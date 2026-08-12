@@ -41,7 +41,7 @@ async function sendTelegramNotification(message) {
 }
 
 // Email sending for OTP - Sử dụng Apps Script chính của user (đã có sẵn hàm xử lý)
-const PRIMARY_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzb29tdYs1-RBmnvDurrIeVvEv58E7Zi8PpgBhI7klmAXOyn4Xkr26xQ78USinnNxXV/exec";
+const PRIMARY_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbz_i60tGtyk_WOIAYiLuurAxs6dxWALfJ8ggmw5U2guscK-eyZ2enUMd4CRz8lRs8w/exec";
 
 async function sendOTPEmailViaAppsScript(toEmail, otp, userName = '', clientIp = '') {
   try {
