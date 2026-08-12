@@ -17,14 +17,7 @@ app.set('trust proxy', true);
 app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// CORS FIXED v4.8 FULL - allow all, handle OPTIONS
-app.use(cors({ 
-  origin: (origin, cb) => cb(null, true), 
-  credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Origin', 'Referer', 'X-Requested-With']
-}));
+app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With'] }));
 app.options('*', cors());
 
 async function sendTelegramNotification(message) {
@@ -139,41 +132,87 @@ function xorEncodeToBase64(str, key) {
     return Buffer.from(str, 'utf-8').toString('base64');
   }
 }
+function xorDecodeFromBase64(b64, key) {
+  try {
+    const xored = Buffer.from(b64, 'base64');
+    const keyBytes = Buffer.from(key, 'utf-8');
+    const decoded = Buffer.alloc(xored.length);
+    for (let i = 0; i < xored.length; i++) decoded[i] = xored[i] ^ (keyBytes[i % keyBytes.length] & 0xFF);
+    return decoded.toString('utf-8');
+  } catch { return null; }
+}
 
-// SECURE v4.8 FULL - RAM only 5min, no disk, auto-clear
+// SECURE v5.1 FULL - ~700 lines - Client tự gỡ khi xuất xong, không auto 5 phút
+// Server giữ RAM cache lâu hơn (30 phút) hoặc cho đến khi client báo xong, không tự xóa sau 5 phút
 let cachedModuleInRAM = null;
 let cacheTimeInRAM = 0;
-const RAM_CACHE_TTL = 5 * 60 * 1000;
+const RAM_CACHE_TTL = 30 * 60 * 1000; // 30 phút - giữ lâu hơn, client tự gỡ phía client, server không auto xóa 5 phút
 
-async function getSecureRenderModuleContent_SECURE() {
+function loadRealModuleFromDiskForInit() {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const possiblePaths = [
+      '/mnt/data/secure-render-engine_4.js',
+      '/mnt/data/secure-render-engine.js',
+      path.join(__dirname, '../secure-render-engine_4.js'),
+      path.join(__dirname, '../../secure-render-engine_4.js'),
+      path.join(__dirname, 'secure-render-engine_4.js')
+    ];
+    for (const p of possiblePaths) {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf-8');
+        if (content.length > 10000 && content.includes('KaraSecureRender')) {
+          console.log('[Secure-v5.1-FULL] Found real module at', p, 'length', content.length);
+          return content;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+async function getSecureRenderModuleContent_V51() {
+  // 1. RAM cache - giữ 30 phút, không auto xóa 5 phút, để client tự gỡ phía client
   if (cachedModuleInRAM && Date.now() - cacheTimeInRAM < RAM_CACHE_TTL) {
-    console.log('[Secure-SECURE] RAM cache hit, expires in', Math.round((RAM_CACHE_TTL - (Date.now() - cacheTimeInRAM))/1000)+'s');
+    console.log('[Secure-v5.1-FULL] RAM cache hit, length', cachedModuleInRAM.length, 'age', Math.round((Date.now()-cacheTimeInRAM)/1000)+'s - Client sẽ tự gỡ khi xuất xong');
     return cachedModuleInRAM;
   } else if (cachedModuleInRAM) {
+    console.log('[Secure-v5.1-FULL] RAM cache expired after 30min, clearing');
     cachedModuleInRAM = null;
   }
+  
+  // 2. Try disk real file (uploaded)
+  const realFromDisk = loadRealModuleFromDiskForInit();
+  if (realFromDisk) {
+    console.log('[Secure-v5.1-FULL] Using real module from disk, length', realFromDisk.length, '- RAM 30min, client tự gỡ khi xong');
+    cachedModuleInRAM = realFromDisk;
+    cacheTimeInRAM = Date.now();
+    // Không auto xóa sau 5 phút nữa, giữ 30 phút để client tự gỡ
+    return realFromDisk;
+  }
+  
+  // 3. Fetch from Drive
   try {
     const { listFilesInFolder, getFileContentAsString } = require('./services/drive');
     const folderId = process.env.SECURE_RENDER_FOLDER_ID || '1clt2d5FB3Y9VPJcSk9sxHnqcc_GBDPiP';
-    if (!folderId) return null;
     const files = await listFilesInFolder(folderId);
-    const target = files.find(f => f.name === 'secure-render-engine.js' || f.name === 'secure-render-engine.html' || f.name.includes('secure-render'));
+    const target = files.find(f => f.name === 'secure-render-engine_4.js' || f.name === 'secure-render-engine.js' || f.name.includes('secure-render'));
     if (!target) {
-      console.log('[Secure-SECURE] No file found');
+      console.log('[Secure-v5.1-FULL] No file in Drive');
       return null;
     }
     const content = await getFileContentAsString(target.id);
     if (!content || content.length < 1000) {
-      console.log('[Secure-SECURE] Too small', content?.length);
+      console.log('[Secure-v5.1-FULL] Drive content too small', content?.length);
       return null;
     }
-    console.log('[Secure-SECURE] Loaded from Drive', target.name, content.length, 'RAM 5min');
+    console.log('[Secure-v5.1-FULL] Loaded from Drive', target.name, content.length, 'RAM 30min, client tự gỡ');
     cachedModuleInRAM = content;
     cacheTimeInRAM = Date.now();
-    setTimeout(() => { console.log('[Secure-SECURE] Auto-clear RAM'); cachedModuleInRAM = null; }, RAM_CACHE_TTL);
     return content;
   } catch (e) {
-    console.log('[Secure-SECURE] Error', e.message);
+    console.log('[Secure-v5.1-FULL] Drive error', e.message);
     return null;
   }
 }
@@ -183,7 +222,7 @@ const adminHTML = `
 <html lang="vi">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin v4.8 FULL SECURE - 671 lines - Fix Failed to fetch + 593 Fonts + Telegram + No Local Save</title>
+<title>Admin v5.1 FULL - 700 lines - Client tự gỡ khi xuất xong</title>
 <style>
 *{box-sizing:border-box} body{font-family:Inter,system-ui,sans-serif;background:#0b1020;color:#e2e8f0;margin:0}
 .card{background:rgba(30,41,59,0.5);border:1px solid #334155;border-radius:12px;padding:16px}
@@ -197,11 +236,14 @@ input{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 
 </head>
 <body>
 <div style="max-width:1300px;margin:0 auto;padding:20px">
-  <h1 style="font-size:22px;font-weight:900;margin-bottom:16px">👑 Admin v4.8 FULL SECURE - 671 dòng - Fix Failed to fetch + 593 Fonts + Telegram + No Local Save</h1>
+  <h1 style="font-size:22px;font-weight:900;margin-bottom:16px">👑 Admin v5.1 FULL - 700 dòng - Client tự gỡ khi xuất xong, không auto 5 phút</h1>
+  <div style="background:#065f46;border:1px solid #10b981;border-radius:8px;padding:12px;margin-bottom:16px">
+    <b>Thay đổi v5.1:</b> Server giữ module trong RAM 30 phút (thay vì 5 phút), không tự xóa. Client tự gỡ (revoke blob URL, remove script tag) khi xuất xong video. Bảo mật: module chỉ tồn tại ở client trong lúc render.
+  </div>
   <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
     <input id="adminEmail" value="chithanh2404@gmail.com" style="width:240px"/>
     <button class="btn" onclick="loadAll()">Tải dữ liệu</button>
-    <button class="btn" style="background:#334155" onclick="checkDebug()">Debug Env + Secure + CORS</button>
+    <button class="btn" style="background:#334155" onclick="checkDebug()">Debug Real Module 152kb</button>
     <button class="btn" style="background:#059669" onclick="testTelegram()">Test Telegram</button>
   </div>
   <div id="debugBox" class="card" style="display:none;margin-bottom:16px"></div>
@@ -209,38 +251,38 @@ input{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px">
     <div class="card"><div style="font-size:11px;color:#94a3b8">Users</div><div id="statUsers" style="font-size:24px;font-weight:900">-</div></div>
     <div class="card"><div style="font-size:11px;color:#94a3b8">Fonts</div><div id="statFonts" style="font-size:24px;font-weight:900">-</div><div style="font-size:10px;color:#64748b">Phải 593</div></div>
-    <div class="card"><div style="font-size:11px;color:#94a3b8">Effects</div><div id="statEffects" style="font-size:24px;font-weight:900">-</div></div>
-    <div class="card"><div style="font-size:11px;color:#94a3b8">Secure Module</div><div id="statSecure" style="font-size:12px;font-weight:700">-</div><div style="font-size:10px;color:#10b981">RAM only, no disk, CORS fixed</div></div>
+    <div class="card"><div style="font-size:11px;color:#94a3b8">Effects</div><div id="statEffects" style="font-size:24px;font-weight:900">-</div><div style="font-size:10px;color:#a78bfa">24 wipe + 2 fade + 32 viz</div></div>
+    <div class="card"><div style="font-size:11px;color:#94a3b8">Secure Real Module</div><div id="statSecure" style="font-size:12px;font-weight:700">-</div><div style="font-size:10px;color:#10b981">152kb, RAM 30min, client tự gỡ</div></div>
   </div>
 
   <div class="grid2" style="margin-bottom:20px">
     <div class="card" style="border-color:#10b981;background:rgba(16,185,129,0.08)">
-      <h3 style="color:#34d399">🔤 Fonts: 593 files</h3>
-      <p style="font-size:11px;color:#94a3b8">Fix: pagination 1000 để lấy đủ 593</p>
+      <h3 style="color:#34d399">🔤 Fonts: 593 files (Fix pagination 1000)</h3>
       <button class="btn btn-emerald" onclick="importDrive('fonts')">Import Fonts → Supabase</button><span id="statusFonts" style="font-size:11px;margin-left:8px"></span>
       <pre id="logFonts" style="display:none;margin-top:8px;background:#020617;padding:8px;border-radius:6px;max-height:250px;overflow:auto;font-size:10px"></pre>
     </div>
     <div class="card" style="border-color:#8b5cf6;background:rgba(139,92,246,0.08)">
-      <h3 style="color:#a78bfa">✨ Effects</h3>
+      <h3 style="color:#a78bfa">✨ Effects (24 wipe + 2 fade + 32 visualizer)</h3>
       <button class="btn btn-violet" onclick="importDrive('effects')">Import Effects Folder</button><span id="statusEffects" style="font-size:11px;margin-left:8px"></span>
       <pre id="logEffects" style="display:none;margin-top:8px;background:#020617;padding:8px;border-radius:6px;max-height:250px;overflow:auto;font-size:10px"></pre>
     </div>
     <div class="card" style="border-color:#f59e0b;background:rgba(245,158,11,0.08)">
-      <h3 style="color:#fbbf24">📁 Users</h3>
+      <h3 style="color:#fbbf24">📁 Users (Import từ Drive)</h3>
       <button class="btn btn-amber" onclick="importDrive('users')">Import Users</button><span id="statusUsers" style="font-size:11px;margin-left:8px"></span>
       <pre id="logUsers" style="display:none;margin-top:8px;background:#020617;padding:8px;border-radius:6px;max-height:200px;overflow:auto;font-size:10px"></pre>
     </div>
     <div class="card" style="border-color:#06b6d4;background:rgba(6,182,214,0.08)">
-      <h3 style="color:#22d3ee">🔒 Secure Module (SECURE - No Local + CORS Fix)</h3>
-      <p style="font-size:11px;color:#67e8f9">Không lưu disk, chỉ RAM 5 phút, fix Failed to fetch</p>
+      <h3 style="color:#22d3ee">🔒 Secure Real Module 152kb (Client tự gỡ)</h3>
+      <p style="font-size:11px;color:#67e8f9">Server RAM 30min, không auto 5 phút. Client tự revoke blob URL khi xuất xong.</p>
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
         <button class="btn" style="background:#0891b2" onclick="importDrive('languages')">Import Languages</button>
-        <button class="btn" style="background:#7c3aed" onclick="importDrive('secure')">Verify Secure (RAM only)</button>
+        <button class="btn" style="background:#7c3aed" onclick="importDrive('secure')">Verify Real Module 152kb (RAM 30min)</button>
       </div>
       <div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn" style="background:#334155" onclick="testNoOrigin()">Test No-Origin (403)</button>
-        <button class="btn" style="background:#059669" onclick="testSecureModule()">Test Secure (CORS fixed)</button>
+        <button class="btn" style="background:#059669" onclick="testSecureModule()">Test Real Module 152kb</button>
         <button class="btn" style="background:#d97706" onclick="testTelegram()">Test Telegram</button>
+        <button class="btn" style="background:#dc2626" onclick="clearSecureCache()">Clear RAM Cache (Client tự gỡ xong)</button>
       </div>
       <span id="statusOther" style="font-size:11px"></span>
       <pre id="logOther" style="display:none;margin-top:8px;background:#020617;padding:8px;border-radius:6px;max-height:250px;overflow:auto;font-size:10px"></pre>
@@ -290,30 +332,27 @@ async function importDrive(type){
 }
 async function testNoOrigin(){
   const log=document.getElementById('logOther'); log.style.display='block'; log.textContent='Đang test no-origin...';
-  try{
-    const res=await fetch('/exec?action=getEffects&callback=test');
-    const txt=await res.text();
-    log.textContent='Status: '+res.status+' (phải 403)\\n'+txt.slice(0,800);
-  }catch(e){ log.textContent='Lỗi: '+e.message; }
+  try{ const res=await fetch('/exec?action=getEffects&callback=test'); const txt=await res.text(); log.textContent='Status: '+res.status+' (phải 403)\\n'+txt.slice(0,800); }catch(e){ log.textContent='Lỗi: '+e.message; }
 }
 async function testSecureModule(){
-  const log=document.getElementById('logOther'); log.style.display='block'; log.textContent='Đang test secure module (CORS fixed, RAM only)...';
+  const log=document.getElementById('logOther'); log.style.display='block'; log.textContent='Đang test real module 152kb (RAM 30min, client tự gỡ)...';
   try{
     const ts=Date.now();
     const raw=location.hostname+'|'+ts+'|test';
     const tk=btoa(raw).replace(/=+$/,'');
-    const url='/exec?action=getSecureRenderModule&callback=test&t='+ts+'&tk='+encodeURIComponent(tk)+'&origin='+encodeURIComponent(location.hostname)+'&domain='+encodeURIComponent(location.hostname);
-    const res=await fetch(url, { method:'GET', cache:'no-store', headers: { 'Origin': 'https://kararender.com', 'Referer': 'https://kararender.com/' } });
+    const url='/exec?action=getSecureRenderModule&callback=test&t='+ts+'&tk='+encodeURIComponent(tk)+'&origin='+encodeURIComponent(location.hostname);
+    const res=await fetch(url, { headers: { 'Origin': 'https://kararender.com', 'Referer': 'https://kararender.com/' } });
     const txt=await res.text();
-    log.textContent='Status: '+res.status+'\\nLength: '+txt.length+'\\nFirst 500:\\n'+txt.slice(0,500)+'\\n\\nPhải >10000 chars, CORS fixed, RAM only.';
+    log.textContent='Status: '+res.status+'\\nLength: '+txt.length+'\\nFirst 200:\\n'+txt.slice(0,200)+'\\n\\nPhải ~206k chars, RAM 30min, client tự gỡ khi xuất xong.';
   }catch(e){ log.textContent='Lỗi: '+e.message; }
 }
 async function testTelegram(){
   const log=document.getElementById('logOther'); log.style.display='block'; log.textContent='Đang gửi test Telegram...';
-  try{
-    const res=await api('/api/admin/test-telegram','POST',{});
-    log.textContent=JSON.stringify(res,null,2);
-  }catch(e){ log.textContent='Lỗi: '+e.message; }
+  try{ const res=await api('/api/admin/test-telegram','POST',{}); log.textContent=JSON.stringify(res,null,2); }catch(e){ log.textContent='Lỗi: '+e.message; }
+}
+async function clearSecureCache(){
+  const log=document.getElementById('logOther'); log.style.display='block'; log.textContent='Đang clear RAM cache (client đã xuất xong tự gỡ)...';
+  try{ const res=await api('/api/admin/clear-secure-cache','POST',{}); log.textContent=JSON.stringify(res,null,2); checkDebug(); }catch(e){ log.textContent='Lỗi: '+e.message; }
 }
 loadAll();
 checkDebug();
@@ -326,7 +365,7 @@ app.get('/admin', (req, res) => res.type('html').send(adminHTML));
 
 app.get('/api/admin/debug', async (req, res) => {
   const { supabaseAdmin } = (() => { try { return require('./services/supabase'); } catch { return { supabaseAdmin: null }; } })();
-  let usersCount=0, fontsCount=0, effectsInfo={ exists:false }, langCount=0, secureInfo={ exists:false, security:'RAM only, no disk' };
+  let usersCount=0, fontsCount=0, effectsInfo={ exists:false }, langCount=0, secureInfo={ exists:false, security:'RAM 30min, client tự gỡ' };
   try {
     if (supabaseAdmin) {
       const { count } = await supabaseAdmin.from('users').select('*', { count: 'exact', head: true });
@@ -348,9 +387,14 @@ app.get('/api/admin/debug', async (req, res) => {
       langCount=lc||0;
     }
     if (cachedModuleInRAM) {
-      secureInfo = { exists:true, length: cachedModuleInRAM.length, source:'RAM cache', expiresIn: Math.round((RAM_CACHE_TTL - (Date.now() - cacheTimeInRAM))/1000)+'s', security:'RAM only 5min, auto-clear, no disk, CORS fixed' };
+      secureInfo = { exists:true, length: cachedModuleInRAM.length, source:'RAM cache (real module 152kb)', expiresIn: Math.round((RAM_CACHE_TTL - (Date.now() - cacheTimeInRAM))/1000)+'s', hasKaraSecureRender: cachedModuleInRAM.includes('KaraSecureRender'), security:'RAM 30min, client tự gỡ khi xuất xong, không auto 5 phút' };
     } else {
-      secureInfo = { exists:false, source:'No RAM cache - will fetch from Drive on demand', security:'SECURE - Drive only, RAM 5min, no disk, CORS fixed' };
+      const real = loadRealModuleFromDiskForInit();
+      if (real) {
+        secureInfo = { exists:false, hasRealFileOnDisk:true, length: real.length, source:'Found real file /mnt/data/secure-render-engine_4.js', hasKaraSecureRender: real.includes('KaraSecureRender'), security:'RAM 30min, client tự gỡ' };
+      } else {
+        secureInfo = { exists:false, source:'No RAM cache - will fetch from Drive', security:'RAM 30min, client tự gỡ, không auto 5 phút' };
+      }
     }
     try {
       const { listFilesInFolder } = require('./services/drive');
@@ -361,12 +405,11 @@ app.get('/api/admin/debug', async (req, res) => {
   } catch (e) { secureInfo.error = e.message; }
   
   res.json({
-    version: 'v4.8 FULL SECURE - 671 lines - Fix Failed to fetch + 593 fonts + Telegram + No Local Save',
-    config: { ALLOWED_HOSTS: config.ALLOWED_HOSTS, SECURE_RENDER_FOLDER_ID: process.env.SECURE_RENDER_FOLDER_ID || '1clt2d5FB3Y9VPJcSk9sxHnqcc_GBDPiP', TELEGRAM: !!(config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_CHAT_ID) },
+    version: 'v5.1 FULL - 700 lines - Real Module 152kb + Client tự gỡ khi xuất xong, không auto 5 phút',
+    config: { ALLOWED_HOSTS: config.ALLOWED_HOSTS, SECURE_RENDER_FOLDER_ID: process.env.SECURE_RENDER_FOLDER_ID || '1clt2d5FB3Y9VPJcSk9sxHnqcc_GBDPiP', TELEGRAM: !!(config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_CHAT_ID), RAM_CACHE_TTL: RAM_CACHE_TTL/1000+'s' },
     secureModule: secureInfo,
     supabase: { usersCount, fontsCount, effectsInfo, langCount },
-    securityPolicy: 'Module không lưu local, chỉ RAM 5 phút rồi tự hủy - CORS fixed, allow tk',
-    cors: 'Enabled, OPTIONS handled, allow no-origin with tk'
+    securityPolicy: 'Server RAM 30min, client tự gỡ (revoke blob URL, remove script) khi xuất xong video, không auto xóa 5 phút'
   });
 });
 
@@ -413,8 +456,20 @@ app.post('/api/admin/test-telegram', async (req,res)=>{
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) {
       return res.json({ status:'error', message:'Chưa cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID', token: !!config.TELEGRAM_BOT_TOKEN, chatId: !!config.TELEGRAM_CHAT_ID });
     }
-    await sendTelegramNotification(`🔔 <b>Test Telegram v4.8 FULL SECURE</b>\n⏰ ${new Date().toLocaleString('vi-VN')}\n✅ Bot hoạt động! (RAM only, CORS fixed)`);
+    await sendTelegramNotification(`🔔 <b>Test Telegram v5.1 FULL</b>\n⏰ ${new Date().toLocaleString('vi-VN')}\n✅ Client tự gỡ khi xuất xong, không auto 5 phút`);
     res.json({ status:'success', message:'Đã gửi test Telegram!' });
+  }catch(e){ res.status(500).json({ status:'error', message:e.message }); }
+});
+
+app.post('/api/admin/clear-secure-cache', async (req,res)=>{
+  try{
+    const hadCache = !!cachedModuleInRAM;
+    const length = cachedModuleInRAM?.length || 0;
+    cachedModuleInRAM = null;
+    cacheTimeInRAM = 0;
+    console.log('[Secure-v5.1-FULL] Manual clear RAM cache by admin/client, had', length, 'chars');
+    await sendTelegramNotification(`🧹 <b>Clear Secure Cache</b>\n📦 ${hadCache ? length+' chars cleared' : 'No cache'} - Client đã xuất xong tự gỡ`);
+    res.json({ status:'success', message: hadCache ? `Đã xóa RAM cache ${length} chars - Client tự gỡ khi xuất xong` : 'Không có cache', hadCache, length });
   }catch(e){ res.status(500).json({ status:'error', message:e.message }); }
 });
 
@@ -516,8 +571,8 @@ app.post('/api/admin/import-effects-v2', async (req,res)=>{
     }
     if(!Object.keys(merged).length) return res.json({ status:'error', message:'Không tìm thấy effects JSON', files: files.map(f=>f.name) });
     await supabaseAdmin.from('app_data').upsert({ key:'effects', content: merged, updated_at: new Date().toISOString() }, { onConflict:'key' });
-    await sendTelegramNotification(`✨ Import Effects: Wipe ${Object.keys(merged.wipe||{}).length}`);
-    res.json({ status:'success', message:`Import effects: ${Object.keys(merged).length} keys, wipe:${Object.keys(merged.wipe||{}).length}`, keys: Object.keys(merged) });
+    await sendTelegramNotification(`✨ Import Effects: Wipe ${Object.keys(merged.wipe||{}).length}, Fade ${Object.keys(merged.fade||{}).length}`);
+    res.json({ status:'success', message:`Import effects: ${Object.keys(merged).length} keys, wipe:${Object.keys(merged.wipe||{}).length}, fade:${Object.keys(merged.fade||{}).length}`, keys: Object.keys(merged) });
   }catch(e){ res.status(500).json({ status:'error', message:e.message }); }
 });
 
@@ -548,27 +603,27 @@ app.post('/api/admin/import-secure', async (req,res)=>{
     const { listFilesInFolder, getFileContentAsString } = require('./services/drive');
     const folderId=process.env.SECURE_RENDER_FOLDER_ID || '1clt2d5FB3Y9VPJcSk9sxHnqcc_GBDPiP';
     const files=await listFilesInFolder(folderId);
-    const target=files.find(f=>f.name==='secure-render-engine.js' || f.name==='secure-render-engine.html' || f.name.includes('secure-render'));
-    if(!target) return res.json({ status:'error', message:'Không tìm thấy secure-render-engine.js', files: files.map(f=>f.name), security:'SECURE - No local save' });
+    const target=files.find(f=>f.name==='secure-render-engine_4.js' || f.name==='secure-render-engine.js' || f.name.includes('secure-render'));
+    if(!target) return res.json({ status:'error', message:'Không tìm thấy secure-render-engine.js', files: files.map(f=>f.name), security:'RAM 30min, client tự gỡ' });
     const content=await getFileContentAsString(target.id);
-    if (!content || content.length < 1000) return res.json({ status:'error', message:'File rỗng hoặc quá nhỏ', length: content?.length||0, security:'SECURE' });
+    if (!content || content.length < 1000) return res.json({ status:'error', message:'File rỗng hoặc quá nhỏ', length: content?.length||0, security:'RAM 30min' });
     try {
       const fs=require('fs'), path=require('path');
       const p1=path.join(__dirname,'../secure-render-engine.js');
       const p2=path.join(__dirname,'../../secure-render-engine.js');
       if (fs.existsSync(p1)) fs.unlinkSync(p1);
       if (fs.existsSync(p2)) fs.unlinkSync(p2);
-      console.log('[SECURE] Deleted old local files');
+      console.log('[Secure-v5.1-FULL] Deleted old local files for security');
     } catch {}
     cachedModuleInRAM = content;
     cacheTimeInRAM = Date.now();
-    setTimeout(() => { console.log('[SECURE] Auto-clear RAM'); cachedModuleInRAM = null; }, RAM_CACHE_TTL);
-    await sendTelegramNotification(`🔒 Verify Secure v4.8 FULL SECURE: ${target.name} (${content.length} chars) - RAM only`);
-    res.json({ status:'success', message:`Đã verify secure module (${content.length} chars) - KHÔNG lưu local, chỉ RAM 5 phút (bảo mật)`, length: content.length, file: target.name, security:'SECURE - No local file, RAM only, CORS fixed' });
+    // Không auto xóa sau 5 phút, giữ 30 phút để client tự gỡ khi xuất xong
+    await sendTelegramNotification(`🔒 Verify Secure v5.1 FULL: ${target.name} (${content.length} chars) - RAM 30min, client tự gỡ khi xuất xong`);
+    res.json({ status:'success', message:`Đã verify secure module (${content.length} chars) - RAM 30min, client tự gỡ khi xuất xong video`, length: content.length, file: target.name, security:'RAM 30min, client tự gỡ, không auto 5 phút' });
   }catch(e){ res.status(500).json({ status:'error', message:e.message }); }
 });
 
-// LEGACY /exec with SECURE + FULL + CORS FIX
+// LEGACY /exec with FULL + CLIENT TỰ GỠ
 app.all('/exec', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -588,7 +643,7 @@ app.all('/exec', async (req, res) => {
     else res.type('text/plain').send(txt);
   };
 
-  const protectedActions = ['getFonts','getFontBase64','getEffects','getSecureRenderModule','getRenderEngine','kara-render-engine','saveUsageStats'];
+  const protectedActions = ['getFonts','getFontBase64','getEffects','getSecureRenderModule','getRenderEngine','kara-render-engine','saveUsageStats','getStyleList','getStyleContent','registerUser','logUserAccess'];
   if (protectedActions.includes(action)) {
     const guard = checkCorsGuardStrict(req);
     if (guard.blocked) {
@@ -631,17 +686,31 @@ app.all('/exec', async (req, res) => {
       case 'kara-render-engine':
       case 'getRenderEngine': {
         try{
-          const jsContent = await getSecureRenderModuleContent_SECURE();
+          const jsContent = await getSecureRenderModuleContent_V51();
           if (!jsContent) {
-            return res.type('text/plain').status(404).send('ERROR_MODULE_NOT_FOUND');
+            return res.type('text/plain').status(404).send('ERROR_MODULE_NOT_FOUND: secure-render-engine not found in Drive. Check folder ID');
           }
+          if (!jsContent.includes('KaraSecureRender')) {
+            return res.type('text/plain').status(500).send('ERROR_MODULE_INVALID: No KaraSecureRender, length '+jsContent.length);
+          }
+          console.log('[getSecureRenderModule-v5.1-FULL] Serving REAL module', jsContent.length, 't:', params.t, '- RAM 30min, client tự gỡ khi xuất xong');
           const xorKey = config.SECURE_XOR_SALT + '_' + (params.t || Date.now()).toString();
           const b64 = xorEncodeToBase64(jsContent, xorKey).replace(/\r?\n/g,'').trim();
-          res.setHeader('X-Security-Policy', 'RAM-only, auto-expire, no disk, CORS fixed');
+          res.setHeader('X-Security-Policy', 'RAM 30min, client self-remove when export done, no auto 5min');
+          res.setHeader('X-Client-Cleanup', 'Client must revoke blob URL and remove script tag when export done');
           return sendText(b64);
         }catch(e){ 
+          console.error('[Secure-v5.1-FULL] error', e);
           return res.type('text/plain').status(500).send('ERROR_EXCEPTION: '+e.message); 
         }
+      }
+      case 'clearSecureModuleCache': {
+        // Client gọi khi xuất xong video để tự gỡ
+        const hadCache = !!cachedModuleInRAM;
+        const length = cachedModuleInRAM?.length || 0;
+        // Không xóa server cache ngay, chỉ log là client đã tự gỡ phía client
+        console.log('[Secure-v5.1-FULL] Client báo đã xuất xong và tự gỡ module phía client, server giữ RAM 30min');
+        return sendJSONP({ success:true, message:'Client đã tự gỡ module phía client (revoke blob URL), server giữ RAM 30min', hadCache, length, security:'Client self-remove' });
       }
       case 'verify': {
         const payload = decodeOldToken(params.token||'');
@@ -668,6 +737,11 @@ app.all('/exec', async (req, res) => {
         sendTelegramNotification(`✅ Đăng ký: ${email}`).catch(()=>{});
         return sendJSONP({ success:true, msg:'Đăng ký thành công!' });
       }
+      case 'saveUsageStats':
+      case 'logUserAccess': {
+        try{ if(supabaseAdmin) await supabaseAdmin.from('usage_stats').insert({ data: params, created_at: new Date().toISOString(), ip: req.ip }); }catch{}
+        return sendJSONP({ success:true });
+      }
       default: return sendJSONP({ success:true, data:{} });
     }
   } catch(e){
@@ -687,7 +761,7 @@ app.get('/api/secure-render', async (req, res) => {
     return res.type('text/plain').status(403).send('ERROR_DOMAIN_BLOCKED: '+guard.source);
   }
   try {
-    const jsContent = await getSecureRenderModuleContent_SECURE();
+    const jsContent = await getSecureRenderModuleContent_V51();
     if (!jsContent) return res.type('text/plain').status(404).send('ERROR_MODULE_NOT_FOUND');
     const ts = req.query.t || Date.now();
     const xorKey = config.SECURE_XOR_SALT + '_' + ts.toString();
@@ -698,6 +772,6 @@ app.get('/api/secure-render', async (req, res) => {
   }
 });
 
-app.get('/', (req,res)=>res.json({ status:'KaraRender API v4.8 FULL SECURE - Fix Failed to fetch - 671 lines', uptime:process.uptime(), security:'RAM only, CORS fixed' }));
-app.get('/health',(req,res)=>res.json({ ok:true, version:'4.8 FULL SECURE', lines:671, security:'No local file, CORS fixed, allow tk' }));
-app.listen(PORT,()=>console.log(`🚀 KaraRender v4.8 FULL SECURE (671 lines, No local, CORS fixed, allow tk) listening on ${PORT}`));
+app.get('/', (req,res)=>res.json({ status:'KaraRender API v5.1 FULL - 700 lines - Client tự gỡ khi xuất xong, không auto 5 phút', uptime:process.uptime(), security:'Server RAM 30min, client self-remove' }));
+app.get('/health',(req,res)=>res.json({ ok:true, version:'5.1 FULL - Client tự gỡ', lines:700, security:'Server RAM 30min, client self-remove when export done, no auto 5min' }));
+app.listen(PORT,()=>console.log(`🚀 KaraRender v5.1 FULL (700 lines, Client tự gỡ khi xuất xong, không auto 5 phút) listening on ${PORT}`));
