@@ -961,19 +961,34 @@ app.all('/exec', async (req, res) => {
       case 'kara-render-engine':
       case 'getRenderEngine': {
         try{
+          const isPlain = params.plain === '1' || params.plain === 'true';
           const jsContent = await getSecureRenderModuleContent_V55();
           if (!jsContent) {
+            console.error('[Secure-v5.5] Module not found');
             return res.type('text/plain').status(404).send('ERROR_MODULE_NOT_FOUND: Failed to fetch from Dropbox direct link');
           }
-          if (!jsContent.includes('KaraSecureRender')) {
-            return res.type('text/plain').status(500).send('ERROR_MODULE_INVALID: No KaraSecureRender, length '+jsContent.length);
+          // FIX: Module mới obfuscate thành vmX, không còn KaraSecureRender ở đầu nhưng vẫn hợp lệ
+          const hasValidMarker = jsContent.includes('KaraSecureRender') || jsContent.includes('vmX') || jsContent.includes('SecureRender') || jsContent.length > 5000;
+          if (!hasValidMarker) {
+            console.error('[Secure-v5.5] Invalid module, no marker', jsContent.length, jsContent.slice(0,200));
+            return res.type('text/plain').status(500).send('ERROR_MODULE_INVALID: No KaraSecureRender/vmX, length '+jsContent.length);
           }
-          console.log('[Secure-v5.5-Dropbox] Serving module', jsContent.length);
+          console.log('[Secure-v5.5-Dropbox] Serving module', jsContent.length, 'plain:', isPlain, 'has Kara:', jsContent.includes('KaraSecureRender'), 'has vmX:', jsContent.includes('vmX'));
+          
+          if (isPlain) {
+            res.setHeader('X-Source', 'Dropbox Direct Link - Plain');
+            res.setHeader('Content-Type', 'application/javascript');
+            return res.type('application/javascript').send(jsContent);
+          }
+          
           const xorKey = config.SECURE_XOR_SALT + '_' + (params.t || Date.now()).toString();
+          console.log('[Secure-v5.5] XOR key:', xorKey.slice(0,30)+'...', 't:', params.t);
           const b64 = xorEncodeToBase64(jsContent, xorKey).replace(/\r?\n/g,'').trim();
           res.setHeader('X-Source', 'Dropbox Direct Link');
+          res.setHeader('X-XOR-Key-Hint', xorKey.slice(0,20)+'...');
           return sendText(b64);
         }catch(e){ 
+          console.error('[Secure-v5.5] Exception', e);
           return res.type('text/plain').status(500).send('ERROR_EXCEPTION: '+e.message); 
         }
       }
@@ -1144,6 +1159,14 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
       }
       case 'saveUsageStats':
       case 'logUserAccess': {
+        console.log('[logUserAccess] Received request', { 
+          email: params.email, 
+          domain: params.domain, 
+          fullName: params.fullName,
+          ip: req.ip,
+          action: action,
+          hasData: !!params.data
+        });
         // Logic ghi log khi có user xuất thành công video với đầy đủ thông tin từ collectExportData + giữ nguyên logic cũ
         let isExportLog = false;
         let exportDataParsed = null;
@@ -1240,7 +1263,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.dev
 🆔 <b>User-Agent:</b> <code>${browserId.substring(0,200)}</code>
 📊 <b>Action:</b> ${action}
 ${isBlocked ? '🚫 <b>Lý do chặn:</b> ' + blockedReason : ''}
-📍 <b>Allowed:</b> ${ALLOWED_HOSTS_STRICT ? ALLOWED_HOSTS_STRICT.join(', ') : 'www.kararender.com, kararender.com'}`).catch(()=>{});
+📍 <b>Allowed:</b> ${config.ALLOWED_HOSTS_STRICT ? config.ALLOWED_HOSTS_STRICT.join(', ') : 'www.kararender.com, kararender.com'}`).catch(()=>{});
           }
         } catch(e) { console.log('Telegram notify error', e.message); }
         return sendJSONP({ success:true, isExport: isExportLog });
@@ -1266,10 +1289,18 @@ app.get('/api/secure-render', async (req, res) => {
     return res.type('text/plain').status(403).send('ERROR_DOMAIN_BLOCKED');
   }
   try {
+    const isPlain = req.query.plain === '1' || req.query.plain === 'true';
     const jsContent = await getSecureRenderModuleContent_V55();
     if (!jsContent) return res.type('text/plain').status(404).send('ERROR_MODULE_NOT_FOUND');
+    
+    if (isPlain) {
+      res.setHeader('Content-Type', 'application/javascript');
+      return res.type('application/javascript').send(jsContent);
+    }
+    
     const ts = req.query.t || Date.now();
     const xorKey = config.SECURE_XOR_SALT + '_' + ts.toString();
+    console.log('[Secure-v5.5 /api] Serving module', jsContent.length, 't:', ts, 'key:', xorKey.slice(0,30)+'...');
     const b64 = xorEncodeToBase64(jsContent, xorKey).replace(/\r?\n/g,'').trim();
     res.type('text/plain').send(b64);
   } catch (e) {
