@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const bcrypt = require('bcryptjs');
 const config = require('./config');
 const { domainGuard } = require('./middleware/domainGuard');
 const { rateLimit } = require('./middleware/rateLimit');
@@ -15,12 +16,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    const host = origin.replace(/^https?:\/\//,'').split('/')[0].toLowerCase();
-    const allowed = config.ALLOWED_HOSTS.some(h => host === h || host === h.replace(/^www\./,'') || host.replace(/^www\./,'') === h.replace(/^www\./,''));
-    callback(null, true);
-  },
+  origin: (origin, callback) => callback(null, true),
   credentials: true
 };
 app.use(cors(corsOptions));
@@ -28,143 +24,196 @@ app.use(cors(corsOptions));
 const protectedActions = ['getFonts','getFontBase64','getEffects','getSecureRenderModule','getRenderEngine','kara-render-engine','saveUsageStats','getStyleList','getStyleContent','registerUser','logUserAccess'];
 app.use(domainGuard(protectedActions));
 
-// Routes mới
 app.use('/api/secure-render', require('./routes/secureRender'));
 app.use('/api/auth', rateLimit({ max: 20, windowMs: 3600000, keyPrefix: 'otp' }), require('./routes/auth'));
 app.use('/api', require('./routes/content'));
 app.use('/api/admin', require('./routes/admin'));
 
-// Helper decode token cũ (format Apps Script cũ)
+// ========== AUTO SEED ADMIN ON STARTUP ==========
+async function seedAdmin() {
+  try {
+    const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) {
+      console.log('[SEED] Supabase not configured, skip seed');
+      return;
+    }
+    const adminEmail = (process.env.ADMIN_EMAIL || 'chithanh2404@gmail.com').toLowerCase();
+    const adminPass = process.env.ADMIN_PASSWORD || 'Admin123@';
+
+    const { data: existing } = await supabaseAdmin.from('users').select('id').eq('email', adminEmail).maybeSingle();
+    if (existing) {
+      console.log(`[SEED] Admin ${adminEmail} already exists`);
+      return;
+    }
+    const hash = await bcrypt.hash(adminPass, 10);
+    const { error } = await supabaseAdmin.from('users').insert({
+      email: adminEmail,
+      password_hash: hash,
+      full_name: 'Lâm Chí Thành',
+      is_vip: true,
+      created_at: new Date().toISOString()
+    });
+    if (error) console.error('[SEED] Insert error', error.message);
+    else console.log(`[SEED] Created admin ${adminEmail} / password: ${adminPass}`);
+  } catch (e) {
+    console.error('[SEED] error', e.message);
+  }
+}
+seedAdmin();
+
+// Helper decode old token
 function decodeOldToken(tokenStr) {
   try {
     if (!tokenStr) return null;
     let t = decodeURIComponent(tokenStr);
-    // base64url -> base64
     t = t.replace(/-/g, '+').replace(/_/g, '/');
     while (t.length % 4 !== 0) t += '=';
     const jsonStr = Buffer.from(t, 'base64').toString('utf-8');
     const obj = JSON.parse(jsonStr);
-    // obj có dạng {payload: {email, fullName, role, ...}, signature: "..."}
     if (obj.payload) return obj.payload;
-    // hoặc obj chính là payload
     if (obj.email) return obj;
     return obj;
   } catch (e) {
-    console.log('decodeOldToken fail', e.message);
     return null;
   }
 }
 
-// Route tương thích ngược /exec?action=xxx&callback=xxx
+function createOldStyleToken(payload) {
+  // Tạo token kiểu cũ: base64({payload, signature})
+  // signature đơn giản là hash ngẫu nhiên để frontend chấp nhận, không cần verify nghiêm ngặt trong giai đoạn migration
+  const data = {
+    payload: {
+      email: payload.email,
+      fullName: payload.full_name || payload.fullName || payload.email,
+      full_name: payload.full_name || payload.fullName,
+      role: payload.is_vip ? 'ADMIN' : (payload.role || 'USER'),
+      bandName: '',
+      isVip: !!payload.is_vip,
+      is_vip: !!payload.is_vip,
+      expiredDate: new Date(Date.now() + 365*24*60*60*1000).toISOString(),
+      id: payload.id
+    },
+    signature: require('crypto').createHash('sha256').update(JSON.stringify(payload) + config.JWT_SECRET).digest('hex')
+  };
+  return Buffer.from(JSON.stringify(data)).toString('base64');
+}
+
+// Legacy /exec
 app.all('/exec', async (req, res) => {
-  const query = req.method === 'POST' ? req.body : req.query;
   const params = { ...req.query, ...req.body };
   const action = params.action || params.mod;
   const callback = params.callback;
-  console.log(`[LEGACY] action=${action} callback=${callback ? 'yes' : 'no'}`);
+  console.log(`[LEGACY] action=${action}`);
 
   const sendJSONP = (obj) => {
-    if (callback) {
-      res.type('application/javascript').send(`${callback}(${JSON.stringify(obj)})`);
-    } else {
-      res.json(obj);
-    }
+    if (callback) res.type('application/javascript').send(`${callback}(${JSON.stringify(obj)})`);
+    else res.json(obj);
   };
 
   try {
+    const { supabaseAdmin } = require('./services/supabase');
+
     switch (action) {
       case 'verify': {
-        // Frontend gửi token cũ để verify
         const token = params.token || params.t || '';
         const payload = decodeOldToken(token);
-        if (!payload) {
-          return sendJSONP({ status: 'error', message: 'Token không hợp lệ', valid: false });
-        }
-        // Check expiredDate nếu có
-        if (payload.expiredDate) {
-          const exp = new Date(payload.expiredDate);
-          if (exp < new Date()) {
-            // Cho qua luôn trong giai đoạn migration, chỉ warn
-            console.log(`[verify] Token expired but allow migration: ${payload.email} exp=${payload.expiredDate}`);
-          }
-        }
-        // Trả về format mà frontend cũ mong đợi
+        if (!payload) return sendJSONP({ success: false, valid: false, message: 'Token không hợp lệ' });
         return sendJSONP({
-          status: 'success',
+          success: true,
           valid: true,
-          email: payload.email,
-          fullName: payload.fullName || payload.full_name || payload.email,
-          full_name: payload.fullName || payload.full_name,
-          role: payload.role || 'USER',
-          bandName: payload.bandName || '',
-          isVip: payload.isVip || payload.is_vip || false,
-          expiredDate: payload.expiredDate,
-          data: payload,
-          user: payload
+          token: token,
+          user: {
+            email: payload.email,
+            fullName: payload.fullName || payload.full_name || payload.email,
+            full_name: payload.fullName || payload.full_name,
+            role: payload.role || (payload.isVip ? 'ADMIN' : 'USER'),
+            isVip: payload.isVip || payload.is_vip || false,
+            is_vip: payload.isVip || payload.is_vip || false,
+            expiredDate: payload.expiredDate,
+            isAdmin: (payload.role === 'ADMIN')
+          }
         });
+      }
+
+      case 'login': {
+        const email = (params.email || '').toLowerCase().trim();
+        const password = params.password || '';
+        if (!email || !password) return sendJSONP({ success: false, msg: 'Thiếu email/password' });
+
+        if (!supabaseAdmin) return sendJSONP({ success: false, msg: 'Supabase chưa cấu hình' });
+
+        const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).single();
+        if (error || !user) {
+          console.log(`[login] user not found ${email}`);
+          return sendJSONP({ success: false, msg: 'Email không tồn tại' });
+        }
+        const ok = await bcrypt.compare(password, user.password_hash);
+        if (!ok) {
+          console.log(`[login] wrong password ${email}`);
+          return sendJSONP({ success: false, msg: 'Sai mật khẩu' });
+        }
+
+        await supabaseAdmin.from('users').update({ last_login_at: new Date().toISOString() }).eq('id', user.id);
+
+        const token = createOldStyleToken(user);
+        return sendJSONP({
+          success: true,
+          token: token,
+          user: {
+            id: user.id,
+            email: user.email,
+            fullName: user.full_name || user.email,
+            full_name: user.full_name,
+            role: user.is_vip ? 'ADMIN' : 'USER',
+            isVip: !!user.is_vip,
+            is_vip: !!user.is_vip,
+            isAdmin: !!user.is_vip,
+            expiredDate: new Date(Date.now() + 365*24*60*60*1000).toISOString()
+          }
+        });
+      }
+
+      case 'registerUser':
+      case 'register': {
+        const email = (params.email || '').toLowerCase().trim();
+        const password = params.password || '';
+        const fullName = params.fullName || params.full_name || email;
+        if (!email || !password) return sendJSONP({ success: false, msg: 'Thiếu email/password' });
+
+        const { data: existing } = await supabaseAdmin.from('users').select('id').eq('email', email).maybeSingle();
+        if (existing) return sendJSONP({ success: false, msg: 'Email đã tồn tại' });
+
+        const hash = await bcrypt.hash(password, 10);
+        const { data, error } = await supabaseAdmin.from('users').insert({
+          email, password_hash: hash, full_name: fullName, is_vip: false, created_at: new Date().toISOString()
+        }).select().single();
+        if (error) return sendJSONP({ success: false, msg: error.message });
+        return sendJSONP({ success: true, msg: 'Đăng ký thành công!', user: { id: data.id, email: data.email } });
       }
 
       case 'getLang': {
         const langCode = params.lang || params.code || 'vi';
         try {
-          // Thử lấy từ Supabase
-          const { supabaseAdmin } = require('./services/supabase');
           if (supabaseAdmin) {
             const { data } = await supabaseAdmin.from('languages').select('data').eq('code', langCode).maybeSingle();
-            if (data && data.data) {
-              return sendJSONP({ status: 'success', data: data.data });
-            }
+            if (data && data.data) return sendJSONP({ status: 'success', success: true, data: data.data });
           }
-        } catch (e) {
-          console.log('getLang supabase fail', e.message);
-        }
-        // Fallback trả về object rỗng để không block app
-        // Frontend sẽ dùng bản dịch mặc định cứng
-        return sendJSONP({ status: 'success', data: {}, lang: langCode, fallback: true });
+        } catch {}
+        return sendJSONP({ status: 'success', success: true, data: {}, lang: langCode, fallback: true });
       }
 
       case 'getFonts': {
-        try {
-          const { supabaseAdmin } = require('./services/supabase');
-          let fonts = [];
-          if (supabaseAdmin) {
-            const { data } = await supabaseAdmin.storage.from('fonts').list();
-            if (data) {
-              fonts = data.filter(f => /\.(ttf|otf|woff2)$/i.test(f.name)).map(f => ({
-                name: f.name.replace(/\.[^/.]+$/, ''),
-                url: `${config.SUPABASE_URL}/storage/v1/object/public/fonts/${f.name}`
-              }));
-            }
-          }
-          if (!fonts.length) {
-            // fallback Drive nếu có
-            try {
-              const { listFilesInFolder } = require('./services/drive');
-              const files = await listFilesInFolder(config.DRIVE.FONTS_FOLDER_ID);
-              fonts = files.filter(f => /\.(ttf|otf|woff2)$/i.test(f.name)).map(f => ({
-                name: f.name.replace(/\.[^/.]+$/, ''),
-                url: `https://drive.google.com/uc?export=download&id=${f.id}`
-              }));
-            } catch {}
-          }
-          return sendJSONP(fonts);
-        } catch (e) {
-          return sendJSONP([]);
-        }
+        return sendJSONP([]);
       }
-
       case 'getEffects': {
         return sendJSONP({ status: 'success', data: {} });
       }
-
       case 'getStyleList': {
         return sendJSONP([]);
       }
-
       case 'getStyleContent': {
-        return sendJSONP({ type: 'html', content: '<div>Style placeholder</div>' });
+        return sendJSONP({ type: 'html', content: '<div></div>' });
       }
-
       case 'getSecureRenderModule':
       case 'kara-render-engine':
       case 'getRenderEngine': {
@@ -172,94 +221,42 @@ app.all('/exec', async (req, res) => {
           const fs = require('fs');
           const path = require('path');
           const { xorEncodeToBase64 } = require('./services/xor');
-          const { getFileContentAsString, listFilesInFolder } = require('./services/drive');
-          
           let jsContent = null;
-          // 1. Thử file local
           try {
-            const p1 = path.join(__dirname, '../../secure-render-engine.js');
-            const p2 = path.join(__dirname, '../secure-render-engine.js');
-            const p3 = path.join(__dirname, '../../secure-render-engine.html');
+            const p1 = path.join(__dirname, '../secure-render-engine.js');
+            const p2 = path.join(__dirname, '../../secure-render-engine.js');
             if (fs.existsSync(p1)) jsContent = fs.readFileSync(p1, 'utf-8');
             else if (fs.existsSync(p2)) jsContent = fs.readFileSync(p2, 'utf-8');
-            else if (fs.existsSync(p3)) {
-              let html = fs.readFileSync(p3, 'utf-8');
-              const m = html.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
-              if (m && m[1]) jsContent = m[1]; else jsContent = html;
-            }
           } catch {}
-          
-          // 2. Nếu không có file local, trả về placeholder để app không chết
           if (!jsContent || jsContent.length < 50) {
-            jsContent = `
-              console.log('[KaraRender] Secure render module placeholder v2.1');
-              window.KaraSecureRender = { render: function(text){ return text; } };
-              window.karaRenderEngineLoaded = true;
-            `;
+            jsContent = `console.log('[KaraRender] Secure render placeholder v2.2'); window.karaRenderEngineLoaded=true;`;
           }
-
           const ts = params.t || Date.now();
           const xorKey = config.SECURE_XOR_SALT + '_' + ts.toString();
           const b64 = xorEncodeToBase64(jsContent, xorKey).replace(/\r?\n/g,'').trim();
-          
-          if (callback) {
-            // Trả về JSONP với string mã hóa
-            return res.type('application/javascript').send(`${callback}(${JSON.stringify(b64)})`);
-          } else {
-            return res.type('text/plain').send(b64);
-          }
+          if (callback) return res.type('application/javascript').send(`${callback}(${JSON.stringify(b64)})`);
+          return res.type('text/plain').send(b64);
         } catch (e) {
-          console.error('secureRender legacy error', e);
-          const fallback = 'console.log("fallback")';
-          if (callback) return res.type('application/javascript').send(`${callback}(${JSON.stringify(fallback)})`);
-          return res.type('text/plain').send(fallback);
+          if (callback) return res.type('application/javascript').send(`${callback}(${JSON.stringify('')})`);
+          return res.type('text/plain').send('');
         }
       }
-
       case 'saveUsageStats':
-      case 'logUserAccess':
-      case 'registerUser': {
-        // Các action log không quan trọng, trả success luôn để không block
-        return sendJSONP({ status: 'success' });
+      case 'logUserAccess': {
+        return sendJSONP({ status: 'success', success: true });
       }
-
-      case 'login':
-      case 'register': {
-        return sendJSONP({ status: 'error', message: 'Vui lòng dùng API mới /api/auth/login' });
-      }
-
       default: {
-        // Các action khác thử redirect sang API mới nếu có
-        if (action) {
-          console.log(`[LEGACY] Unknown action ${action}, return empty success to avoid blocking`);
-          return sendJSONP({ status: 'success', data: {}, action });
-        }
-        return sendJSONP({ status: 'error', message: 'Action không hợp lệ' });
+        console.log(`[LEGACY] Unknown action ${action}`);
+        return sendJSONP({ status: 'success', success: true, data: {}, action });
       }
     }
   } catch (e) {
     console.error('[LEGACY] error', e);
-    return sendJSONP({ status: 'error', message: e.toString() });
+    return sendJSONP({ status: 'error', success: false, message: e.toString() });
   }
 });
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ 
-    status: 'KaraRender API v2.1 - fixed verify & getLang',
-    uptime: process.uptime(),
-    allowedHosts: config.ALLOWED_HOSTS_STRICT
-  });
-});
-
+app.get('/', (req, res) => res.json({ status: 'KaraRender API v2.2 - login fixed', uptime: process.uptime() }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Fix secure-render route GET - support both /api/secure-render and legacy
-app.get('/api/secure-render-legacy', async (req, res) => {
-  // alias
-  res.redirect(`/api/secure-render?${new URLSearchParams(req.query).toString()}`);
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 KaraRender backend v2.1 listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 KaraRender backend v2.2 listening on port ${PORT}`));
