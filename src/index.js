@@ -40,63 +40,96 @@ async function sendTelegramNotification(message) {
   }
 }
 
-// Email sending for OTP - kích hoạt gửi mail cho user, không lộ OTP ở toast
+// Email sending for OTP - Fix Connection timeout với Gmail
 async function sendOTPEmail(toEmail, otp, userName = '') {
   try {
-    const emailHost = process.env.EMAIL_HOST || process.env.SMTP_HOST;
-    const emailPort = process.env.EMAIL_PORT || process.env.SMTP_PORT || 587;
+    const emailHost = process.env.EMAIL_HOST || process.env.SMTP_HOST || 'smtp.gmail.com';
+    let emailPort = parseInt(process.env.EMAIL_PORT || process.env.SMTP_PORT || '587');
     const emailUser = process.env.EMAIL_USER || process.env.SMTP_USER;
     const emailPass = process.env.EMAIL_PASS || process.env.SMTP_PASS || process.env.EMAIL_PASSWORD;
     const emailFrom = process.env.EMAIL_FROM || emailUser || 'noreply@kararender.com';
     
     if (!emailHost || !emailUser || !emailPass) {
-      console.log('[Email] Skipped - no SMTP config. Set EMAIL_HOST, EMAIL_USER, EMAIL_PASS in Render env');
-      console.log(`[Email Debug] Would send OTP ${otp} to ${toEmail}`);
-      return { success: false, reason: 'No SMTP config', debugOtp: otp };
+      console.log('[Email] Skipped - no SMTP config');
+      return { success: false, reason: 'No SMTP config' };
     }
 
-    try {
-      const nodemailer = require('nodemailer');
-      const transporter = nodemailer.createTransport({
+    const nodemailer = require('nodemailer');
+
+    // Thử 2 cấu hình: 587 STARTTLS và 465 SSL để tránh timeout
+    const configs = [
+      {
         host: emailHost,
-        port: parseInt(emailPort),
-        secure: emailPort == 465,
-        auth: { user: emailUser, pass: emailPass }
-      });
+        port: 587,
+        secure: false,
+        auth: { user: emailUser, pass: emailPass },
+        tls: { ciphers: 'SSLv3', rejectUnauthorized: false },
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
+      },
+      {
+        host: emailHost,
+        port: 465,
+        secure: true,
+        auth: { user: emailUser, pass: emailPass },
+        tls: { rejectUnauthorized: false },
+        connectionTimeout: 10000,
+        greetingTimeout: 10000,
+        socketTimeout: 15000,
+      }
+    ];
 
-      const mailOptions = {
-        from: `"KaraRender" <${emailFrom}>`,
-        to: toEmail,
-        subject: `Mã OTP KaraRender - ${otp}`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9;">
-            <div style="background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
-              <h1 style="color: #2563eb; text-align: center;">KaraRender</h1>
-              <h2 style="color: #333;">Xin chào ${userName || toEmail},</h2>
-              <p>Bạn vừa yêu cầu mã OTP để xác thực tài khoản KaraRender.</p>
-              <div style="background: #f0f7ff; border: 2px dashed #2563eb; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0;">
-                <p style="margin: 0; color: #666; font-size: 14px;">Mã OTP của bạn là:</p>
-                <p style="margin: 10px 0; font-size: 32px; font-weight: bold; color: #2563eb; letter-spacing: 5px;">${otp}</p>
-                <p style="margin: 0; color: #999; font-size: 12px;">Mã có hiệu lực trong 5 phút</p>
+    for (let i = 0; i < configs.length; i++) {
+      const cfg = configs[i];
+      try {
+        console.log(`[Email] Trying config ${i+1}: ${cfg.host}:${cfg.port} secure=${cfg.secure}`);
+        const transporter = nodemailer.createTransport(cfg);
+        
+        // Verify connection trước
+        await transporter.verify().catch(e => {
+          console.log(`[Email] Verify failed for ${cfg.port}:`, e.message);
+          throw e;
+        });
+
+        const mailOptions = {
+          from: emailFrom.includes('<') ? emailFrom : `"KaraRender" <${emailFrom}>`,
+          to: toEmail,
+          subject: `Mã OTP KaraRender - ${otp}`,
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9;">
+              <div style="background: white; padding: 30px; border-radius: 10px;">
+                <h1 style="color: #2563eb; text-align: center;">KaraRender</h1>
+                <h2>Xin chào ${userName || toEmail},</h2>
+                <p>Bạn vừa yêu cầu mã OTP để xác thực tài khoản KaraRender.</p>
+                <div style="background: #f0f7ff; border: 2px dashed #2563eb; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0;">
+                  <p style="margin: 0; color: #666; font-size: 14px;">Mã OTP của bạn là:</p>
+                  <p style="margin: 10px 0; font-size: 32px; font-weight: bold; color: #2563eb; letter-spacing: 5px;">${otp}</p>
+                  <p style="margin: 0; color: #999; font-size: 12px;">Mã có hiệu lực trong 5 phút</p>
+                </div>
+                <p style="color: #666; font-size: 14px;">Nếu bạn không yêu cầu mã này, vui lòng bỏ qua email này.</p>
               </div>
-              <p style="color: #666; font-size: 14px;">Nếu bạn không yêu cầu mã này, vui lòng bỏ qua email này.</p>
-              <p style="color: #999; font-size: 12px; margin-top: 30px; border-top: 1px solid #eee; padding-top: 20px;">
-                Email này được gửi tự động từ hệ thống KaraRender - www.kararender.com<br>
-                Vui lòng không trả lời email này.
-              </p>
             </div>
-          </div>
-        `,
-        text: `KaraRender - Mã OTP của bạn là: ${otp}. Mã có hiệu lực trong 5 phút.`
-      };
+          `,
+          text: `KaraRender - Mã OTP của bạn là: ${otp}. Mã có hiệu lực trong 5 phút.`
+        };
 
-      const info = await transporter.sendMail(mailOptions);
-      console.log('[Email] OTP sent to', toEmail, 'messageId:', info.messageId);
-      return { success: true, messageId: info.messageId };
-    } catch (e) {
-      console.log('[Email] Nodemailer error', e.message);
-      return { success: false, error: e.message, debugOtp: otp };
+        const info = await transporter.sendMail(mailOptions);
+        console.log(`[Email] OTP sent via port ${cfg.port} to`, toEmail, 'messageId:', info.messageId);
+        return { success: true, messageId: info.messageId, port: cfg.port };
+      } catch (e) {
+        console.log(`[Email] Config ${cfg.port} failed:`, e.message);
+        if (i === configs.length - 1) {
+          // Cấu hình cuối cùng vẫn fail
+          console.log('[Email] All configs failed, last error:', e.message);
+          return { success: false, error: e.message, debugOtp: otp };
+        }
+        // Thử cấu hình tiếp theo
+        continue;
+      }
     }
+
+    return { success: false, error: 'All SMTP configs failed' };
   } catch (e) {
     console.error('[Email] Send OTP error', e.message);
     return { success: false, error: e.message };
@@ -984,11 +1017,20 @@ app.all('/exec', async (req, res) => {
         const info = getClientInfoFull(req);
         const userInfo = getUserInfoFromRequest(req, params);
         
-        // Gửi mail cho user - kích hoạt gửi mail
-        const emailResult = await sendOTPEmail(email, otp, params.fullName || userInfo.fullName || '');
-        
-        // Telegram - có OTP nhưng không lộ ở frontend
-        await sendTelegramNotification(`🔑 <b>OTP Request</b>
+        // FIX: Trả về ngay lập tức để frontend không bị treo ở "ĐANG GỬI MÃ..."
+        // Trước: await sendOTPEmail rồi mới trả về → nếu SMTP chậm sẽ treo
+        // Sau: Trả về ngay, gửi mail + telegram ở background
+        sendJSONP({ 
+          success:true, 
+          message:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).`,
+          emailSent: true,
+        });
+
+        // Gửi mail và telegram ở background, không block response
+        (async () => {
+          try {
+            const emailResult = await sendOTPEmail(email, otp, params.fullName || userInfo.fullName || '');
+            await sendTelegramNotification(`🔑 <b>OTP Request</b>
 👤 <b>User:</b> ${userInfo.fullName} - ${email}
 📧 <b>Email:</b> ${email}
 🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅' : 'Chưa gửi mail (thiếu SMTP) ⚠️'}
@@ -998,13 +1040,12 @@ app.all('/exec', async (req, res) => {
 ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
 🌐 <b>Browser:</b> ${info.browser}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+          } catch (e) {
+            console.log('Background OTP email/telegram error', e.message);
+          }
+        })();
         
-        // FIX: Không trả về OTP ở response để toast không lộ mã
-        return sendJSONP({ 
-          success:true, 
-          message:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).`,
-          emailSent: emailResult.success,
-        });
+        return; // Đã trả về ở trên
       }
       case 'verifyOTP': {
         const email=(params.email||'').toLowerCase().trim();
