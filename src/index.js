@@ -1224,7 +1224,9 @@ ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:<
             const email = userInfo.email || params.email || 'N/A';
             const browserId = userInfo.browserId || info.browserFull || 'N/A';
             
-            await sendTelegramNotification(`${isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '🔔 <b>THÔNG BÁO TRUY CẬP</b> ${isBlocked ? '🚫 BLOCKED' : '✅ Allowed'}`}
+            const statusText = isBlocked ? '🚫 BLOCKED' : '✅ Allowed';
+            const titleText = isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '🔔 <b>THÔNG BÁO TRUY CẬP</b> ' + statusText;
+            await sendTelegramNotification(`${titleText}
 🌐 <b>Domain truy cập:</b> ${info.domain || params.domain || 'unknown'}
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
