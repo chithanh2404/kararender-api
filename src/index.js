@@ -1216,21 +1216,29 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
 ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:</b> Được phép'}
 ⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN')}`).catch(()=>{});
           } else {
-            const shouldNotify = process.env.TELEGRAM_NOTIFY_ALL_ACCESS === 'true' || isBlocked || (params.domain && params.domain.includes('blogspot'));
-            if (shouldNotify || isBlocked) {
-              await sendTelegramNotification(`${isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '👁️ <b>Truy cập mới</b>'}
-🌐 <b>Domain:</b> ${info.domain}
+            // FIX: Luôn gửi Telegram cho mọi truy cập, có đầy đủ thông tin user chi tiết
+            // Trước: chỉ gửi khi TELEGRAM_NOTIFY_ALL_ACCESS=true hoặc bị chặn hoặc blogspot
+            // Sau: luôn gửi, kể cả user login thành công từ www.kararender.com
+            const userInfo = getUserInfoFromRequest(req, params);
+            const fullName = userInfo.fullName || params.fullName || params.name || 'Khách';
+            const email = userInfo.email || params.email || 'N/A';
+            const browserId = userInfo.browserId || info.browserFull || 'N/A';
+            
+            await sendTelegramNotification(`${isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '🔔 <b>THÔNG BÁO TRUY CẬP</b> ${isBlocked ? '🚫 BLOCKED' : '✅ Allowed'}`}
+🌐 <b>Domain truy cập:</b> ${info.domain || params.domain || 'unknown'}
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
-${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN - ' + blockedReason : '✅ <b>Trạng thái:</b> Được phép'}
-📍 <b>IP:</b> ${info.ip}
+👤 <b>Tên:</b> ${fullName}
+📧 <b>Email:</b> ${email}
 ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.device === 'Mobile' ? 'Điện thoại' : info.device === 'Tablet' ? 'Máy tính bảng' : 'Máy tính'}
 🌐 <b>Browser:</b> ${info.browser}
-🖥️ <b>User-Agent:</b> ${info.browserFull.slice(0,300)}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}
+📍 <b>IP (server):</b> ${info.ip}
+📍 <b>IP (client):</b> ${params.ip || info.ip}
+🕒 <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}
+🆔 <b>User-Agent:</b> <code>${browserId.substring(0,200)}</code>
 📊 <b>Action:</b> ${action}
-${params.email ? '📧 <b>Email:</b> ' + params.email : ''}`).catch(()=>{});
-            }
+${isBlocked ? '🚫 <b>Lý do chặn:</b> ' + blockedReason : ''}
+📍 <b>Allowed:</b> ${ALLOWED_HOSTS_STRICT ? ALLOWED_HOSTS_STRICT.join(', ') : 'www.kararender.com, kararender.com'}`).catch(()=>{});
           }
         } catch(e) { console.log('Telegram notify error', e.message); }
         return sendJSONP({ success:true, isExport: isExportLog });
