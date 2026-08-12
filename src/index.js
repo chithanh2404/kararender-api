@@ -643,7 +643,7 @@ app.all('/exec', async (req, res) => {
     else res.type('text/plain').send(txt);
   };
 
-  const protectedActions = ['getFonts','getFontBase64','getEffects','getSecureRenderModule','getRenderEngine','kara-render-engine','saveUsageStats','getStyleList','getStyleContent','registerUser','logUserAccess'];
+  const protectedActions = ['getFonts','getFontBase64','getEffects','getSecureRenderModule','getRenderEngine','kara-render-engine','saveUsageStats','getStyleList','getStyleContent','registerUser','logUserAccess','getLang','getlang'];
   if (protectedActions.includes(action)) {
     const guard = checkCorsGuardStrict(req);
     if (guard.blocked) {
@@ -656,6 +656,51 @@ app.all('/exec', async (req, res) => {
   try {
     const { supabaseAdmin } = require('./services/supabase');
     switch (action) {
+      case 'getLang':
+      case 'getlang': {
+        try{
+          const langCode = (params.lang || 'vi').toLowerCase();
+          console.log('[getLang v5.1 FIX] Request lang:', langCode, 'from', params.domain || params.origin);
+          let langData = null;
+          
+          // 1. Supabase languages table
+          if (supabaseAdmin) {
+            const { data } = await supabaseAdmin.from('languages').select('data').eq('code', langCode).maybeSingle();
+            if (data && data.data) {
+              langData = data.data;
+              console.log('[getLang v5.1 FIX] Found in Supabase', langCode, Object.keys(langData).length+' keys');
+            }
+          }
+          
+          // 2. Drive fallback
+          if (!langData) {
+            try {
+              const { listFilesInFolder, getFileContentAsString } = require('./services/drive');
+              const folderId = process.env.LANGUAGES_FOLDER_ID || '1mdXYIMIQiOXeMg3uWIaEeRnrNOoijUNp';
+              const files = await listFilesInFolder(folderId);
+              const target = files.find(f => f.name.toLowerCase() === langCode+'.json');
+              if (target) {
+                const content = await getFileContentAsString(target.id);
+                if (content) {
+                  langData = JSON.parse(content);
+                  console.log('[getLang v5.1 FIX] Found in Drive', langCode);
+                }
+              }
+            } catch(e) { console.log('[getLang v5.1 FIX] Drive error', e.message); }
+          }
+          
+          // FIX: Trả về đúng format theme cũ cần: {status:success, data:{...}}
+          if (langData) {
+            return sendJSONP({ status: 'success', success: true, data: langData });
+          } else {
+            console.log('[getLang v5.1 FIX] Not found', langCode, 'returning empty success');
+            return sendJSONP({ status: 'success', success: true, data: {} });
+          }
+        }catch(e){
+          console.error('[getLang v5.1 FIX] Exception', e);
+          return sendJSONP({ status: 'success', success: true, data: {} });
+        }
+      }
       case 'getEffects': {
         try{
           const { data } = await supabaseAdmin.from('app_data').select('content').eq('key','effects').maybeSingle();
