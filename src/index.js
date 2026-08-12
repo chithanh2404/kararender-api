@@ -1074,34 +1074,33 @@ app.all('/exec', async (req, res) => {
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ success:true, message:'Đã gửi yêu cầu VIP!' });
       }
-            case 'sendOTP': {
+                  case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
-        if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'Email không hợp lệ' });
+        if (!email || !email.includes('@')) return sendJSONP('❌ Email không hợp lệ');
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
         try {
+          // Lưu OTP vào Supabase - là nguồn duy nhất để verify
           await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString() }, { onConflict:'email' });
+          console.log(`[OTP] Saved ${otp} for ${email} to Supabase`);
         } catch (e) { console.log('OTP save error', e.message); }
         const info = getClientInfoFull(req);
         const userInfo = getUserInfoFromRequest(req, params);
         
-        // FIX: Trả về ngay lập tức để frontend không bị treo ở "ĐANG GỬI MÃ..."
-        // Trước: await sendOTPEmail rồi mới trả về → nếu SMTP chậm sẽ treo
-        // Sau: Trả về ngay, gửi mail + telegram ở background
-        sendJSONP({ 
-          success:true, 
-          message:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).`,
-          emailSent: true,
-        });
+        // FIX 1: Toast gọn - trả về string trực tiếp, không phải object JSON
+        // Trước: sendJSONP({success:true, message:"..."}) → frontend JSON.stringify → hiện cả {"success":true,"message":...}
+        // Sau: sendJSONP("Mã OTP đã được gửi...") → frontend hiện gọn
+        sendJSONP(`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).`);
 
-        // Gửi mail và telegram ở background, không block response
+        // FIX 2: OTP đồng nhất - Gửi đúng OTP này (807781) qua Apps Script, không để Apps Script tự sinh OTP mới (570810)
+        // Apps Script sẽ nhận otp param và dùng luôn, lưu vào cache của nó
         (async () => {
           try {
-            const emailResult = await sendOTPEmail(email, otp, params.fullName || userInfo.fullName || '');
+            const emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip);
             await sendTelegramNotification(`🔑 <b>OTP Request</b>
 👤 <b>User:</b> ${userInfo.fullName} - ${email}
 📧 <b>Email:</b> ${email}
-🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅' : 'Chưa gửi mail (thiếu SMTP) ⚠️'}
+🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📍 <b>IP:</b> ${info.ip}
@@ -1113,7 +1112,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
           }
         })();
         
-        return; // Đã trả về ở trên
+        return;
       }
       case 'verifyOTP': {
         const email=(params.email||'').toLowerCase().trim();
