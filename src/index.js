@@ -54,6 +54,44 @@ function getClientInfo(req) {
   }
 }
 
+function getClientInfoFull(req) {
+  try {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.ip || req.connection?.remoteAddress || 'unknown';
+    const userAgent = req.headers['user-agent'] || 'unknown';
+    const origin = req.headers.origin || req.headers.referer || req.body?.origin || req.query?.origin || 'unknown';
+    const domain = req.body?.domain || req.query?.domain || req.headers.origin || req.headers.referer || 'unknown';
+    const fullUrl = req.body?.fullUrl || req.query?.fullUrl || req.headers.referer || 'unknown';
+    const referer = req.headers.referer || 'unknown';
+    const uaLower = userAgent.toLowerCase();
+    let device = 'Desktop';
+    let deviceIcon = '💻';
+    if (/mobile|android|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(uaLower)) {
+      device = 'Mobile';
+      deviceIcon = '📱';
+      if (/ipad|tablet/i.test(uaLower)) {
+        device = 'Tablet';
+        deviceIcon = '📲';
+      }
+    }
+    let os = 'Unknown';
+    if (uaLower.includes('windows')) os = 'Windows';
+    else if (uaLower.includes('mac os') || uaLower.includes('macintosh')) os = 'macOS';
+    else if (uaLower.includes('linux')) os = 'Linux';
+    else if (uaLower.includes('android')) os = 'Android';
+    else if (uaLower.includes('iphone') || uaLower.includes('ipad')) os = 'iOS';
+    let browser = 'Unknown';
+    if (uaLower.includes('chrome') && !uaLower.includes('edg') && !uaLower.includes('opr')) browser = 'Chrome';
+    else if (uaLower.includes('firefox')) browser = 'Firefox';
+    else if (uaLower.includes('safari') && !uaLower.includes('chrome')) browser = 'Safari';
+    else if (uaLower.includes('edg')) browser = 'Edge';
+    else if (uaLower.includes('opr') || uaLower.includes('opera')) browser = 'Opera';
+    else if (uaLower.includes('coc_coc')) browser = 'Cốc Cốc';
+    return { ip, userAgent, origin, domain, fullUrl, referer, device, deviceIcon, os, browser, browserFull: userAgent.slice(0,400) };
+  } catch {
+    return { ip: 'unknown', userAgent: 'unknown', origin: 'unknown', domain: 'unknown', fullUrl: 'unknown', referer: 'unknown', device: 'Unknown', deviceIcon: '❓', os: 'Unknown', browser: 'Unknown', browserFull: 'unknown' };
+  }
+}
+
 async function seedAdmin() {
   try {
     const { supabaseAdmin } = require('./services/supabase');
@@ -859,7 +897,32 @@ app.all('/exec', async (req, res) => {
       }
       case 'saveUsageStats':
       case 'logUserAccess': {
-        try{ if(supabaseAdmin) await supabaseAdmin.from('usage_stats').insert({ data: params, created_at: new Date().toISOString(), ip: req.ip }); }catch{}
+        try{ 
+          if(supabaseAdmin) {
+            await supabaseAdmin.from('usage_stats').insert({ data: params, created_at: new Date().toISOString(), ip: req.ip, domain: params.domain||'' }); 
+          }
+        }catch(e){ console.log('usage_stats error', e.message); }
+        // Telegram access notify với đầy đủ thông tin: domain, chặn hay không, IP, browser, thiết bị mobile/desktop
+        try {
+          const info = getClientInfoFull(req);
+          const isBlocked = checkCorsGuardStrict(req).blocked;
+          const blockedReason = checkCorsGuardStrict(req).reason || '';
+          const shouldNotify = process.env.TELEGRAM_NOTIFY_ALL_ACCESS === 'true' || isBlocked || (params.domain && params.domain.includes('blogspot'));
+          if (shouldNotify || isBlocked) {
+            await sendTelegramNotification(`${isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '👁️ <b>Truy cập mới</b>'}
+🌐 <b>Domain:</b> ${info.domain}
+🔗 <b>Origin:</b> ${info.origin}
+📄 <b>Full URL:</b> ${info.fullUrl}
+${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN - ' + blockedReason : '✅ <b>Trạng thái:</b> Được phép'}
+📍 <b>IP:</b> ${info.ip}
+${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.device === 'Mobile' ? 'Điện thoại' : info.device === 'Tablet' ? 'Máy tính bảng' : 'Máy tính'}
+🌐 <b>Browser:</b> ${info.browser}
+🖥️ <b>User-Agent:</b> ${info.browserFull.slice(0,300)}
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}
+📊 <b>Action:</b> ${action}
+${params.email ? '📧 <b>Email:</b> ' + params.email : ''}`).catch(()=>{});
+          }
+        } catch(e) { console.log('Telegram access notify error', e.message); }
         return sendJSONP({ success:true });
       }
       default: {
