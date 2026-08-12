@@ -211,6 +211,48 @@ app.all('/exec', async (req, res) => {
       case 'getStyleList': {
         return sendJSONP([]);
       }
+      case 'updateProfile':
+      case 'updateUserProfileFields': {
+        const email = (params.email || '').toLowerCase().trim();
+        const fullName = params.fullName || params.full_name || '';
+        const oldPassword = params.oldPassword || params.old_password || '';
+        const newPassword = params.newPassword || params.new_password || '';
+        if (!email || !oldPassword) return sendJSONP({ success: false, message: 'Thiếu email hoặc mật khẩu cũ' });
+
+        const { data: user } = await supabaseAdmin.from('users').select('*').eq('email', email).single();
+        if (!user) return sendJSONP({ success: false, message: 'Tài khoản không tồn tại' });
+
+        const ok = await bcrypt.compare(oldPassword, user.password_hash);
+        if (!ok) return sendJSONP({ success: false, message: 'Mật khẩu cũ không đúng' });
+
+        let updateData = {};
+        if (fullName) updateData.full_name = fullName;
+        if (newPassword) {
+          updateData.password_hash = await bcrypt.hash(newPassword, 10);
+        }
+
+        if (Object.keys(updateData).length > 0) {
+          const { error } = await supabaseAdmin.from('users').update(updateData).eq('id', user.id);
+          if (error) return sendJSONP({ success: false, message: error.message });
+        }
+
+        const { data: updatedUser } = await supabaseAdmin.from('users').select('*').eq('id', user.id).single();
+        const newToken = createOldStyleToken(updatedUser);
+        return sendJSONP({ success: true, status: 'success', message: 'Cập nhật thành công', newToken: newToken, token: newToken });
+      }
+
+      case 'requestVip':
+      case 'requestUpgradeVipServer': {
+        const email = (params.email || '').toLowerCase().trim();
+        if (email) {
+          try {
+            const { sendTelegramNotification } = require('./services/telegram');
+            await sendTelegramNotification(`💎 <b>Yêu cầu VIP</b>\n📧 ${email}\n⏰ ${new Date().toLocaleString('vi-VN')}`);
+          } catch {}
+        }
+        return sendJSONP({ success: true, status: 'success', message: 'Đã gửi yêu cầu VIP' });
+      }
+
       case 'getStyleContent': {
         return sendJSONP({ type: 'html', content: '<div></div>' });
       }
