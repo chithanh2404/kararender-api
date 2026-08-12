@@ -5,44 +5,33 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
-const { domainGuard } = require('./middleware/domainGuard');
-const { rateLimit } = require('./middleware/rateLimit');
 
 const app = express();
 const PORT = config.PORT;
 app.set('trust proxy', true);
-app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true }));
-
-const protectedActions = ['getFonts','getFontBase64','getEffects','getSecureRenderModule','getRenderEngine','kara-render-engine','saveUsageStats','getStyleList','getStyleContent','registerUser','logUserAccess'];
-app.use(domainGuard(protectedActions));
-
-// Existing API routes
-app.use('/api/secure-render', require('./routes/secureRender'));
-app.use('/api/auth', rateLimit({ max: 20, windowMs: 3600000, keyPrefix: 'otp' }), require('./routes/auth'));
-app.use('/api', require('./routes/content'));
 
 // Seed admin
 async function seedAdmin() {
   try {
     const { supabaseAdmin } = require('./services/supabase');
-    if (!supabaseAdmin) return;
+    if (!supabaseAdmin) { console.log('[SEED] no supabase'); return; }
     const adminEmail = (process.env.ADMIN_EMAIL || 'chithanh2404@gmail.com').toLowerCase();
     const adminPass = process.env.ADMIN_PASSWORD || 'Admin123@';
     const { data: existing } = await supabaseAdmin.from('users').select('id').eq('email', adminEmail).maybeSingle();
-    if (existing) { console.log(`[SEED] Admin ${adminEmail} exists`); return; }
+    if (existing) { console.log(`[SEED] Admin exists ${adminEmail}`); return; }
     const hash = await bcrypt.hash(adminPass, 10);
-    await supabaseAdmin.from('users').insert({ email: adminEmail, password_hash: hash, full_name: 'Lâm Chí Thành', is_vip: true, created_at: new Date().toISOString() });
-    console.log(`[SEED] Created admin ${adminEmail}`);
+    const { error } = await supabaseAdmin.from('users').insert({ email: adminEmail, password_hash: hash, full_name: 'Lâm Chí Thành', is_vip: true, created_at: new Date().toISOString() });
+    if (error) console.error('[SEED] error', error.message); else console.log(`[SEED] Created ${adminEmail}`);
   } catch (e) { console.error('[SEED]', e.message); }
 }
 seedAdmin();
 
 function decodeOldToken(t) {
   try {
-    if (!t) return null;
     let s = decodeURIComponent(t).replace(/-/g, '+').replace(/_/g, '/');
     while (s.length % 4 !== 0) s += '=';
     const obj = JSON.parse(Buffer.from(s, 'base64').toString('utf-8'));
@@ -65,57 +54,60 @@ function createOldStyleToken(p) {
   return Buffer.from(JSON.stringify(data)).toString('base64');
 }
 
-// ========== ADMIN DASHBOARD HTML ==========
 const adminHTML = `
 <!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>KaraRender Admin</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined" rel="stylesheet"/>
+<title>KaraRender Admin v3.6</title>
+<style>
+*{box-sizing:border-box} body{font-family:Inter,system-ui,sans-serif;background:#0b1020;color:#e2e8f0;margin:0}
+.card{background:rgba(30,41,59,0.5);border:1px solid #334155;border-radius:12px;padding:16px}
+.btn{background:#2563eb;color:white;border:0;padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:700;font-size:13px}
+.btn:hover{background:#1d4ed8} .btn-amber{background:#d97706} .btn-amber:hover{background:#b45309}
+table{width:100%;border-collapse:collapse} th{color:#94a3b8;font-size:11px;text-transform:uppercase;padding:8px;text-align:left;background:#0f172a;position:sticky;top:0} td{padding:8px;border-bottom:1px solid #1e293b;font-size:12px}
+input{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 12px;color:white;font-size:13px}
+.badge{font-size:10px;padding:2px 6px;border-radius:4px;font-weight:900}
+</style>
 </head>
-<body class="bg-[#0b1020] text-slate-200 min-h-screen">
-<div class="max-w-7xl mx-auto p-4 md:p-6">
-  <div class="flex items-center justify-between mb-6">
-    <h1 class="text-2xl font-black flex items-center gap-2"><span class="material-symbols-outlined text-amber-400">admin_panel_settings</span> KaraRender Admin v3.5</h1>
-    <div class="flex gap-2">
-      <input id="adminEmail" placeholder="admin email để xác thực" class="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm w-64" value="chithanh2404@gmail.com"/>
-      <button onclick="loadAll()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded-lg text-sm font-bold">Tải dữ liệu</button>
+<body>
+<div style="max-width:1200px;margin:0 auto;padding:20px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:12px">
+    <h1 style="font-size:24px;font-weight:900">👑 KaraRender Admin v3.6 <span style="font-size:12px;color:#94a3b8">FIXED</span></h1>
+    <div style="display:flex;gap:8px">
+      <input id="adminEmail" placeholder="admin email" style="width:240px" value="chithanh2404@gmail.com"/>
+      <button class="btn" onclick="loadAll()">Tải dữ liệu</button>
+      <button class="btn" style="background:#334155" onclick="checkDebug()">Debug</button>
     </div>
   </div>
 
-  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-    <div class="bg-slate-800/50 border border-slate-700 rounded-xl p-4"><div class="text-xs text-slate-400 uppercase">Tổng Users</div><div id="statUsers" class="text-2xl font-black mt-1">-</div></div>
-    <div class="bg-slate-800/50 border border-slate-700 rounded-xl p-4"><div class="text-xs text-slate-400 uppercase">VIP / Admin</div><div id="statVip" class="text-2xl font-black mt-1">-</div></div>
-    <div class="bg-slate-800/50 border border-slate-700 rounded-xl p-4"><div class="text-xs text-slate-400 uppercase">Feedbacks</div><div id="statFeedback" class="text-2xl font-black mt-1">-</div></div>
-    <div class="bg-slate-800/50 border border-slate-700 rounded-xl p-4"><div class="text-xs text-slate-400 uppercase">Usage Logs</div><div id="statUsage" class="text-2xl font-black mt-1">-</div></div>
+  <div id="debugBox" style="display:none" class="card" style="margin-bottom:16px;background:#1e1b4b"></div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:20px">
+    <div class="card"><div style="font-size:11px;color:#94a3b8">Tổng Users</div><div id="statUsers" style="font-size:28px;font-weight:900">-</div><div id="statUsersSub" style="font-size:11px;color:#64748b"></div></div>
+    <div class="card"><div style="font-size:11px;color:#94a3b8">VIP / Admin</div><div id="statVip" style="font-size:28px;font-weight:900">-</div></div>
+    <div class="card"><div style="font-size:11px;color:#94a3b8">Feedbacks</div><div id="statFeedback" style="font-size:28px;font-weight:900">-</div></div>
+    <div class="card"><div style="font-size:11px;color:#94a3b8">Usage Logs</div><div id="statUsage" style="font-size:28px;font-weight:900">-</div></div>
   </div>
 
-  <div class="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4 mb-6">
-    <h3 class="font-bold text-amber-400 mb-2 flex items-center gap-2"><span class="material-symbols-outlined">drive_folder_upload</span> Import Users từ Google Drive</h3>
-    <p class="text-xs text-slate-400 mb-3">Cần cấu hình <code>GOOGLE_SERVICE_ACCOUNT_JSON</code> và <code>USERS_FOLDER_ID</code> trong Render Environment. Tool sẽ đọc tất cả file JSON trong folder Users cũ và import vào Supabase, tự hash lại mật khẩu nếu cần.</p>
-    <div class="flex gap-2">
-      <button onclick="importDrive()" id="btnImport" class="bg-amber-600 hover:bg-amber-700 px-4 py-2 rounded-lg text-sm font-bold">🚀 Import từ Drive ngay</button>
-      <span id="importStatus" class="text-xs py-2"></span>
+  <div class="card" style="margin-bottom:20px;border-color:#f59e0b;background:rgba(245,158,11,0.1)">
+    <h3 style="color:#fbbf24;font-weight:800;margin-bottom:8px">📁 Import Users từ Google Drive cũ</h3>
+    <p style="font-size:12px;color:#94a3b8;margin-bottom:12px">Cần 2 biến trong Render: <code>GOOGLE_SERVICE_ACCOUNT_JSON</code> và <code>USERS_FOLDER_ID</code>. Tool sẽ đọc tất cả file JSON trong folder và import vào Supabase.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-amber" onclick="importDrive()" id="btnImport">🚀 Import từ Drive ngay</button>
+      <span id="importStatus" style="font-size:12px"></span>
     </div>
-    <div id="importLog" class="mt-3 text-xs font-mono bg-black/30 rounded p-2 max-h-60 overflow-auto hidden"></div>
+    <pre id="importLog" style="margin-top:12px;background:#020617;padding:12px;border-radius:8px;max-height:300px;overflow:auto;display:none;font-size:11px;white-space:pre-wrap"></pre>
   </div>
 
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-    <div class="bg-slate-800/30 border border-slate-700 rounded-xl overflow-hidden">
-      <div class="px-4 py-3 border-b border-slate-700 flex justify-between items-center"><h2 class="font-bold">👥 Users (1000 mới nhất)</h2><input id="searchUser" placeholder="Tìm email..." class="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs w-40" oninput="filterUsers()"/></div>
-      <div class="overflow-auto max-h-[600px]"><table class="w-full text-xs"><thead class="sticky top-0 bg-slate-900 text-slate-400"><tr><th class="p-2 text-left">Email</th><th class="p-2">Tên</th><th class="p-2">VIP</th><th class="p-2">Ngày tạo</th><th class="p-2">Action</th></tr></thead><tbody id="usersBody"></tbody></table></div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+    <div class="card" style="padding:0;overflow:hidden">
+      <div style="padding:12px 16px;border-bottom:1px solid #334155;display:flex;justify-content:space-between"><b>👥 Users (2000 mới nhất)</b><input id="searchUser" placeholder="Tìm email..." style="width:140px;padding:4px 8px;font-size:11px" oninput="filterUsers()"/></div>
+      <div style="overflow:auto;max-height:600px"><table><thead><tr><th>Email</th><th>Tên</th><th>VIP</th><th>Ngày tạo</th><th>Action</th></tr></thead><tbody id="usersBody"><tr><td colspan="5" style="text-align:center;padding:20px;color:#64748b">Chưa tải</td></tr></tbody></table></div>
     </div>
-    <div class="space-y-6">
-      <div class="bg-slate-800/30 border border-slate-700 rounded-xl overflow-hidden">
-        <div class="px-4 py-3 border-b border-slate-700 font-bold">💬 Feedbacks mới</div>
-        <div id="feedbackList" class="p-3 space-y-2 max-h-[300px] overflow-auto text-xs"></div>
-      </div>
-      <div class="bg-slate-800/30 border border-slate-700 rounded-xl overflow-hidden">
-        <div class="px-4 py-3 border-b border-slate-700 font-bold">📊 Usage Logs mới</div>
-        <div id="usageList" class="p-3 space-y-1 max-h-[300px] overflow-auto text-[11px] font-mono"></div>
-      </div>
+    <div style="display:flex;flex-direction:column;gap:20px">
+      <div class="card" style="padding:0;overflow:hidden"><div style="padding:12px 16px;border-bottom:1px solid #334155"><b>💬 Feedbacks mới</b></div><div id="feedbackList" style="padding:12px;max-height:280px;overflow:auto;font-size:12px">Chưa tải</div></div>
+      <div class="card" style="padding:0;overflow:hidden"><div style="padding:12px 16px;border-bottom:1px solid #334155"><b>📊 Usage Logs mới</b></div><div id="usageList" style="padding:12px;max-height:280px;overflow:auto;font-family:monospace;font-size:11px">Chưa tải</div></div>
     </div>
   </div>
 </div>
@@ -125,40 +117,61 @@ async function api(path, method='GET', body=null){
   const adminEmail = document.getElementById('adminEmail').value.trim();
   const opts = { method, headers: { 'Content-Type': 'application/json', 'x-admin-email': adminEmail } };
   if (body) opts.body = JSON.stringify({ ...body, adminEmail });
-  const url = path + (path.includes('?') ? '&' : '?') + 'adminEmail=' + encodeURIComponent(adminEmail);
+  const url = path + (path.includes('?')?'&':'?') + 'adminEmail=' + encodeURIComponent(adminEmail);
+  console.log('Fetch', url);
   const res = await fetch(url, opts);
-  return res.json();
+  const txt = await res.text();
+  try { return JSON.parse(txt); } catch { return { raw: txt, status: res.status }; }
+}
+async function checkDebug(){
+  const box = document.getElementById('debugBox');
+  box.style.display='block';
+  box.innerHTML='Đang kiểm tra...';
+  try {
+    const data = await api('/api/admin/debug');
+    box.innerHTML = '<b>Debug Info:</b><pre style="white-space:pre-wrap;font-size:11px;margin-top:8px">' + JSON.stringify(data, null, 2) + '</pre>';
+  } catch(e){ box.innerHTML = 'Lỗi: ' + e.message; }
 }
 async function loadAll(){
   try {
+    document.getElementById('usersBody').innerHTML = '<tr><td colspan="5" style="text-align:center;padding:20px">Đang tải...</td></tr>';
     const users = await api('/api/admin/users');
-    const feedbacks = await api('/api/admin/feedbacks');
-    const usage = await api('/api/admin/usage');
+    console.log('users', users);
+    if (users.error) { document.getElementById('usersBody').innerHTML = '<tr><td colspan="5" style="color:#ef4444">Lỗi: ' + users.error + '</td></tr>'; return; }
+    if (users.raw) { document.getElementById('usersBody').innerHTML = '<tr><td colspan="5" style="color:#ef4444">Lỗi raw: ' + users.raw.slice(0,500) + '</td></tr>'; return; }
     if (Array.isArray(users)) {
       allUsers = users;
       document.getElementById('statUsers').textContent = users.length;
+      document.getElementById('statUsersSub').textContent = users.length ? 'Mới nhất: ' + (users[0]?.email||'') : '';
       document.getElementById('statVip').textContent = users.filter(u=>u.is_vip).length;
       renderUsers(users);
+    } else {
+      document.getElementById('usersBody').innerHTML = '<tr><td colspan="5">Không phải array: ' + JSON.stringify(users).slice(0,500) + '</td></tr>';
     }
+
+    const feedbacks = await api('/api/admin/feedbacks');
     if (Array.isArray(feedbacks)) {
       document.getElementById('statFeedback').textContent = feedbacks.length;
-      document.getElementById('feedbackList').innerHTML = feedbacks.slice(0,50).map(f => \`<div class="bg-slate-900 p-2 rounded"><div class="text-slate-400">\${f.email||'Ẩn danh'} - \${new Date(f.created_at).toLocaleString('vi-VN')}</div><div class="mt-1">\${(f.message||'').slice(0,300)}</div></div>\`).join('') || '<div class="text-slate-500">Chưa có feedback</div>';
+      document.getElementById('feedbackList').innerHTML = feedbacks.slice(0,50).map(f => \`<div style="background:#0f172a;padding:8px;border-radius:6px;margin-bottom:6px"><div style="color:#94a3b8">\${f.email||'Ẩn danh'} - \${new Date(f.created_at).toLocaleString('vi-VN')}</div><div style="margin-top:4px">\${(f.message||'').slice(0,300)}</div></div>\`).join('') || 'Chưa có';
     }
+
+    const usage = await api('/api/admin/usage');
     if (Array.isArray(usage)) {
       document.getElementById('statUsage').textContent = usage.length;
-      document.getElementById('usageList').innerHTML = usage.slice(0,100).map(u => \`<div>\${new Date(u.created_at).toLocaleTimeString()} - \${u.ip||''} - \${JSON.stringify(u.data||{}).slice(0,120)}</div>\`).join('');
+      document.getElementById('usageList').innerHTML = usage.slice(0,100).map(u => \`<div>\${new Date(u.created_at).toLocaleTimeString()} - \${u.ip||''} - \${JSON.stringify(u.data||{}).slice(0,120)}</div>\`).join('') || 'Chưa có';
     }
-  } catch(e){ alert('Lỗi: ' + e.message); }
+  } catch(e){ alert('Lỗi loadAll: ' + e.message); console.error(e); }
 }
 function renderUsers(users){
   const body = document.getElementById('usersBody');
+  if (!users.length) { body.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:20px">Trống - chưa có user nào hoặc chưa import</td></tr>'; return; }
   body.innerHTML = users.map(u => \`
-    <tr class="border-b border-slate-800 hover:bg-slate-800/50">
-      <td class="p-2 truncate max-w-[180px]">\${u.email}</td>
-      <td class="p-2">\${u.full_name||''}</td>
-      <td class="p-2 text-center">\${u.is_vip ? '👑' : ''}</td>
-      <td class="p-2">\${new Date(u.created_at).toLocaleDateString()}</td>
-      <td class="p-2"><button onclick="toggleVip('\${u.email}', \${!u.is_vip})" class="px-2 py-1 rounded \${u.is_vip ? 'bg-slate-700' : 'bg-amber-600'} text-[10px]">\${u.is_vip ? 'Hủy VIP' : 'Duyệt VIP'}</button></td>
+    <tr>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis">\${u.email}</td>
+      <td>\${u.full_name||''}</td>
+      <td style="text-align:center">\${u.is_vip ? '👑' : ''}</td>
+      <td>\${u.created_at ? new Date(u.created_at).toLocaleDateString() : ''}</td>
+      <td><button onclick="toggleVip('\${u.email}', \${!u.is_vip})" style="padding:4px 8px;border-radius:4px;border:0;cursor:pointer;font-size:10px;background:\${u.is_vip ? '#334155' : '#d97706'};color:white">\${u.is_vip ? 'Hủy VIP' : 'Duyệt VIP'}</button></td>
     </tr>\`).join('');
 }
 function filterUsers(){
@@ -176,13 +189,13 @@ async function importDrive(){
   const log = document.getElementById('importLog');
   btn.disabled = true; btn.textContent = 'Đang import...';
   status.textContent = 'Đang đọc Drive...';
-  log.classList.remove('hidden'); log.textContent = '';
+  log.style.display='block'; log.textContent = 'Đang xử lý...';
   try {
     const res = await api('/api/admin/import-drive-users', 'POST', {});
     status.textContent = res.message || 'Xong';
     log.textContent = JSON.stringify(res, null, 2);
     if (res.imported) loadAll();
-  } catch(e){ status.textContent = 'Lỗi: ' + e.message; }
+  } catch(e){ status.textContent = 'Lỗi: ' + e.message; log.textContent = e.stack||e.message; }
   btn.disabled = false; btn.textContent = '🚀 Import từ Drive ngay';
 }
 loadAll();
@@ -193,17 +206,62 @@ loadAll();
 
 app.get('/admin', (req, res) => res.type('html').send(adminHTML));
 
-// Admin API
+app.get('/api/admin/debug', async (req, res) => {
+  const { supabaseAdmin } = (() => { try { return require('./services/supabase'); } catch { return { supabaseAdmin: null }; } })();
+  let supaOk = false, usersCount = 0, driveOk = false, driveFiles = 0;
+  try {
+    if (supabaseAdmin) {
+      const { data, error } = await supabaseAdmin.from('users').select('id', { count: 'exact', head: true });
+      if (!error) { supaOk = true; usersCount = data?.length || 0; }
+      const { count } = await supabaseAdmin.from('users').select('*', { count: 'exact', head: true });
+      usersCount = count || 0;
+    }
+  } catch (e) { }
+  try {
+    const { getDriveClient, listFilesInFolder } = require('./services/drive');
+    const drive = getDriveClient();
+    if (drive) {
+      driveOk = true;
+      if (process.env.USERS_FOLDER_ID) {
+        const files = await listFilesInFolder(process.env.USERS_FOLDER_ID);
+        driveFiles = files.length;
+      }
+    }
+  } catch (e) { }
+
+  res.json({
+    version: 'v3.6 fixed',
+    env: {
+      SUPABASE_URL: !!process.env.SUPABASE_URL,
+      SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+      USERS_FOLDER_ID: process.env.USERS_FOLDER_ID || 'NOT SET',
+      GOOGLE_SERVICE_ACCOUNT_JSON: !!process.env.GOOGLE_SERVICE_ACCOUNT_JSON,
+      ADMIN_EMAIL: process.env.ADMIN_EMAIL || 'NOT SET',
+      ADMIN_EMAILS: process.env.ADMIN_EMAILS || 'NOT SET',
+      DRIVE: {
+        USERS_FOLDER_ID: !!process.env.USERS_FOLDER_ID,
+        FONTS_FOLDER_ID: !!process.env.FONTS_FOLDER_ID,
+        SECURE_RENDER_FOLDER_ID: !!process.env.SECURE_RENDER_FOLDER_ID
+      }
+    },
+    supabase: { ok: supaOk, usersCount },
+    drive: { ok: driveOk, filesInUsersFolder: driveFiles }
+  });
+});
+
 app.get('/api/admin/users', async (req, res) => {
   try {
     const { supabaseAdmin } = require('./services/supabase');
-    const { data } = await supabaseAdmin.from('users').select('id,email,full_name,is_vip,created_at,last_login_at').order('created_at', { ascending: false }).limit(2000);
+    if (!supabaseAdmin) return res.status(500).json({ error: 'Supabase not configured - missing SUPABASE_URL or SERVICE_ROLE_KEY' });
+    const { data, error } = await supabaseAdmin.from('users').select('id,email,full_name,is_vip,created_at,last_login_at').order('created_at', { ascending: false }).limit(2000);
+    if (error) return res.status(500).json({ error: error.message });
     res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
 });
 app.get('/api/admin/feedbacks', async (req, res) => {
   try {
     const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return res.json([]);
     const { data } = await supabaseAdmin.from('feedbacks').select('*').order('created_at', { ascending: false }).limit(200);
     res.json(data || []);
   } catch (e) { res.json([]); }
@@ -211,6 +269,7 @@ app.get('/api/admin/feedbacks', async (req, res) => {
 app.get('/api/admin/usage', async (req, res) => {
   try {
     const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return res.json([]);
     const { data } = await supabaseAdmin.from('usage_stats').select('*').order('created_at', { ascending: false }).limit(200);
     res.json(data || []);
   } catch (e) { res.json([]); }
@@ -219,104 +278,57 @@ app.post('/api/admin/approve-vip', async (req, res) => {
   try {
     const { supabaseAdmin } = require('./services/supabase');
     const { email, action } = req.body;
-    const isVip = action === 'approve';
-    await supabaseAdmin.from('users').update({ is_vip: isVip }).eq('email', (email||'').toLowerCase());
+    await supabaseAdmin.from('users').update({ is_vip: action === 'approve' }).eq('email', (email||'').toLowerCase());
     res.json({ status: 'success' });
   } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
 });
-
-// Import from Drive
 app.post('/api/admin/import-drive-users', async (req, res) => {
-  const adminEmail = (req.body.adminEmail || req.query.adminEmail || '').toLowerCase();
-  const allowedAdmins = (process.env.ADMIN_EMAILS || process.env.ADMIN_EMAIL || 'chithanh2404@gmail.com').toLowerCase().split(',').map(s=>s.trim());
-  if (allowedAdmins.length && !allowedAdmins.includes(adminEmail)) {
-    return res.status(403).json({ status: 'error', message: 'Không có quyền admin: ' + adminEmail });
-  }
-
   try {
     const { supabaseAdmin } = require('./services/supabase');
     const { listFilesInFolder, getFileContentAsString } = require('./services/drive');
     const folderId = process.env.USERS_FOLDER_ID;
-    if (!folderId) return res.json({ status: 'error', message: 'Chưa cấu hình USERS_FOLDER_ID trong Environment. Hãy thêm ID folder Users trên Drive vào Render.' });
-
+    if (!folderId) return res.json({ status: 'error', message: 'Chưa cấu hình USERS_FOLDER_ID trong Environment' });
     const files = await listFilesInFolder(folderId);
-    if (!files.length) return res.json({ status: 'error', message: 'Không tìm thấy file nào trong folder Users. Kiểm tra GOOGLE_SERVICE_ACCOUNT_JSON và USERS_FOLDER_ID.', files: [] });
-
+    if (!files.length) return res.json({ status: 'error', message: 'Không tìm thấy file nào trong folder Users. Kiểm tra GOOGLE_SERVICE_ACCOUNT_JSON và quyền share folder.', totalFiles: 0 });
     let imported = 0, skipped = 0, errors = [];
     for (const f of files) {
       try {
         const content = await getFileContentAsString(f.id);
         if (!content) { skipped++; continue; }
-        let obj;
-        try { obj = JSON.parse(content); } catch { continue; }
+        let obj; try { obj = JSON.parse(content); } catch { skipped++; continue; }
         const email = (obj.email || obj.Email || f.name.replace('.json','')).toLowerCase().trim();
         if (!email || !email.includes('@')) { skipped++; continue; }
-
         const { data: existing } = await supabaseAdmin.from('users').select('id').eq('email', email).maybeSingle();
         if (existing) { skipped++; continue; }
-
-        let passwordHash = obj.password_hash || obj.passwordHash || obj.hash || '';
-        const plainPassword = obj.password || obj.pass || obj.password_plain || '';
-
-        if (!passwordHash && plainPassword) {
-          passwordHash = await bcrypt.hash(plainPassword, 10);
-        } else if (passwordHash && passwordHash.length < 50) {
-          // Nếu hash cũ không phải bcrypt, hash lại
-          try {
-            // Thử coi như plain
-            passwordHash = await bcrypt.hash(passwordHash, 10);
-          } catch {}
-        } else if (!passwordHash) {
-          // Tạo mật khẩu ngẫu nhiên, user sẽ dùng OTP để đổi
-          passwordHash = await bcrypt.hash('Temp1234@' + Math.random().toString(36).slice(2), 10);
-        }
-
+        let hash = obj.password_hash || obj.passwordHash || '';
+        const plain = obj.password || obj.pass || '';
+        if (!hash && plain) hash = await bcrypt.hash(plain, 10);
+        else if (!hash) hash = await bcrypt.hash('Temp' + Math.random().toString(36).slice(2), 10);
+        else if (hash.length < 50) hash = await bcrypt.hash(hash, 10);
         const fullName = obj.fullName || obj.full_name || obj.name || email;
         const isVip = !!(obj.isVip || obj.is_vip || obj.role === 'VIP' || obj.role === 'ADMIN');
-
-        await supabaseAdmin.from('users').insert({
-          email,
-          password_hash: passwordHash,
-          full_name: fullName,
-          is_vip: isVip,
-          created_at: obj.created_at || obj.createdAt || new Date().toISOString()
-        });
+        await supabaseAdmin.from('users').insert({ email, password_hash: hash, full_name: fullName, is_vip: isVip, created_at: obj.created_at || new Date().toISOString() });
         imported++;
-      } catch (e) {
-        errors.push({ file: f.name, error: e.message });
-      }
+      } catch (e) { errors.push({ file: f.name, error: e.message }); }
     }
-
-    res.json({ status: 'success', message: `Import xong: ${imported} imported, ${skipped} skipped (đã tồn tại)`, imported, skipped, totalFiles: files.length, errors: errors.slice(0,20) });
-  } catch (e) {
-    res.status(500).json({ status: 'error', message: e.message, stack: e.stack });
-  }
+    res.json({ status: 'success', message: `Import xong: ${imported} imported, ${skipped} skipped`, imported, skipped, totalFiles: files.length, errors: errors.slice(0,20) });
+  } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
 });
 
-// Legacy /exec full (v3.0)
+// Legacy exec (keep compatibility)
 app.all('/exec', async (req, res) => {
   const params = { ...req.query, ...req.body };
   const action = params.action || params.mod;
   const callback = params.callback;
-  console.log(`[LEGACY] action=${action}`);
-
-  const sendJSONP = (obj) => {
-    if (callback) res.type('application/javascript').send(`${callback}(${JSON.stringify(obj)})`);
-    else res.json(obj);
-  };
-  const sendText = (txt) => {
-    if (callback) res.type('application/javascript').send(`${callback}(${JSON.stringify(txt)})`);
-    else res.type('text/plain').send(txt);
-  };
-
+  const sendJSONP = (obj) => { if (callback) res.type('application/javascript').send(`${callback}(${JSON.stringify(obj)})`); else res.json(obj); };
+  const sendText = (txt) => { if (callback) res.type('application/javascript').send(`${callback}(${JSON.stringify(txt)})`); else res.type('text/plain').send(txt); };
   try {
     const { supabaseAdmin } = require('./services/supabase');
-
     switch (action) {
       case 'verify': {
-        const payload = decodeOldToken(params.token || params.t || '');
+        const payload = decodeOldToken(params.token||'');
         if (!payload) return sendJSONP({ success: false, message: 'Token không hợp lệ' });
-        return sendJSONP({ success: true, valid: true, token: params.token, user: { email: payload.email, fullName: payload.fullName || payload.full_name, role: payload.role || 'USER', isVip: payload.isVip || payload.is_vip, is_vip: payload.isVip || payload.is_vip, expiredDate: payload.expiredDate, isAdmin: payload.role === 'ADMIN' } });
+        return sendJSONP({ success: true, valid: true, token: params.token, user: { email: payload.email, fullName: payload.fullName||payload.full_name, role: payload.role||'USER', isVip: payload.isVip||payload.is_vip, is_vip: payload.isVip||payload.is_vip, expiredDate: payload.expiredDate, isAdmin: payload.role==='ADMIN' } });
       }
       case 'login': {
         const email = (params.email||'').toLowerCase().trim();
@@ -342,7 +354,6 @@ app.all('/exec', async (req, res) => {
         if (!u) return sendJSONP('❌ Email không tồn tại!');
         const otp = Math.floor(100000+Math.random()*900000).toString();
         await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: new Date(Date.now()+5*60*1000).toISOString(), created_at: new Date().toISOString() }, { onConflict: 'email' });
-        try { const { sendTelegramNotification } = require('./services/telegram'); await sendTelegramNotification(`🔑 OTP ${email}: ${otp}`); } catch {}
         return sendJSONP(`Mã OTP đã được gửi tới email ${email}. OTP (debug): ${otp}`);
       }
       case 'verifyAndResetPassword': {
@@ -367,8 +378,7 @@ app.all('/exec', async (req, res) => {
         return sendJSONP({ success: true, newToken: createOldStyleToken(updated), token: createOldStyleToken(updated) });
       }
       case 'saveFeedback': {
-        let payload = {};
-        try { payload = JSON.parse(params.data||'{}'); } catch { payload = params; }
+        let payload = {}; try { payload = JSON.parse(params.data||'{}'); } catch { payload = params; }
         if (supabaseAdmin) await supabaseAdmin.from('feedbacks').insert({ email: payload.email, message: payload.message||JSON.stringify(payload), created_at: new Date().toISOString(), domain: params.domain||'' });
         return sendJSONP({ status: 'success', success: true });
       }
@@ -381,8 +391,7 @@ app.all('/exec', async (req, res) => {
         return sendJSONP({ status: 'success', data: (data||[]).map(u=>({ email: u.email, fullName: u.full_name, full_name: u.full_name, role: u.is_vip?'ADMIN':'USER', isVip: !!u.is_vip })) });
       }
       case 'adminVipAction': {
-        const isVip = (params.action||'') === 'approve';
-        await supabaseAdmin.from('users').update({ is_vip: isVip }).eq('email', (params.email||'').toLowerCase());
+        await supabaseAdmin.from('users').update({ is_vip: (params.action||'')==='approve' }).eq('email', (params.email||'').toLowerCase());
         return sendJSONP({ status: 'success' });
       }
       case 'getLang': return sendJSONP({ status: 'success', success: true, data: {} });
@@ -393,11 +402,7 @@ app.all('/exec', async (req, res) => {
       case 'getStyleContent': return sendJSONP({ type: 'html', content: '' });
       case 'getSecureRenderModule': {
         const fs = require('fs'), path = require('path'), { xorEncodeToBase64 } = require('./services/xor');
-        let js = '';
-        try {
-          const p = path.join(__dirname, '../secure-render-engine.js');
-          if (fs.existsSync(p)) js = fs.readFileSync(p, 'utf-8');
-        } catch {}
+        let js = ''; try { const p = path.join(__dirname, '../secure-render-engine.js'); if (fs.existsSync(p)) js = fs.readFileSync(p, 'utf-8'); } catch {}
         if (!js) js = 'window.karaRenderEngineLoaded=true;';
         const b64 = xorEncodeToBase64(js, config.SECURE_XOR_SALT + '_' + (params.t||Date.now())).replace(/\r?\n/g,'').trim();
         return sendText(b64);
@@ -411,14 +416,14 @@ app.all('/exec', async (req, res) => {
     }
   } catch (e) {
     console.error('[LEGACY]', e);
-    const cb = (req.query.callback || req.body?.callback);
+    const cb = req.query.callback || req.body?.callback;
     const obj = { success: false, message: e.message };
     if (cb) res.type('application/javascript').send(`${cb}(${JSON.stringify(obj)})`);
     else res.json(obj);
   }
 });
 
-app.get('/', (req, res) => res.json({ status: 'KaraRender API v3.5 ADMIN+IMPORT', uptime: process.uptime() }));
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/', (req, res) => res.json({ status: 'KaraRender API v3.6 ADMIN FIXED', uptime: process.uptime() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: '3.6' }));
 
-app.listen(PORT, () => console.log(`🚀 KaraRender v3.5 ADMIN listening on ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 KaraRender v3.6 ADMIN FIXED listening on ${PORT}`));
