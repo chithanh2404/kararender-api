@@ -92,6 +92,42 @@ function getClientInfoFull(req) {
   }
 }
 
+function getUserInfoFromRequest(req, params) {
+  try {
+    let email = params.email || params.userEmail || params.user_email || '';
+    let fullName = params.fullName || params.full_name || params.name || params.userName || '';
+    const token = params.token || params.tk || req.headers['authorization']?.replace('Bearer ', '') || '';
+    if (token && !email) {
+      try {
+        let s = decodeURIComponent(token).replace(/-/g, '+').replace(/_/g, '/');
+        while (s.length % 4 !== 0) s += '=';
+        const obj = JSON.parse(Buffer.from(s, 'base64').toString('utf-8'));
+        const payload = obj.payload || obj;
+        if (payload) {
+          email = payload.email || email;
+          fullName = payload.fullName || payload.full_name || fullName;
+        }
+      } catch {}
+    }
+    if (params.data) {
+      try {
+        let decoded = '';
+        try { decoded = decodeURIComponent(params.data); } catch { decoded = params.data; }
+        const parsed = JSON.parse(decoded);
+        if (parsed && parsed.userInfo) {
+          email = parsed.userInfo.email || email;
+          fullName = parsed.userInfo.fullName || fullName;
+        }
+      } catch {}
+    }
+    if (!email) { email = req.body?.email || req.query?.email || ''; }
+    if (!fullName) { fullName = req.body?.fullName || req.query?.fullName || req.body?.name || ''; }
+    return { email: email || 'Chưa đăng nhập', fullName: fullName || 'Khách' };
+  } catch {
+    return { email: 'Unknown', fullName: 'Unknown' };
+  }
+}
+
 async function seedAdmin() {
   try {
     const { supabaseAdmin } = require('./services/supabase');
@@ -897,19 +933,81 @@ app.all('/exec', async (req, res) => {
       }
       case 'saveUsageStats':
       case 'logUserAccess': {
+        // Logic ghi log khi có user xuất thành công video với đầy đủ thông tin từ collectExportData + giữ nguyên logic cũ
+        let isExportLog = false;
+        let exportDataParsed = null;
+        let exportDataRaw = params.data || '';
+        try {
+          if (exportDataRaw) {
+            let decoded = '';
+            try { decoded = decodeURIComponent(exportDataRaw); } catch { decoded = exportDataRaw; }
+            const parsed = JSON.parse(decoded);
+            if (parsed && parsed.userInfo && parsed.features) {
+              isExportLog = true;
+              exportDataParsed = parsed;
+              console.log('[Export Log] Detected export from collectExportData', parsed.userInfo?.email);
+            }
+          }
+        } catch (e) { isExportLog = false; }
+
         try{ 
           if(supabaseAdmin) {
-            await supabaseAdmin.from('usage_stats').insert({ data: params, created_at: new Date().toISOString(), ip: req.ip, domain: params.domain||'' }); 
+            await supabaseAdmin.from('usage_stats').insert({ 
+              data: params, 
+              created_at: new Date().toISOString(), 
+              ip: req.ip, 
+              domain: params.domain||'',
+              is_export: isExportLog,
+              export_data: exportDataParsed ? JSON.stringify(exportDataParsed) : null
+            }); 
           }
         }catch(e){ console.log('usage_stats error', e.message); }
-        // Telegram access notify với đầy đủ thông tin: domain, chặn hay không, IP, browser, thiết bị mobile/desktop
+        
         try {
           const info = getClientInfoFull(req);
           const isBlocked = checkCorsGuardStrict(req).blocked;
           const blockedReason = checkCorsGuardStrict(req).reason || '';
-          const shouldNotify = process.env.TELEGRAM_NOTIFY_ALL_ACCESS === 'true' || isBlocked || (params.domain && params.domain.includes('blogspot'));
-          if (shouldNotify || isBlocked) {
-            await sendTelegramNotification(`${isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '👁️ <b>Truy cập mới</b>'}
+          
+          if (isExportLog && exportDataParsed) {
+            const userInfo = exportDataParsed.userInfo || {};
+            const features = exportDataParsed.features || {};
+            await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
+👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
+📧 <b>Email:</b> ${userInfo.email || 'unknown'}
+📍 <b>IP (client):</b> ${userInfo.ip || info.ip}
+📍 <b>IP (server):</b> ${info.ip}
+${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${info.os}
+🌐 <b>Browser:</b> ${info.browser}
+🖥️ <b>User-Agent:</b> ${info.browserFull.slice(0,250)}
+
+🎨 <b>Tính năng đã dùng:</b>
+🔤 <b>Font:</b> ${features.fontFamily || 'Default'}
+🎵 <b>Audio:</b> ${features.audioStatus || 'N/A'}
+✨ <b>Wipe:</b> ${features.wipeEffect || 'None'}
+📌 <b>Tiêu đề:</b> ${features.useTitle ? 'Có' : 'Không'}
+⏱️ <b>Đếm ngược:</b> ${features.useCountdown ? 'Có' : 'Không'}
+🖼️ <b>Logo:</b> ${features.useLogo ? 'Có' : 'Không'}
+🎲 <b>Logo 3D:</b> ${features.useLogo3D ? 'Có ('+features.logo3DMode+')' : 'Không'}
+💥 <b>Beat Zoom:</b> ${features.useBeatZoom ? 'Có' : 'Không'}
+🎶 <b>Visualizer:</b> ${features.useVisualizer ? 'Có ('+features.vizType+')' : 'Không'}
+📺 <b>Độ phân giải:</b> ${features.resolution || 'Default'}
+🎞️ <b>Timeline:</b> ${features.useTimeline ? 'Có' : 'Không'}
+🖼️ <b>Số ảnh nền:</b> ${features.bgImagesCount || 0}
+🎥 <b>Video nền:</b> ${features.useVideoBg ? 'Có' : 'Không'}
+🎤 <b>Chế độ:</b> ${features.karaokeMode || 'solo'}
+📜 <b>Scroll:</b> ${features.scrollEnabled ? 'Có - Speed:'+features.scrollSpeed : 'Không'}
+✨ <b>Hiệu ứng:</b> ${features.chkEffectEnabled ? features.selEffectType : 'Không'}
+🔤 <b>Hiệu ứng chữ:</b> ${features.selTextEffectType || 'karaoke_fill'}
+
+🌐 <b>Domain:</b> ${info.domain}
+🔗 <b>Origin:</b> ${info.origin}
+📄 <b>Full URL:</b> ${info.fullUrl}
+${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:</b> Được phép'}
+⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+          } else {
+            const shouldNotify = process.env.TELEGRAM_NOTIFY_ALL_ACCESS === 'true' || isBlocked || (params.domain && params.domain.includes('blogspot'));
+            if (shouldNotify || isBlocked) {
+              await sendTelegramNotification(`${isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '👁️ <b>Truy cập mới</b>'}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
@@ -921,9 +1019,10 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.dev
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}
 📊 <b>Action:</b> ${action}
 ${params.email ? '📧 <b>Email:</b> ' + params.email : ''}`).catch(()=>{});
+            }
           }
-        } catch(e) { console.log('Telegram access notify error', e.message); }
-        return sendJSONP({ success:true });
+        } catch(e) { console.log('Telegram notify error', e.message); }
+        return sendJSONP({ success:true, isExport: isExportLog });
       }
       default: {
         console.log('[exec] Unknown action:', action);
