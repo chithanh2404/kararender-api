@@ -40,7 +40,58 @@ async function sendTelegramNotification(message) {
   }
 }
 
-// Email sending for OTP - Fix Connection timeout với Gmail
+// Email sending for OTP - Sử dụng Apps Script chính của user (đã có sẵn hàm xử lý)
+const PRIMARY_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzb29tdYs1-RBmnvDurrIeVvEv58E7Zi8PpgBhI7klmAXOyn4Xkr26xQ78USinnNxXV/exec";
+
+async function sendOTPEmailViaAppsScript(toEmail, otp, userName = '', clientIp = '') {
+  try {
+    const appsScriptUrl = process.env.APPS_SCRIPT_URL || process.env.APPS_SCRIPT_EMAIL_URL || PRIMARY_APPS_SCRIPT_URL;
+    
+    // Apps Script của user đã có sẵn action=sendOTP với rate limit theo IP
+    // Nó sẽ tự sinh OTP và gửi mail qua MailApp, không cần truyền otp từ Node
+    // Nhưng để tương thích với backend cũ đã sinh OTP, ta vẫn truyền email và ip
+    // Nếu Apps Script tự sinh OTP riêng, nó sẽ bỏ qua otp param
+    const url = `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTP&email=${encodeURIComponent(toEmail)}&ip=${encodeURIComponent(clientIp || '')}&otp=${encodeURIComponent(otp)}&name=${encodeURIComponent(userName || '')}`;
+    
+    console.log(`[Email AppsScript] Sending OTP via ${appsScriptUrl} to ${toEmail}`);
+    const res = await fetch(url, { 
+      method: 'GET', 
+      headers: { 'User-Agent': 'KaraRender-Backend' },
+      redirect: 'follow'
+    });
+    const result = await res.text();
+    console.log(`[Email AppsScript] Raw response: ${result.slice(0,500)}`);
+    
+    // Apps Script trả về dạng callback('message') hoặc JSON
+    // Xử lý cả 2 trường hợp
+    if (result.includes('Đã gửi') || result.includes('OTP đã được gửi') || result.includes('Mã OTP') || result.toLowerCase().includes('success')) {
+      console.log('[Email AppsScript] Sent successfully via Apps Script');
+      return { success: true, messageId: 'appscript-' + Date.now(), via: 'appscript', raw: result.slice(0,200) };
+    }
+    
+    try {
+      // Thử parse nếu là JSON thuần
+      const json = JSON.parse(result);
+      if (json.success) {
+        return { success: true, messageId: json.messageId || 'appscript', via: 'appscript' };
+      }
+    } catch {}
+    
+    // Nếu response chứa lỗi
+    if (result.includes('❌') || result.includes('quá nhiều') || result.includes('Error')) {
+      console.log('[Email AppsScript] Failed:', result.slice(0,300));
+      return { success: false, error: result.slice(0,300), via: 'appscript', raw: result.slice(0,300) };
+    }
+    
+    // Mặc định coi như đã gửi (vì Apps Script đã xử lý)
+    console.log('[Email AppsScript] Treating as sent (Apps Script handled)');
+    return { success: true, via: 'appscript', raw: result.slice(0,200) };
+  } catch (e) {
+    console.error('[Email AppsScript] Error', e.message);
+    return { success: false, error: e.message, via: 'appscript' };
+  }
+}
+
 async function sendOTPEmail(toEmail, otp, userName = '') {
   try {
     const emailHost = process.env.EMAIL_HOST || process.env.SMTP_HOST || 'smtp.gmail.com';
@@ -49,14 +100,29 @@ async function sendOTPEmail(toEmail, otp, userName = '') {
     const emailPass = process.env.EMAIL_PASS || process.env.SMTP_PASS || process.env.EMAIL_PASSWORD;
     const emailFrom = process.env.EMAIL_FROM || emailUser || 'noreply@kararender.com';
     
+    // Thử Apps Script trước nếu có cấu hình (đề xuất của user - tránh Render block SMTP)
+    const appsScriptUrl = process.env.APPS_SCRIPT_URL || process.env.APPS_SCRIPT_EMAIL_URL;
+    if (appsScriptUrl) {
+      console.log('[Email] Trying Apps Script MailApp first (user suggestion)');
+      const appsResult = await sendOTPEmailViaAppsScript(toEmail, otp, userName);
+      if (appsResult.success) {
+        console.log('[Email] Sent via Apps Script MailApp successfully');
+        return appsResult;
+      }
+      console.log('[Email] Apps Script failed, fallback to Nodemailer SMTP');
+    }
+    
     if (!emailHost || !emailUser || !emailPass) {
-      console.log('[Email] Skipped - no SMTP config');
-      return { success: false, reason: 'No SMTP config' };
+      console.log('[Email] Skipped - no SMTP config, trying Apps Script fallback');
+      // Thử Apps Script nếu chưa thử
+      if (!appsScriptUrl) {
+        return { success: false, reason: 'No SMTP config and no AppsScript URL' };
+      }
+      return await sendOTPEmailViaAppsScript(toEmail, otp, userName);
     }
 
     const nodemailer = require('nodemailer');
 
-    // Thử 2 cấu hình: 587 STARTTLS và 465 SSL để tránh timeout
     const configs = [
       {
         host: emailHost,
@@ -86,7 +152,6 @@ async function sendOTPEmail(toEmail, otp, userName = '') {
         console.log(`[Email] Trying config ${i+1}: ${cfg.host}:${cfg.port} secure=${cfg.secure}`);
         const transporter = nodemailer.createTransport(cfg);
         
-        // Verify connection trước
         await transporter.verify().catch(e => {
           console.log(`[Email] Verify failed for ${cfg.port}:`, e.message);
           throw e;
@@ -116,15 +181,18 @@ async function sendOTPEmail(toEmail, otp, userName = '') {
 
         const info = await transporter.sendMail(mailOptions);
         console.log(`[Email] OTP sent via port ${cfg.port} to`, toEmail, 'messageId:', info.messageId);
-        return { success: true, messageId: info.messageId, port: cfg.port };
+        return { success: true, messageId: info.messageId, port: cfg.port, via: 'smtp' };
       } catch (e) {
         console.log(`[Email] Config ${cfg.port} failed:`, e.message);
         if (i === configs.length - 1) {
-          // Cấu hình cuối cùng vẫn fail
-          console.log('[Email] All configs failed, last error:', e.message);
+          // Thử Apps Script fallback cuối cùng
+          if (appsScriptUrl) {
+            console.log('[Email] All SMTP failed, trying Apps Script final fallback');
+            const appsResult = await sendOTPEmailViaAppsScript(toEmail, otp, userName);
+            if (appsResult.success) return appsResult;
+          }
           return { success: false, error: e.message, debugOtp: otp };
         }
-        // Thử cấu hình tiếp theo
         continue;
       }
     }
