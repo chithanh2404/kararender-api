@@ -40,6 +40,69 @@ async function sendTelegramNotification(message) {
   }
 }
 
+// Email sending for OTP - kích hoạt gửi mail cho user, không lộ OTP ở toast
+async function sendOTPEmail(toEmail, otp, userName = '') {
+  try {
+    const emailHost = process.env.EMAIL_HOST || process.env.SMTP_HOST;
+    const emailPort = process.env.EMAIL_PORT || process.env.SMTP_PORT || 587;
+    const emailUser = process.env.EMAIL_USER || process.env.SMTP_USER;
+    const emailPass = process.env.EMAIL_PASS || process.env.SMTP_PASS || process.env.EMAIL_PASSWORD;
+    const emailFrom = process.env.EMAIL_FROM || emailUser || 'noreply@kararender.com';
+    
+    if (!emailHost || !emailUser || !emailPass) {
+      console.log('[Email] Skipped - no SMTP config. Set EMAIL_HOST, EMAIL_USER, EMAIL_PASS in Render env');
+      console.log(`[Email Debug] Would send OTP ${otp} to ${toEmail}`);
+      return { success: false, reason: 'No SMTP config', debugOtp: otp };
+    }
+
+    try {
+      const nodemailer = require('nodemailer');
+      const transporter = nodemailer.createTransport({
+        host: emailHost,
+        port: parseInt(emailPort),
+        secure: emailPort == 465,
+        auth: { user: emailUser, pass: emailPass }
+      });
+
+      const mailOptions = {
+        from: `"KaraRender" <${emailFrom}>`,
+        to: toEmail,
+        subject: `Mã OTP KaraRender - ${otp}`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background: #f9f9f9;">
+            <div style="background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+              <h1 style="color: #2563eb; text-align: center;">KaraRender</h1>
+              <h2 style="color: #333;">Xin chào ${userName || toEmail},</h2>
+              <p>Bạn vừa yêu cầu mã OTP để xác thực tài khoản KaraRender.</p>
+              <div style="background: #f0f7ff; border: 2px dashed #2563eb; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0;">
+                <p style="margin: 0; color: #666; font-size: 14px;">Mã OTP của bạn là:</p>
+                <p style="margin: 10px 0; font-size: 32px; font-weight: bold; color: #2563eb; letter-spacing: 5px;">${otp}</p>
+                <p style="margin: 0; color: #999; font-size: 12px;">Mã có hiệu lực trong 5 phút</p>
+              </div>
+              <p style="color: #666; font-size: 14px;">Nếu bạn không yêu cầu mã này, vui lòng bỏ qua email này.</p>
+              <p style="color: #999; font-size: 12px; margin-top: 30px; border-top: 1px solid #eee; padding-top: 20px;">
+                Email này được gửi tự động từ hệ thống KaraRender - www.kararender.com<br>
+                Vui lòng không trả lời email này.
+              </p>
+            </div>
+          </div>
+        `,
+        text: `KaraRender - Mã OTP của bạn là: ${otp}. Mã có hiệu lực trong 5 phút.`
+      };
+
+      const info = await transporter.sendMail(mailOptions);
+      console.log('[Email] OTP sent to', toEmail, 'messageId:', info.messageId);
+      return { success: true, messageId: info.messageId };
+    } catch (e) {
+      console.log('[Email] Nodemailer error', e.message);
+      return { success: false, error: e.message, debugOtp: otp };
+    }
+  } catch (e) {
+    console.error('[Email] Send OTP error', e.message);
+    return { success: false, error: e.message };
+  }
+}
+
 function getClientInfo(req) {
   try {
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.connection?.remoteAddress || 'unknown';
@@ -910,23 +973,52 @@ app.all('/exec', async (req, res) => {
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ success:true, message:'Đã gửi yêu cầu VIP!' });
       }
-      case 'sendOTP': {
+            case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
+        if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'Email không hợp lệ' });
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
         try {
           await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString() }, { onConflict:'email' });
-        } catch {}
-        const info = getClientInfo(req);
+        } catch (e) { console.log('OTP save error', e.message); }
+        const info = getClientInfoFull(req);
+        const userInfo = getUserInfoFromRequest(req, params);
+        
+        // Gửi mail cho user - kích hoạt gửi mail
+        const emailResult = await sendOTPEmail(email, otp, params.fullName || userInfo.fullName || '');
+        
+        // Telegram - có OTP nhưng không lộ ở frontend
         await sendTelegramNotification(`🔑 <b>OTP Request</b>
+👤 <b>User:</b> ${userInfo.fullName} - ${email}
 📧 <b>Email:</b> ${email}
-🔢 <b>OTP:</b> ${otp} (5 phút)
+🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅' : 'Chưa gửi mail (thiếu SMTP) ⚠️'}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📍 <b>IP:</b> ${info.ip}
-🖥️ <b>Browser:</b> ${info.browser.slice(0,200)}
+${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
+🌐 <b>Browser:</b> ${info.browser}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-        return sendJSONP({ success:true, message:`Mã OTP đã gửi tới ${email}`, otp: otp });
+        
+        // FIX: Không trả về OTP ở response để toast không lộ mã
+        return sendJSONP({ 
+          success:true, 
+          message:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).`,
+          emailSent: emailResult.success,
+        });
+      }
+      case 'verifyOTP': {
+        const email=(params.email||'').toLowerCase().trim();
+        const otp=(params.otp||'').trim();
+        try {
+          const { data } = await supabaseAdmin.from('otps').select('*').eq('email',email).single();
+          if (!data) return sendJSONP({ success:false, msg:'OTP không tồn tại hoặc đã hết hạn' });
+          if (data.otp !== otp) return sendJSONP({ success:false, msg:'Mã OTP không đúng' });
+          if (new Date(data.expires_at) < new Date()) return sendJSONP({ success:false, msg:'Mã OTP đã hết hạn' });
+          await supabaseAdmin.from('otps').delete().eq('email',email);
+          return sendJSONP({ success:true, msg:'Xác thực OTP thành công!' });
+        } catch (e) {
+          return sendJSONP({ success:false, msg:'Lỗi xác thực OTP: '+e.message });
+        }
       }
       case 'clearSecureModuleCache': {
         return sendJSONP({ success:true, message:'Client đã tự gỡ module phía client, server giữ RAM 30min' });
