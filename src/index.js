@@ -7,7 +7,6 @@ const crypto = require('crypto');
 const config = require('./config');
 const upgradeRoutes = require('./routes/upgrade');
 
-
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
   config.ALLOWED_HOSTS = ['kararender.com', 'www.kararender.com', 'localhost', '127.0.0.1'];
   config.ALLOWED_HOSTS_STRICT = ['https://kararender.com', 'https://www.kararender.com'];
@@ -19,11 +18,27 @@ app.set('trust proxy', true);
 app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With'] }));
-app.options('*', cors());
+
+// FIX CORS - THÊM X-User-Email, X-Admin-Token, Authorization
+const corsOptions = {
+  origin: (o, cb) => cb(null, true),
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With','X-User-Email','X-Admin-Token','Authorization']
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
+// FIX: Thêm middleware log + đảm bảo /api/health luôn trả về
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - Email: ${req.headers['x-user-email'] || 'none'}`);
+  next();
+});
+
 app.use('/api', upgradeRoutes);
 
-
+// Thêm health check ngay sau mount để test nhanh
+app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip'], time: new Date().toISOString() }));
 
 
 // Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
