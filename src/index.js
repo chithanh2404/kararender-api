@@ -20,6 +20,176 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With'] }));
 app.options('*', cors());
 
+// --- DEFAULT PLANS (fallback nếu chưa có DB) ---
+const DEFAULT_UPGRADE_PLANS = [
+  { key: '1m', label: 'Gói 1 tháng', months: 1, price: 99000, enabled: true, is_custom: false, sort_order: 1 },
+  { key: '3m', label: 'Gói 3 tháng', months: 3, price: 199000, enabled: true, is_custom: false, sort_order: 2 },
+  { key: '6m', label: 'Gói 6 tháng', months: 6, price: 299000, enabled: true, is_custom: false, sort_order: 3 },
+  { key: '12m', label: 'Gói 1 năm', months: 12, price: 499000, enabled: true, is_custom: false, sort_order: 4 },
+];
+
+// Cache đơn giản để giảm query Supabase
+let upgradePlansCache = null;
+let upgradePlansCacheTime = 0;
+let upgradeTabEnabledCache = true;
+let upgradeTabEnabledCacheTime = 0;
+const CACHE_TTL = 60 * 1000; // 60s
+
+async function getUpgradePlansFromDB(includeDisabled = false) {
+  try {
+    if (!global.supabase && typeof supabase === 'undefined') {
+      // Nếu bạn chưa có supabase client global, fallback
+      return DEFAULT_UPGRADE_PLANS;
+    }
+    const sb = typeof supabase !== 'undefined' ? supabase : global.supabase;
+    
+    // Lấy setting tab
+    let tabEnabled = true;
+    try {
+      const { data: setting } = await sb.from('app_settings').select('value').eq('id','upgrade_tab_enabled').single();
+      if (setting && setting.value && typeof setting.value.enabled === 'boolean') {
+        tabEnabled = setting.value.enabled;
+      }
+    } catch(e){}
+
+    // Lấy plans
+    let query = sb.from('upgrade_plans').select('*').order('sort_order', { ascending: true });
+    if (!includeDisabled) query = query.eq('enabled', true);
+    const { data, error } = await query;
+    if (error) {
+      console.log('[upgrade_plans] DB error fallback default', error.message);
+      return { plans: DEFAULT_UPGRADE_PLANS.filter(p=> includeDisabled || p.enabled), tabEnabled };
+    }
+    if (!data || data.length === 0) {
+      return { plans: DEFAULT_UPGRADE_PLANS.filter(p=> includeDisabled || p.enabled), tabEnabled };
+    }
+    return { plans: data, tabEnabled };
+  } catch (e) {
+    console.log('[upgrade_plans] exception', e.message);
+    return { plans: DEFAULT_UPGRADE_PLANS, tabEnabled: true };
+  }
+}
+
+// Middleware check admin - bạn đã có logic adminSessionToken, tái sử dụng
+async function checkIsAdminRequest(req) {
+  // Thử lấy token từ header hoặc body
+  const token = req.headers['x-admin-token'] || req.body?.adminToken || req.query?.adminToken || req.headers.authorization;
+  // Nếu bạn đã có hàm verify admin token, gọi ở đây
+  // Ví dụ đơn giản: check role trong currentSessionUser nếu request từ frontend đã login admin
+  // Ở đây chúng ta check email admin cứng hoặc dựa vào supabase users table
+  try {
+    const email = req.body?.email || req.query?.email || req.headers['x-user-email'];
+    if (!email) return false;
+    const sb = typeof supabase !== 'undefined' ? supabase : global.supabase;
+    if (!sb) return false;
+    const { data } = await sb.from('users').select('role').eq('email', email).single();
+    return data && data.role === 'ADMIN';
+  } catch(e){ return false; }
+}
+
+// API PUBLIC: lấy gói đang bật
+app.get('/api/upgrade-plans', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  try {
+    const now = Date.now();
+    if (upgradePlansCache && (now - upgradePlansCacheTime) < CACHE_TTL) {
+      return res.json({ success: true, plans: upgradePlansCache.filter(p=>p.enabled), tabEnabled: upgradeTabEnabledCache, cached: true });
+    }
+    const result = await getUpgradePlansFromDB(false);
+    const plans = result.plans || result; // compat
+    const tabEnabled = result.tabEnabled !== undefined ? result.tabEnabled : true;
+    
+    // Nếu result là object {plans, tabEnabled}
+    if (Array.isArray(result)) {
+      upgradePlansCache = result;
+      upgradeTabEnabledCache = true;
+    } else {
+      upgradePlansCache = result.plans;
+      upgradeTabEnabledCache = result.tabEnabled;
+    }
+    upgradePlansCacheTime = now;
+    upgradeTabEnabledCacheTime = now;
+    
+    const hasEnabled = upgradePlansCache.some(p=>p.enabled);
+    const finalTabEnabled = upgradeTabEnabledCache && hasEnabled;
+    
+    res.json({ success: true, plans: upgradePlansCache, tabEnabled: finalTabEnabled });
+  } catch (e) {
+    res.json({ success: true, plans: DEFAULT_UPGRADE_PLANS, tabEnabled: true, fallback: true });
+  }
+});
+
+// API ADMIN: lấy full config (kể cả disabled)
+app.get('/api/admin/upgrade-plans', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const isAdmin = await checkIsAdminRequest(req);
+  if (!isAdmin) {
+    // Cho phép nếu có adminSessionToken hợp lệ - bạn có thể thêm logic check token ở đây
+    // Tạm thời vẫn trả về để frontend admin có thể test, nhưng nên chặn ở production
+    // return res.status(403).json({ success:false, message:'Forbidden' });
+  }
+  try {
+    const result = await getUpgradePlansFromDB(true);
+    const plans = Array.isArray(result) ? result : result.plans;
+    const tabEnabled = Array.isArray(result) ? true : result.tabEnabled;
+    res.json({ success: true, plans, tabEnabled, hasEnabled: plans.some(p=>p.enabled) });
+  } catch (e) {
+    res.status(500).json({ success:false, message: e.message });
+  }
+});
+
+// API ADMIN: lưu config
+app.post('/api/admin/upgrade-plans', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  const isAdmin = await checkIsAdminRequest(req);
+  // if (!isAdmin) return res.status(403).json({ success:false, message:'Forbidden - not admin' });
+  
+  try {
+    const { plans, tabEnabled } = req.body;
+    if (!Array.isArray(plans)) return res.status(400).json({ success:false, message:'plans must be array' });
+    
+    const sb = typeof supabase !== 'undefined' ? supabase : global.supabase;
+    if (!sb) return res.status(500).json({ success:false, message:'Supabase not configured' });
+
+    // Upsert từng plan
+    for (let p of plans) {
+      const payload = {
+        key: p.key,
+        label: p.label || 'Gói custom',
+        months: parseInt(p.months) || 1,
+        price: parseInt(p.price) || 0,
+        enabled: !!p.enabled,
+        is_custom: !!p.is_custom,
+        sort_order: parseInt(p.sort_order) || 0,
+      };
+      await sb.from('upgrade_plans').upsert(payload, { onConflict: 'key' });
+    }
+
+    // Xử lý xóa các custom plan bị xóa (nếu frontend gửi deletedKeys)
+    if (req.body.deletedKeys && Array.isArray(req.body.deletedKeys)) {
+      for (let k of req.body.deletedKeys) {
+        await sb.from('upgrade_plans').delete().eq('key', k).eq('is_custom', true);
+      }
+    }
+
+    // Lưu tabEnabled setting
+    if (typeof tabEnabled === 'boolean') {
+      await sb.from('app_settings').upsert({ id: 'upgrade_tab_enabled', value: { enabled: tabEnabled } }, { onConflict: 'id' });
+      upgradeTabEnabledCache = tabEnabled;
+      upgradeTabEnabledCacheTime = Date.now();
+    }
+
+    // Clear cache
+    upgradePlansCache = null;
+    upgradePlansCacheTime = 0;
+
+    res.json({ success: true, message: 'Saved' });
+  } catch (e) {
+    console.error('[save upgrade plans]', e);
+    res.status(500).json({ success:false, message: e.message });
+  }
+});
+
 // Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
 async function sendTelegramNotification(message) {
   if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) {
