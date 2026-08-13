@@ -1,5 +1,4 @@
-
-// src/routes/upgrade.js - V8 FINAL - FIX sb_secret keys + cache + payment_configs + vip_requests
+// src/routes/upgrade.js - V11 FULL 341 LINES - NO CACHE - Giữ nguyên logic V8, chỉ xóa cache
 const express = require('express');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
@@ -9,8 +8,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL || process.env.SUPABASE_URL_NEW ||
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '';
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLISHABLE_KEY || '';
 
-console.log('[upgrade.js V8] ENV check - URL:', !!SUPABASE_URL, 'SERVICE_KEY:', !!SUPABASE_SERVICE_KEY, 'len:', SUPABASE_SERVICE_KEY?.length, 'ANON:', !!SUPABASE_ANON_KEY);
-if(SUPABASE_SERVICE_KEY) console.log('[upgrade.js V8] SERVICE_KEY prefix:', SUPABASE_SERVICE_KEY.substring(0, 15));
+console.log('[upgrade.js V11] ENV check - URL:', !!SUPABASE_URL, 'SERVICE_KEY:', !!SUPABASE_SERVICE_KEY, 'len:', SUPABASE_SERVICE_KEY?.length, 'ANON:', !!SUPABASE_ANON_KEY);
+if(SUPABASE_SERVICE_KEY) console.log('[upgrade.js V11] SERVICE_KEY prefix:', SUPABASE_SERVICE_KEY.substring(0, 15));
 
 let supabaseAdmin = null;
 try {
@@ -18,12 +17,12 @@ try {
     supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
       auth: { autoRefreshToken: false, persistSession: false }
     });
-    console.log('[upgrade.js V8] supabaseAdmin created SUCCESS');
+    console.log('[upgrade.js V11] supabaseAdmin created SUCCESS');
   } else {
-    console.error('[upgrade.js V8] Missing SUPABASE_URL or SERVICE_KEY');
+    console.error('[upgrade.js V11] Missing SUPABASE_URL or SERVICE_KEY');
   }
 } catch(e){
-  console.error('[upgrade.js V8] createClient failed', e.message);
+  console.error('[upgrade.js V11] createClient failed', e.message);
 }
 
 const DEFAULT_PLANS = [
@@ -33,7 +32,7 @@ const DEFAULT_PLANS = [
   { key: '12m', label: 'Gói 1 năm', months: 12, price: 499000, enabled: true, is_custom: false, sort_order: 4 },
 ];
 
-let cache=null, cacheTime=0, tabCache=true, TTL=60*1000;
+// ĐÃ XÓA CACHE: let cache=null, cacheTime=0, tabCache=true, TTL=60*1000;
 
 async function getPlans(includeDisabled=false){
   if(!supabaseAdmin) {
@@ -69,30 +68,10 @@ async function getPlans(includeDisabled=false){
 
 router.get('/upgrade-plans', async (req,res)=>{
   try{
-    let freshTab = null;
-    if(supabaseAdmin){
-      try{
-        const {data}=await supabaseAdmin.from('app_settings').select('value').eq('id','upgrade_tab_enabled').single();
-        if(data?.value?.enabled!==undefined) freshTab = data.value.enabled;
-      }catch{}
-    }
-    const now=Date.now();
-    // V9: Nếu cache có nhưng DB đã đổi số lượng enabled, bỏ cache
-    if(cache && (now-cacheTime)<TTL){
-      const filtered = cache.filter(p=>p.enabled);
-      console.log('[upgrade-plans] CACHE check, cached total:', cache.length, 'filtered enabled:', filtered.length, 'freshTab:', freshTab);
-      // Nếu cache filtered vẫn đúng 1 gói như DB hiện tại thì dùng, không thì fetch fresh
-      if(filtered.length===1){
-        const effectiveTab = freshTab!==null ? freshTab : tabCache;
-        return res.json({success:true, plans:filtered, tabEnabled: effectiveTab && filtered.length>0, _cache:true, _filtered:filtered.length});
-      }
-    }
+    // V11: NO CACHE - luôn query fresh từ DB
     const result=await getPlans(false);
-    cache=result.plans; tabCache=result.tabEnabled; cacheTime=now;
-    if(freshTab!==null) tabCache = freshTab;
-    const hasEnabled=cache.some(p=>p.enabled);
-    console.log('[upgrade-plans] FRESH fetch, plans:', cache.length, 'tabEnabled:', tabCache, 'hasEnabled:', hasEnabled, 'plans:', cache.map(p=>p.key+':'+p.enabled));
-    res.json({success:true, plans:cache.filter(p=>p.enabled), tabEnabled:tabCache&&hasEnabled, _cache:false, _count:cache.filter(p=>p.enabled).length});
+    console.log('[upgrade-plans] FRESH - NO CACHE, plans:', result.plans.length, 'tabEnabled:', result.tabEnabled, 'plans:', result.plans.map(p=>p.key+':'+p.enabled));
+    res.json({success:true, plans:result.plans, tabEnabled:result.tabEnabled, _cache:false, _v11:true, _count:result.plans.length});
   }catch(e){ 
     console.error('[upgrade-plans] error', e.message);
     res.json({success:true, plans:DEFAULT_PLANS, tabEnabled:true}); 
@@ -129,8 +108,7 @@ router.post('/admin/upgrade-plans', async (req,res)=>{
       if(error) console.error('[admin/upgrade-plans] tab save error', error.message);
       else console.log('[admin/upgrade-plans] tabEnabled saved:', tabEnabled);
     }
-    cache=null; cacheTime=0;
-    console.log('[admin/upgrade-plans] Saved, cache cleared');
+    console.log('[admin/upgrade-plans] Saved - NO CACHE needed');
     res.json({success:true, tabEnabled});
   }catch(e){ console.error('[admin/upgrade-plans] fatal', e.message); res.status(500).json({success:false, message:e.message}); }
 });
