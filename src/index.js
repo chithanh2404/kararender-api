@@ -19,8 +19,9 @@ app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With'] }));
-app.options('*', cors());
 app.use('/api', upgradeRoutes);
+app.options('*', cors());
+
 
 // Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
 async function sendTelegramNotification(message) {
