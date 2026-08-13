@@ -227,4 +227,57 @@ router.post('/admin/reject-vip', async (req,res)=>{
   }catch(e){ res.status(500).json({success:false, message:e.message}); }
 });
 
+// THÊM VÀO src/routes/upgrade.js - PHẦN PAYMENT CONFIG
+
+// Lấy cấu hình ngân hàng (public - user dùng để tạo QR)
+router.get('/payment-config', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.json({ success: true, config: { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
+    }
+    const { data } = await supabaseAdmin.from('payment_configs').select('*').eq('id','default').single();
+    if (!data) {
+      return res.json({ success: true, config: { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
+    }
+    res.json({ success: true, config: data });
+  } catch (e) {
+    res.json({ success: true, config: { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
+  }
+});
+
+// Admin lấy cấu hình
+router.get('/admin/payment-config', async (req, res) => {
+  try {
+    const { data } = await supabaseAdmin.from('payment_configs').select('*').eq('id','default').single();
+    res.json({ success: true, config: data || { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Admin lưu cấu hình
+router.post('/admin/payment-config', async (req, res) => {
+  try {
+    const { bank_id, account_number, account_name } = req.body;
+    if (!bank_id || !account_number || !account_name) {
+      return res.status(400).json({ success: false, message: 'Thiếu thông tin ngân hàng' });
+    }
+    const payload = {
+      id: 'default',
+      bank_id: bank_id.trim().toUpperCase(),
+      account_number: account_number.trim(),
+      account_name: account_name.trim(),
+      updated_at: new Date().toISOString()
+    };
+    const { error } = await supabaseAdmin.from('payment_configs').upsert(payload, { onConflict: 'id' });
+    if (error) throw error;
+    console.log(`[payment-config] Updated to ${payload.bank_id} - ${payload.account_number} - ${payload.account_name}`);
+    res.json({ success: true, config: payload });
+  } catch (e) {
+    console.error('[payment-config] save error', e.message);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+
 module.exports=router;
