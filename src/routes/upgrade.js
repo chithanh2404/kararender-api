@@ -316,4 +316,33 @@ router.post('/admin/payment-config', async (req, res) => {
   }
 });
 
+// Thêm cột trial_used int default 0 vào bảng users trong Supabase
+
+router.get('/trial-status', async (req,res)=>{
+  try{
+    const email = (req.query.email || req.headers['x-user-email'] || '').toLowerCase();
+    if(!email) return res.json({success:true, isVip:false, trialUsed:0, trialLimit:3, canFull:true});
+    const {data:user} = await supabaseAdmin.from('users').select('is_vip, trial_used').eq('email', email).single();
+    const isVip =!!user?.is_vip;
+    const trialUsed = user?.trial_used || 0;
+    const {data:tab} = await supabaseAdmin.from('app_settings').select('value').eq('id','upgrade_tab_enabled').single();
+    const tabEnabled =!!tab?.value?.enabled;
+    // Nếu tab tắt hoặc đã VIP -> luôn full
+    const canFull = isVip ||!tabEnabled || trialUsed < 3;
+    res.json({success:true, isVip, trialUsed, trialLimit:3, tabEnabled, canFull, remaining: Math.max(0, 3-trialUsed)});
+  }catch(e){ res.json({success:true, isVip:false, trialUsed:0, trialLimit:3, canFull:true}); }
+});
+
+router.post('/trial-consume', async (req,res)=>{
+  try{
+    const email = (req.body.email || req.headers['x-user-email'] || '').toLowerCase();
+    if(!email) return res.json({success:false});
+    const {data:user} = await supabaseAdmin.from('users').select('is_vip, trial_used').eq('email', email).single();
+    if(user?.is_vip) return res.json({success:true, isVip:true});
+    const newCount = (user?.trial_used || 0) + 1;
+    await supabaseAdmin.from('users').update({trial_used:newCount, updated_at:new Date().toISOString()}).eq('email', email);
+    res.json({success:true, trialUsed:newCount, remaining: Math.max(0, 3-newCount)});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
 module.exports=router;
