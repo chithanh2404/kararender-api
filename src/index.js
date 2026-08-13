@@ -631,73 +631,7 @@ checkDebug();
 </html>
 `;
 
-// ADMIN với password bảo vệ 252531
-const ADMIN_PASS = process.env.ADMIN_PASS || '252531';
-
-function checkAdminAuth(req) {
-  const passFromQuery = req.query.pass || req.query.p || req.query.password;
-  const passFromHeader = req.headers['x-admin-pass'] || req.headers['x-admin-token'];
-  const passFromCookie = req.headers.cookie ? (req.headers.cookie.match(/admin_pass=([^;]+)/)?.[1]) : null;
-  const pass = passFromQuery || passFromHeader || passFromCookie;
-  return pass === ADMIN_PASS;
-}
-
-app.get('/admin', (req, res) => {
-  if (!checkAdminAuth(req)) {
-    const loginHTML = `
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Admin Login - KaraRender</title>
-<style>
-*{box-sizing:border-box} body{font-family:Inter,system-ui,sans-serif;background:#0b1020;color:#e2e8f0;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}
-.card{background:rgba(30,41,59,0.8);border:1px solid #334155;border-radius:16px;padding:32px;max-width:400px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
-.btn{background:#2563eb;color:white;border:0;padding:12px 20px;border-radius:10px;cursor:pointer;font-weight:700;font-size:14px;width:100%;margin-top:12px}
-.btn:hover{background:#1d4ed8}
-input{width:100%;background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px 16px;color:white;font-size:14px;margin-top:8px}
-input:focus{outline:none;border-color:#2563eb}
-h1{font-size:22px;font-weight:900;margin:0 0 8px 0;text-align:center}
-p{font-size:13px;color:#94a3b8;text-align:center;margin:0 0 20px 0}
-.error{background:#7f1d1d;border:1px solid #dc2626;color:#fca5a5;padding:10px;border-radius:8px;font-size:12px;margin-top:12px;display:none}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>🔒 Admin Login</h1>
-<p>Nhập mật khẩu để truy cập trang quản trị KaraRender</p>
-<form onsubmit="return handleLogin(event)">
-<input type="password" id="passInput" placeholder="Nhập mật khẩu admin..." autofocus>
-<button type="submit" class="btn">Đăng nhập</button>
-<div id="errorBox" class="error">❌ Sai mật khẩu!</div>
-</form>
-</div>
-<script>
-function handleLogin(e){
-  e.preventDefault();
-  const pass = document.getElementById('passInput').value;
-  if(!pass){ document.getElementById('errorBox').style.display='block'; document.getElementById('errorBox').textContent='❌ Vui lòng nhập mật khẩu!'; return false; }
-  document.cookie = 'admin_pass=' + encodeURIComponent(pass) + '; path=/; max-age=' + (60*60*24*7);
-  window.location.href = '/admin?pass=' + encodeURIComponent(pass);
-  return false;
-}
-const urlParams = new URLSearchParams(window.location.search);
-if(urlParams.get('error')==='1'){
-  document.getElementById('errorBox').style.display='block';
-}
-</script>
-</body>
-</html>`;
-    return res.type('html').send(loginHTML);
-  }
-  
-  // Nếu có pass ở query thì set cookie
-  if (req.query.pass) {
-    res.setHeader('Set-Cookie', 'admin_pass=' + req.query.pass + '; Path=/; Max-Age=' + (60*60*24*7) + '; SameSite=Lax');
-  }
-  
-  return res.type('html').send(adminHTML);
-});
+app.get('/admin', (req, res) => res.type('html').send(adminHTML));
 
 app.get('/api/admin/debug', async (req, res) => {
   const { supabaseAdmin } = (() => { try { return require('./services/supabase'); } catch { return { supabaseAdmin: null }; } })();
@@ -782,7 +716,7 @@ app.post('/api/admin/test-telegram-full', async (req,res)=>{
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return res.json({ status:'error', message:'Chưa cấu hình Telegram', token: !!config.TELEGRAM_BOT_TOKEN, chatId: !!config.TELEGRAM_CHAT_ID });
     const info = getClientInfo(req);
     const message = `🔔 <b>Test Telegram Full Info v5.5 FULL</b>
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} (Giờ VN)
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
@@ -1090,7 +1024,7 @@ app.all('/exec', async (req, res) => {
 📄 <b>Full URL:</b> ${info.fullUrl}
 📍 <b>IP:</b> ${info.ip}
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} (Giờ VN)`).catch(()=>{});
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ success:true, token:createOldStyleToken(user), user:{ email:user.email, fullName:user.full_name, role:user.is_vip?'ADMIN':'USER', isVip:!!user.is_vip } });
       }
       case 'registerUser':
@@ -1109,7 +1043,7 @@ app.all('/exec', async (req, res) => {
 📄 <b>Full URL:</b> ${info.fullUrl}
 📍 <b>IP:</b> ${info.ip}
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} (Giờ VN)`).catch(()=>{});
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ success:true, msg:'Đăng ký thành công!' });
       }
       case 'saveFeedback': {
@@ -1146,7 +1080,7 @@ app.all('/exec', async (req, res) => {
 📄 <b>Full URL:</b> ${info.fullUrl}
 📍 <b>IP:</b> ${info.ip}
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} (Giờ VN)`).catch(()=>{});
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ status:'success', success:true, message: 'Cảm ơn bạn đã góp ý!' });
       }
       case 'requestVip':
@@ -1163,7 +1097,7 @@ app.all('/exec', async (req, res) => {
 📄 <b>Full URL:</b> ${info.fullUrl}
 📍 <b>IP:</b> ${info.ip}
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} (Giờ VN)`).catch(()=>{});
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ success:true, message:'Đã gửi yêu cầu VIP!' });
       }
                   case 'sendOTP': {
@@ -1198,7 +1132,7 @@ app.all('/exec', async (req, res) => {
 📍 <b>IP:</b> ${info.ip}
 ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
 🌐 <b>Browser:</b> ${info.browser}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })} (Giờ VN)`).catch(()=>{});
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
           } catch (e) {
             console.log('Background OTP email/telegram error', e.message);
           }
@@ -1303,7 +1237,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
 ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:</b> Được phép'}
-⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}`).catch(()=>{});
+⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN')}`).catch(()=>{});
           } else {
             // FIX: Luôn gửi Telegram cho mọi truy cập, có đầy đủ thông tin user chi tiết
             // Trước: chỉ gửi khi TELEGRAM_NOTIFY_ALL_ACCESS=true hoặc bị chặn hoặc blogspot
@@ -1325,7 +1259,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.dev
 🌐 <b>Browser:</b> ${info.browser}
 📍 <b>IP (server):</b> ${info.ip}
 📍 <b>IP (client):</b> ${params.ip || info.ip}
-🕒 <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}
+🕒 <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}
 🆔 <b>User-Agent:</b> <code>${browserId.substring(0,200)}</code>
 📊 <b>Action:</b> ${action}
 ${isBlocked ? '🚫 <b>Lý do chặn:</b> ' + blockedReason : ''}
