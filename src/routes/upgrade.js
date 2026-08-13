@@ -59,7 +59,7 @@ async function getPlans(includeDisabled=false){
       console.warn('[getPlans] No plans in DB, using DEFAULT');
       return {plans: DEFAULT_PLANS.filter(p=>includeDisabled||p.enabled), tabEnabled};
     }
-    console.log('[getPlans] Found', data.length, 'plans');
+    console.log('[getPlans] Found', data.length, 'plans from DB (includeDisabled:', includeDisabled, ')', data.map(p=>p.key+':'+p.enabled));
     return {plans:data, tabEnabled};
   }catch(e){
     console.error('[getPlans] exception', e.message);
@@ -69,7 +69,6 @@ async function getPlans(includeDisabled=false){
 
 router.get('/upgrade-plans', async (req,res)=>{
   try{
-    // Luôn đọc tabEnabled tươi
     let freshTab = null;
     if(supabaseAdmin){
       try{
@@ -78,18 +77,22 @@ router.get('/upgrade-plans', async (req,res)=>{
       }catch{}
     }
     const now=Date.now();
+    // V9: Nếu cache có nhưng DB đã đổi số lượng enabled, bỏ cache
     if(cache && (now-cacheTime)<TTL){
-      const hasEnabled=cache.some(p=>p.enabled);
-      const effectiveTab = freshTab!==null ? freshTab : tabCache;
-      console.log('[upgrade-plans] CACHE hit, freshTab:', freshTab, 'effective:', effectiveTab);
-      return res.json({success:true, plans:cache.filter(p=>p.enabled), tabEnabled: effectiveTab && hasEnabled, _cache:true});
+      const filtered = cache.filter(p=>p.enabled);
+      console.log('[upgrade-plans] CACHE check, cached total:', cache.length, 'filtered enabled:', filtered.length, 'freshTab:', freshTab);
+      // Nếu cache filtered vẫn đúng 1 gói như DB hiện tại thì dùng, không thì fetch fresh
+      if(filtered.length===1){
+        const effectiveTab = freshTab!==null ? freshTab : tabCache;
+        return res.json({success:true, plans:filtered, tabEnabled: effectiveTab && filtered.length>0, _cache:true, _filtered:filtered.length});
+      }
     }
     const result=await getPlans(false);
     cache=result.plans; tabCache=result.tabEnabled; cacheTime=now;
     if(freshTab!==null) tabCache = freshTab;
     const hasEnabled=cache.some(p=>p.enabled);
-    console.log('[upgrade-plans] FRESH, tabEnabled:', tabCache);
-    res.json({success:true, plans:cache, tabEnabled:tabCache&&hasEnabled, _cache:false});
+    console.log('[upgrade-plans] FRESH fetch, plans:', cache.length, 'tabEnabled:', tabCache, 'hasEnabled:', hasEnabled, 'plans:', cache.map(p=>p.key+':'+p.enabled));
+    res.json({success:true, plans:cache.filter(p=>p.enabled), tabEnabled:tabCache&&hasEnabled, _cache:false, _count:cache.filter(p=>p.enabled).length});
   }catch(e){ 
     console.error('[upgrade-plans] error', e.message);
     res.json({success:true, plans:DEFAULT_PLANS, tabEnabled:true}); 
