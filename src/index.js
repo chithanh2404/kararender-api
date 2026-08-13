@@ -981,27 +981,12 @@ app.all('/exec', async (req, res) => {
         return sendJSONP([]);
       }
       case 'getFontBase64': {
-        try {
-          const fileName = params.file || params.name || params.fileName || params.fileId;
-          if (!fileName) return sendJSONP({ success:false, error:'Missing file name' });
-      
-          // Nếu fileName thực chất là Drive fileId cũ
-          if (fileName.length > 25 &&!fileName.includes('.')) {
-            // thử load từ Drive service cũ nếu bạn còn
-            const { getFileContentAsBase64 } = require('./services/drive');
-            const b64 = await getFileContentAsBase64(fileName);
-            return sendJSONP({ status:'success', data: `data:font/ttf;base64,${b64}` });
-          }
-      
-          const { data, error } = await supabaseAdmin.storage.from('fonts').download(fileName);
-          if (error) return sendJSONP({ success:false, error: error.message });
-      
-          const buf = Buffer.from(await data.arrayBuffer());
-          const base64 = buf.toString('base64');
-          return sendJSONP({ status:'success', success:true, data: `data:font/ttf;base64,${base64}`, base64 });
-      
-        } catch(e){ return sendJSONP({ success:false, error: e.message }); }
-      }  
+        const fileName = (params.file || '').trim();
+        const { data, error } = await supabaseAdmin.storage.from('fonts').download(fileName);
+        if(error) return sendJSONP({success:false, error:error.message});
+        const b64 = Buffer.from(await data.arrayBuffer()).toString('base64');
+        return sendJSONP({success:true, data: `data:font/woff2;base64,${b64}`});
+      }
       case 'getSecureRenderModule':
       case 'kara-render-engine':
       case 'getRenderEngine': {
