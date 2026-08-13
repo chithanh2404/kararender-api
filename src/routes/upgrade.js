@@ -111,7 +111,11 @@ router.post('/request-vip', async (req,res)=>{
     const plansRes=await getPlans(false);
     const plan=plansRes.plans.find(p=>p.key===planKey)||{price:0, label:planKey, months:1};
 
-    if(!supabaseAdmin) return res.json({success:true, message:'Mock success'});
+    console.log('[request-vip] supabaseAdmin exists:', !!supabaseAdmin, 'email:', email, 'planKey:', planKey);
+    if(!supabaseAdmin){
+      console.error('[request-vip] supabaseAdmin NULL - check SUPABASE_SERVICE_ROLE_KEY');
+      return res.status(500).json({success:false, message:'Backend chưa cấu hình Supabase SERVICE_ROLE_KEY'});
+    }
 
     // Lấy full_name từ bảng users
     let fullName=email;
@@ -121,6 +125,7 @@ router.post('/request-vip', async (req,res)=>{
     }catch{}
 
     // Insert vào vip_requests
+    console.log('[request-vip] Inserting', { email: email.toLowerCase(), plan_key: planKey, amount: plan.price });
     const {data:inserted, error:insertError}=await supabaseAdmin.from('vip_requests').insert({
       email:email.toLowerCase(),
       full_name:fullName,
@@ -131,19 +136,32 @@ router.post('/request-vip', async (req,res)=>{
     }).select().single();
 
     if(insertError){
-      console.error('[request-vip] insert error', insertError.message);
-      return res.status(500).json({success:false, message:insertError.message});
+      console.error('[request-vip] insert vip_requests error', insertError.message, insertError);
+      if(insertError.message.includes('does not exist') || insertError.code==='42P01'){
+        console.error('[request-vip] Table vip_requests not found - check SQL migration');
+      }
+      // Không return luôn, vẫn cố ghi vào users để không mất request
+    } else {
+      console.log('[request-vip] Inserted vip_requests id:', inserted?.id);
     }
 
-    // Cập nhật users table để đánh dấu đang chờ (optional)
+    // Cập nhật users table - BẮT BUỘC
     try{
-      await supabaseAdmin.from('users').update({
+      const payload = {
         vip_status:'PENDING',
         request_vip_time:new Date().toISOString(),
         request_plan_key:planKey,
+        request_amount: plan.price,
+        request_content: content||`nang cap ${email} ${planKey}`,
         updated_at:new Date().toISOString()
-      }).eq('email',email.toLowerCase());
-    }catch{}
+      };
+      console.log('[request-vip] Updating users', payload);
+      const { error: userErr, data: userData } = await supabaseAdmin.from('users').update(payload).eq('email',email.toLowerCase()).select();
+      if(userErr) console.error('[request-vip] users update error', userErr.message);
+      else console.log('[request-vip] users updated', userData?.length);
+    }catch(e){
+      console.error('[request-vip] users update exception', e.message);
+    }
 
     // Gửi Telegram
     try{
@@ -153,7 +171,8 @@ router.post('/request-vip', async (req,res)=>{
       }
     }catch(e){ console.warn('[telegram]', e.message); }
 
-    res.json({success:true, message:'Đã gửi yêu cầu', requestId:inserted?.id});
+    console.log('[request-vip] SUCCESS', email, planKey);
+    res.json({success:true, message:'Đã gửi yêu cầu, chờ admin duyệt', requestId:inserted?.id});
   }catch(e){
     console.error('[request-vip]', e.message);
     res.status(500).json({success:false, message:e.message});
@@ -226,58 +245,5 @@ router.post('/admin/reject-vip', async (req,res)=>{
     res.json({success:true});
   }catch(e){ res.status(500).json({success:false, message:e.message}); }
 });
-
-// THÊM VÀO src/routes/upgrade.js - PHẦN PAYMENT CONFIG
-
-// Lấy cấu hình ngân hàng (public - user dùng để tạo QR)
-router.get('/payment-config', async (req, res) => {
-  try {
-    if (!supabaseAdmin) {
-      return res.json({ success: true, config: { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
-    }
-    const { data } = await supabaseAdmin.from('payment_configs').select('*').eq('id','default').single();
-    if (!data) {
-      return res.json({ success: true, config: { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
-    }
-    res.json({ success: true, config: data });
-  } catch (e) {
-    res.json({ success: true, config: { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
-  }
-});
-
-// Admin lấy cấu hình
-router.get('/admin/payment-config', async (req, res) => {
-  try {
-    const { data } = await supabaseAdmin.from('payment_configs').select('*').eq('id','default').single();
-    res.json({ success: true, config: data || { bank_id: 'HDB', account_number: '0354563516', account_name: 'LOI NHAC SONG PRO' } });
-  } catch (e) {
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
-// Admin lưu cấu hình
-router.post('/admin/payment-config', async (req, res) => {
-  try {
-    const { bank_id, account_number, account_name } = req.body;
-    if (!bank_id || !account_number || !account_name) {
-      return res.status(400).json({ success: false, message: 'Thiếu thông tin ngân hàng' });
-    }
-    const payload = {
-      id: 'default',
-      bank_id: bank_id.trim().toUpperCase(),
-      account_number: account_number.trim(),
-      account_name: account_name.trim(),
-      updated_at: new Date().toISOString()
-    };
-    const { error } = await supabaseAdmin.from('payment_configs').upsert(payload, { onConflict: 'id' });
-    if (error) throw error;
-    console.log(`[payment-config] Updated to ${payload.bank_id} - ${payload.account_number} - ${payload.account_name}`);
-    res.json({ success: true, config: payload });
-  } catch (e) {
-    console.error('[payment-config] save error', e.message);
-    res.status(500).json({ success: false, message: e.message });
-  }
-});
-
 
 module.exports=router;
