@@ -18,17 +18,13 @@ app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With'] }));
+
+const upgradeRouter = require('./src/routes/upgrade');
+app.use('/api', upgradeRouter);
 app.options(/.*/, cors());
 
 
-try {
-  const upgradeRouter = require('./src/routes/upgrade'); // nếu index.js nằm ở root
-  // nếu index.js của bạn nằm trong src/ thì dùng: require('./routes/upgrade')
-  app.use('/api', upgradeRouter);
-  console.log('[index] upgradeRouter mounted at /api');
-} catch(e) {
-  console.error('[index] Failed to mount upgradeRouter', e.message);
-}
+
 
 // Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
 async function sendTelegramNotification(message) {
