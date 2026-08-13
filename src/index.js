@@ -981,11 +981,12 @@ app.all('/exec', async (req, res) => {
         return sendJSONP([]);
       }
       case 'getFontBase64': {
-        const fileName = (params.file || '').trim();
+        const fileName = (params.file || params.name || params.fileName || '').trim();
+        if(!fileName) return sendJSONP({success:false, error:'Thieu file'});
         const { data, error } = await supabaseAdmin.storage.from('fonts').download(fileName);
         if(error) return sendJSONP({success:false, error:error.message});
         const b64 = Buffer.from(await data.arrayBuffer()).toString('base64');
-        return sendJSONP({success:true, data: `data:font/woff2;base64,${b64}`});
+        return sendJSONP({success:true, data: b64}); // trả base64 thuần
       }
       case 'getSecureRenderModule':
       case 'kara-render-engine':
