@@ -5,6 +5,8 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
+const upgradeRoutes = require('./routes/upgrade');
+
 
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
   config.ALLOWED_HOSTS = ['kararender.com', 'www.kararender.com', 'localhost', '127.0.0.1'];
@@ -19,6 +21,8 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cors({ origin: (o, cb) => cb(null, true), credentials: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With'] }));
 app.options('*', cors());
+app.use('/api', upgradeRoutes);
+
 
 
 
