@@ -29,16 +29,31 @@ async function getPlans(includeDisabled=false){
 
 router.get('/upgrade-plans', async (req,res)=>{
   try{
+    // Luôn đọc tabEnabled tươi từ DB để tôn trọng admin tắt/bật, cache chỉ dùng cho plans
     const now=Date.now();
+    let freshTab = null;
+    try{
+      const {data:tabData}=await supabaseAdmin.from('app_settings').select('value').eq('id','upgrade_tab_enabled').single();
+      if(tabData?.value?.enabled!==undefined) freshTab = tabData.value.enabled;
+    }catch{}
     if(cache && (now-cacheTime)<TTL){
       const hasEnabled=cache.some(p=>p.enabled);
-      return res.json({success:true, plans:cache.filter(p=>p.enabled), tabEnabled:tabCache&&hasEnabled});
+      const effectiveTab = freshTab!==null ? freshTab : tabCache;
+      console.log('[upgrade-plans] Using cache plans, freshTab:', freshTab, 'tabCache:', tabCache, 'effective:', effectiveTab);
+      return res.json({success:true, plans:cache.filter(p=>p.enabled), tabEnabled: effectiveTab && hasEnabled});
     }
     const result=await getPlans(false);
-    cache=result.plans; tabCache=result.tabEnabled; cacheTime=now;
+    cache=result.plans; 
+    tabCache=result.tabEnabled; 
+    cacheTime=now;
+    if(freshTab!==null) tabCache = freshTab;
     const hasEnabled=cache.some(p=>p.enabled);
+    console.log('[upgrade-plans] Fresh fetch tabEnabled:', tabCache, 'hasEnabled:', hasEnabled);
     res.json({success:true, plans:cache, tabEnabled:tabCache&&hasEnabled});
-  }catch{ res.json({success:true, plans:DEFAULT_PLANS, tabEnabled:true}); }
+  }catch(e){ 
+    console.error('[upgrade-plans] error', e.message);
+    res.json({success:true, plans:DEFAULT_PLANS, tabEnabled:true}); 
+  }
 });
 
 router.get('/admin/upgrade-plans', async (req,res)=>{
@@ -64,8 +79,9 @@ router.post('/admin/upgrade-plans', async (req,res)=>{
     if(typeof tabEnabled==='boolean'){
       await supabaseAdmin.from('app_settings').upsert({id:'upgrade_tab_enabled', value:{enabled:tabEnabled}},{onConflict:'id'});
     }
-    cache=null;
-    res.json({success:true});
+    cache=null; cacheTime=0;
+    console.log('[admin/upgrade-plans] Saved, cache cleared, tabEnabled:', tabEnabled);
+    res.json({success:true, tabEnabled});
   }catch(e){ res.status(500).json({success:false, message:e.message}); }
 });
 
@@ -111,11 +127,17 @@ router.post('/request-vip', async (req,res)=>{
     const plansRes=await getPlans(false);
     const plan=plansRes.plans.find(p=>p.key===planKey)||{price:0, label:planKey, months:1};
 
-    console.log('[request-vip] supabaseAdmin exists:', !!supabaseAdmin, 'email:', email, 'planKey:', planKey);
+    console.log('[request-vip] supabaseAdmin exists:', !!supabaseAdmin, 'email:', email, 'planKey:', planKey, 'SUPABASE_URL:', !!process.env.SUPABASE_URL);
     if(!supabaseAdmin){
-      console.error('[request-vip] supabaseAdmin NULL - check SUPABASE_SERVICE_ROLE_KEY');
-      return res.status(500).json({success:false, message:'Backend chưa cấu hình Supabase SERVICE_ROLE_KEY'});
+      console.error('[request-vip] supabaseAdmin NULL - check SUPABASE_SERVICE_ROLE_KEY, ENV:', Object.keys(process.env).filter(k=>k.includes('SUPABASE')));
+      return res.status(500).json({success:false, message:'Backend chưa cấu hình Supabase SERVICE_ROLE_KEY - kiểm tra ENV trên Render'});
     }
+    // Test connection
+    try{
+      const {data:testConn, error:testErr}=await supabaseAdmin.from('app_settings').select('id').limit(1);
+      if(testErr) console.error('[request-vip] Supabase connection test failed', testErr.message);
+      else console.log('[request-vip] Supabase connection OK');
+    }catch(testE){ console.error('[request-vip] Supabase test exception', testE.message); }
 
     // Lấy full_name từ bảng users
     let fullName=email;
