@@ -25,6 +25,32 @@ try {
   console.error('[upgrade.js V11] createClient failed', e.message);
 }
 
+// FIX TELEGRAM - gửi trực tiếp, không phụ thuộc services/telegram
+async function sendTelegramDirect(message){
+  try{
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if(!token || !chatId){
+      console.warn('[Telegram Direct] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+      return false;
+    }
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const res = await fetch(url, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode:'HTML' })
+    });
+    const data = await res.json().catch(()=>({}));
+    if(data.ok) console.log('[Telegram Direct] Sent OK');
+    else console.warn('[Telegram Direct] API fail', JSON.stringify(data).slice(0,500));
+    return data.ok;
+  }catch(e){
+    console.error('[Telegram Direct] Error', e.message);
+    return false;
+  }
+}
+
+
 const DEFAULT_PLANS = [
   { key: '1m', label: 'Gói 1 tháng', months: 1, price: 99000, enabled: true, is_custom: false, sort_order: 1 },
   { key: '3m', label: 'Gói 3 tháng', months: 3, price: 199000, enabled: true, is_custom: false, sort_order: 2 },
