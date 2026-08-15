@@ -217,7 +217,8 @@ router.post('/request-vip', async (req,res)=>{
     }
 
     try{
-      const {sendTelegram}=require('../services/telegram');
+      const {sendTelegramNotification: serviceTelegram, sendTelegram: serviceTelegram2}=require('../services/telegram');
+      const sendTelegram = serviceTelegram || serviceTelegram2;
       if(sendTelegram){
         await sendTelegram(`🔔 Yêu cầu VIP mới\n👤 ${email} (${fullName})\n📦 ${plan.label} - ${plan.months} tháng - ${plan.price.toLocaleString('vi-VN')}đ`);
       }
