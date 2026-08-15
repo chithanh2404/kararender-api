@@ -340,7 +340,7 @@ async function seedAdmin() {
     const { data: ex } = await supabaseAdmin.from('users').select('id').eq('email', adminEmail).maybeSingle();
     if (ex) return;
     const hash = await bcrypt.hash(adminPass, 10);
-    await supabaseAdmin.from('users').insert({ email: adminEmail, password_hash: hash, full_name: 'Lâm Chí Thành', is_vip: true, created_at: new Date().toISOString() });
+    await supabaseAdmin.from('users').insert({ email: adminEmail, password_hash: hash, full_name: 'Lâm Chí Thành', is_vip: true, role: 'ADMIN', is_admin: true, created_at: new Date().toISOString() });
   } catch {}
 }
 seedAdmin();
@@ -359,9 +359,18 @@ function createOldStyleToken(p) {
       email: p.email,
       fullName: p.full_name || p.fullName || p.email,
       full_name: p.full_name || p.fullName,
-      role: p.is_vip ? 'ADMIN' : 'USER',
-      isVip: !!p.is_vip, is_vip: !!p.is_vip,
-      expiredDate: new Date(Date.now() + 365*24*60*60*1000).toISOString(),
+      // FIX: Giữ role thật từ DB, không tự đổi is_vip thành ADMIN
+      role: p.role || (p.is_vip ? 'VIP' : 'USER'),
+      isVip: !!p.is_vip, 
+      is_vip: !!p.is_vip,
+      is_vip_bool: !!p.is_vip,
+      is_admin: p.role === 'ADMIN' || p.is_admin === true,
+      vip_status: p.vip_status || (p.is_vip ? 'APPROVED' : 'NONE'),
+      // FIX: Dùng expired_date thật từ DB, không hardcode 365 ngày
+      expired_date: p.expired_date || p.expiredDate || null,
+      expiredDate: p.expired_date || p.expiredDate || new Date(Date.now() + 30*24*60*60*1000).toISOString(),
+      request_vip_time: p.request_vip_time || null,
+      request_plan_key: p.request_plan_key || null,
       id: p.id
     },
     signature: crypto.createHash('sha256').update(JSON.stringify(p) + config.JWT_SECRET).digest('hex')
@@ -1061,7 +1070,7 @@ app.all('/exec', async (req, res) => {
 📍 <b>IP:</b> ${info.ip}
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-        return sendJSONP({ success:true, token:createOldStyleToken(user), user:{ email:user.email, fullName:user.full_name, role:user.is_vip?'ADMIN':'USER', isVip:!!user.is_vip } });
+        return sendJSONP({ success:true, token:createOldStyleToken(user), user:{ email:user.email, fullName:user.full_name, role:user.role || (user.is_vip?'VIP':'USER'), isVip:!!user.is_vip, is_vip:!!user.is_vip, expired_date:user.expired_date, vip_status:user.vip_status } });
       }
       case 'registerUser':
       case 'register': {
