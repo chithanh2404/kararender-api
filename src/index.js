@@ -49,6 +49,80 @@ async function sendTelegramNotification(message) {
   const chatId = process.env.TELEGRAM_CHAT_ID || config.TELEGRAM_CHAT_ID;
   if (!token || !chatId) {
     console.log('[Telegram] Skipped - no token/chat_id', { hasToken: !!token, hasChatId: !!chatId, envToken: !!process.env.TELEGRAM_BOT_TOKEN, cfgToken: !!config.TELEGRAM_BOT_TOKEN });
+
+
+// ===== MỚI THÊM: API lấy user mới nhất để client tự refresh không cần logout/login =====
+app.get('/api/me', async (req, res) => {
+  try {
+    const email = (req.headers['x-user-email'] || req.query.email || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ success:false, message:'Missing X-User-Email' });
+    const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
+    const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).single();
+    if (error || !user) return res.status(404).json({ success:false, message:'User not found' });
+    
+    // Trả về user với role thật
+    const freshUser = {
+      id: user.id,
+      email: user.email,
+      full_name: user.full_name,
+      fullName: user.full_name,
+      role: user.role || (user.is_vip ? 'VIP' : 'USER'),
+      is_vip: !!user.is_vip,
+      is_vip_bool: !!user.is_vip,
+      isVip: !!user.is_vip,
+      is_admin: user.role === 'ADMIN',
+      isAdmin: user.role === 'ADMIN',
+      expired_date: user.expired_date,
+      expiredDate: user.expired_date,
+      vip_status: user.vip_status,
+      vipStatus: user.vip_status,
+      request_vip_time: user.request_vip_time,
+      request_plan_key: user.request_plan_key,
+      request_amount: user.request_amount,
+      request_content: user.request_content,
+      created_at: user.created_at,
+      last_login_at: user.last_login_at
+    };
+    
+    // Tạo token mới nếu cần
+    const newToken = (() => {
+      try {
+        const payload = { 
+          email: freshUser.email, 
+          fullName: freshUser.full_name, 
+          full_name: freshUser.full_name,
+          role: freshUser.role,
+          isVip: freshUser.is_vip,
+          is_vip: freshUser.is_vip,
+          expiredDate: freshUser.expired_date,
+          expired_date: freshUser.expired_date,
+          id: freshUser.id,
+          vip_status: freshUser.vip_status
+        };
+        const data = { payload, signature: require('crypto').createHash('sha256').update(JSON.stringify(payload) + require('./config').JWT_SECRET).digest('hex') };
+        return Buffer.from(JSON.stringify(data)).toString('base64');
+      } catch(e){ return null; }
+    })();
+    
+    return res.json({ success:true, user: freshUser, data: freshUser, payload: freshUser, token: newToken, newToken });
+  } catch(e){
+    console.error('[GET /api/me] error', e);
+    return res.status(500).json({ success:false, message:e.message });
+  }
+});
+
+app.get('/api/auth/me', async (req, res) => {
+  // alias
+  req.url = '/api/me';
+  return app._router.handle(req, res, () => {});
+});
+
+app.get('/api/user/me', async (req, res) => {
+  req.url = '/api/me';
+  return app._router.handle(req, res, () => {});
+});
+
     return false;
   }
   try {
@@ -738,17 +812,6 @@ app.get('/api/admin/stats/languages', async (req,res)=>{
     const { count } = await supabaseAdmin.from('languages').select('*',{count:'exact',head:true});
     res.json({ count: count||0 });
   }catch{ res.json({ count:0 }); }
-});
-
-app.get('/api/me', async (req,res) => {
-  const email = req.headers['x-user-email'];
-  const {data:user} = await supabaseAdmin.from('users').select('*').eq('email',email).single();
-  // trả về role thật từ DB, không tự đổi is_vip -> ADMIN nữa
-  return res.json({ 
-    success:true, 
-    user: { email:user.email, role:user.role, is_vip:user.is_vip, expired_date:user.expired_date, vip_status:user.vip_status },
-    token: newToken // token mới
-  });
 });
 
 app.post('/api/admin/test-telegram', async (req,res)=>{
