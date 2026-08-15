@@ -1493,4 +1493,90 @@ app.get('/api/secure-render', async (req, res) => {
 
 app.get('/', (req,res)=>res.json({ status:'KaraRender API v5.5 FULL - Feedback + Telegram Full Info + Dropbox + 850 lines - Client tự gỡ', uptime:process.uptime(), features:['feedback','vip','otp','login','register','telegram-full-info','dropbox-direct'] }));
 app.get('/health',(req,res)=>res.json({ ok:true, version:'5.5 FULL - Feedback + Telegram Full Info + Dropbox + Client tự gỡ', lines:850, features:['feedback','telegram-full'] }));
+
+// ===== AUTO APPROVE VIP KHI CHUYỂN KHOẢN THÀNH CÔNG - WEBHOOK SEPAY / CASSO =====
+app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) => {
+  try {
+    console.log('[Webhook Bank] Raw body:', JSON.stringify(req.body).slice(0,1000));
+    const body = req.body;
+    const amount = body.transferAmount || body.amount || body.data?.amount || body.transfer_amount || 0;
+    const content = (body.content || body.description || body.data?.description || body.transaction_content || '').toLowerCase().trim();
+    if(!content){ return res.json({ success: true, message: 'No content' }); }
+    console.log(`[Webhook] Content: "${content}" Amount: ${amount}`);
+    const match = content.match(/nang\s*cap\s+([a-z0-9]+)\s+([a-z0-9]+)/i);
+    if(!match){
+      console.log('[Webhook] Không match cú pháp nang cap');
+      return res.json({ success: true, ignored: true });
+    }
+    const safeCode = match[1].toLowerCase();
+    const planKey = match[2].toLowerCase();
+    let supabaseAdmin;
+    try { supabaseAdmin = require('./services/supabase').supabaseAdmin; } catch(e) { supabaseAdmin = null; }
+    if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
+    const { data: users, error } = await supabaseAdmin.from('users').select('*');
+    if(error) return res.status(500).json({ success:false, error:error.message });
+    let targetUser = null;
+    for(let u of users){
+      const code = (u.email || '').replace(/[@.]/g,'').toLowerCase();
+      if(code === safeCode || content.includes(code)){
+        targetUser = u;
+        break;
+      }
+    }
+    if(!targetUser){
+      console.log('[Webhook] Không tìm thấy user với code', safeCode);
+      return res.json({ success:false, message:'User not found for code '+safeCode });
+    }
+    const planPrices = { '1m':99000, '3m':199000, '6m':299000, '12m':499000, '1y':499000 };
+    let expectedAmount = planPrices[planKey] || 99000;
+    try{
+      const { data: plans } = await supabaseAdmin.from('upgrade_plans').select('*').eq('key', planKey).single();
+      if(plans && plans.price) expectedAmount = plans.price;
+    }catch(e){}
+    if(amount < expectedAmount - 1000){
+      console.log(`[Webhook] Amount ${amount} < expected ${expectedAmount} -> pending`);
+      await supabaseAdmin.from('users').update({
+        vip_status: 'PENDING',
+        request_plan_key: planKey,
+        request_amount: amount,
+        request_content: content,
+        request_vip_time: new Date().toISOString()
+      }).eq('id', targetUser.id);
+      return res.json({ success:true, pending:true, reason:'Amount not enough' });
+    }
+    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '1y':12, 'lifetime':1200 };
+    const months = monthsMap[planKey] || 1;
+    const now = new Date();
+    let expireDate = new Date();
+    if(targetUser.expired_date && new Date(targetUser.expired_date) > now){
+      expireDate = new Date(targetUser.expired_date);
+    }
+    expireDate.setMonth(expireDate.getMonth() + months);
+    if(planKey==='lifetime') expireDate = new Date('2099-12-31');
+    const { error: upErr } = await supabaseAdmin.from('users').update({
+      is_vip: true,
+      role: 'VIP',
+      vip_status: 'APPROVED',
+      expired_date: expireDate.toISOString(),
+      request_plan_key: planKey,
+      request_amount: amount,
+      request_content: content,
+      request_vip_time: new Date().toISOString(),
+      last_login_at: new Date().toISOString()
+    }).eq('id', targetUser.id);
+    if(upErr){
+      console.error('[Webhook] Update VIP error', upErr);
+      return res.status(500).json({ success:false, error: upErr.message });
+    }
+    console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
+    return res.json({ success:true, autoApproved:true, email: targetUser.email, plan: planKey, expire: expireDate.toISOString() });
+  }catch(e){
+    console.error('[Webhook Bank] Exception', e);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+app.post('/api/webhook/sepay', (req,res,next)=>{ req.url='/api/webhook/bank'; req.method='POST'; app._router.handle(req,res,next); });
+app.post('/api/webhook/casso', (req,res,next)=>{ req.url='/api/webhook/bank'; req.method='POST'; app._router.handle(req,res,next); });
+
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
