@@ -216,13 +216,49 @@ router.post('/request-vip', async (req,res)=>{
       console.error('[request-vip] users update exception', e.message);
     }
 
+    // TELEGRAM CHI TIẾT - BẢN NÂNG CẤP ĐẦY ĐỦ
     try{
-      const {sendTelegramNotification: serviceTelegram, sendTelegram: serviceTelegram2}=require('../services/telegram');
-      const sendTelegram = serviceTelegram || serviceTelegram2;
-      if(sendTelegram){
-        await sendTelegram(`🔔 Yêu cầu VIP mới\n👤 ${email} (${fullName})\n📦 ${plan.label} - ${plan.months} tháng - ${plan.price.toLocaleString('vi-VN')}đ`);
-      }
-    }catch(e){ console.warn('[telegram]', e.message); }
+      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.headers['x-real-ip'] || 'unknown';
+      const domain = req.headers.origin || req.headers.referer || 'unknown';
+      const origin = req.headers.origin || 'unknown';
+      const referer = req.headers.referer || 'unknown';
+      const ua = req.headers['user-agent'] || 'unknown';
+      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+
+      const detailedMsg = `💥💎🚀 <b>YÊU CẦU NÂNG CẤP VIP - KARARENDER</b> 🚀💎💥
+━━━━━━━━━━━━━━━━━━━━━━
+👤 <b>Khách hàng:</b> ${fullName}
+📧 <b>Email:</b> ${email}
+🆔 <b>User:</b> <code>${email}</code>
+
+💳 <b>GÓI NÂNG CẤP:</b>
+├─ <b>Mã gói:</b> ${planKey}
+├─ <b>Tên gói:</b> ${plan.label}
+├─ <b>Thời hạn:</b> ${plan.months} tháng
+└─ <b>Giá:</b> ${plan.price.toLocaleString('vi-VN')}đ
+
+📝 <b>Nội dung CK:</b> <code>${content||'N/A'}</code>
+💰 <b>Số tiền:</b> ${plan.price.toLocaleString('vi-VN')}đ
+
+🌐 <b>THÔNG TIN TRUY CẬP:</b>
+├─ <b>Domain:</b> ${domain}
+├─ <b>Origin:</b> ${origin}
+├─ <b>Referer:</b> ${referer}
+├─ <b>IP:</b> ${ip}
+└─ <b>Browser:</b> ${ua.slice(0,220)}
+
+⏰ <b>Thời gian:</b> ${timeVN}
+🆔 <b>Request ID:</b> <code>${inserted?.id||'N/A'}</code>
+━━━━━━━━━━━━━━━━━━━━━━
+⚡ <b>HÀNH ĐỘNG:</b> Vào Admin Dashboard duyệt ngay!`;
+
+      await sendTelegramDirect(detailedMsg);
+      try{
+        const {sendTelegramNotification, sendTelegram} = require('../services/telegram');
+        const fn = sendTelegramNotification || sendTelegram;
+        if(fn) await fn(detailedMsg);
+      }catch{}
+    }catch(e){ console.warn('[telegram detailed]', e.message); }
 
     res.json({success:true, message:'Đã gửi yêu cầu, chờ admin duyệt', requestId:inserted?.id, _debug: insertError ? insertError.message : 'ok'});
   }catch(e){
@@ -344,52 +380,32 @@ router.post('/admin/payment-config', async (req, res) => {
 });
 
 
-// ===== TRIAL 3 LẦN - LOGIC CHUẨN V13b - GIỮ NGUYÊN 349 DÒNG TRÊN, CHỈ THAY 2 ROUTE NÀY =====
+// ===== TRIAL 3 LẦN - LOGIC CHUẨN V13b =====
 const TRIAL_LIMIT = 3;
 
 router.get('/trial-status', async (req,res)=>{
   try{
     const email = (req.query.email || req.headers['x-user-email'] || '').toLowerCase().trim();
     if(!email){
-      console.log('[trial-status] no email, returning canFull true');
       return res.json({success:true, isVip:false, trialUsed:0, trialLimit:TRIAL_LIMIT, tabEnabled:true, canFull:true, limited:false, remaining:TRIAL_LIMIT});
     }
     if(!supabaseAdmin){
-      console.warn('[trial-status] supabaseAdmin NULL');
       return res.json({success:true, isVip:false, trialUsed:0, trialLimit:TRIAL_LIMIT, tabEnabled:true, canFull:true, limited:false, remaining:TRIAL_LIMIT, _mock:true});
     }
     let isVip=false, trialUsed=0;
     try{
-      const {data:user, error} = await supabaseAdmin.from('users').select('is_vip, trial_used').eq('email', email).single();
-      if(error) console.warn('[trial-status] user fetch error', error.message);
-      else if(user){ isVip=!!user.is_vip; trialUsed=user.trial_used||0; }
-    }catch(e){ console.warn('[trial-status] user fetch exception', e.message); }
-    
+      const {data:user} = await supabaseAdmin.from('users').select('is_vip, trial_used').eq('email', email).single();
+      if(user){ isVip=!!user.is_vip; trialUsed=user.trial_used||0; }
+    }catch{}
     let tabEnabled=true;
     try{
-      const {data:tab, error:tabErr} = await supabaseAdmin.from('app_settings').select('value').eq('id','upgrade_tab_enabled').single();
-      if(tabErr) console.warn('[trial-status] tab fetch error', tabErr.message);
-      else if(tab?.value?.enabled!==undefined) tabEnabled=!!tab.value.enabled;
-    }catch(e){ console.warn('[trial-status] tab fetch exception', e.message); }
-    
+      const {data:tab} = await supabaseAdmin.from('app_settings').select('value').eq('id','upgrade_tab_enabled').single();
+      if(tab?.value?.enabled!==undefined) tabEnabled=!!tab.value.enabled;
+    }catch{}
     const canFull = isVip || !tabEnabled || trialUsed < TRIAL_LIMIT;
     const limited = !isVip && tabEnabled && trialUsed >= TRIAL_LIMIT;
-    
-    console.log(`[trial-status] ${email} vip:${isVip} used:${trialUsed}/${TRIAL_LIMIT} tab:${tabEnabled} canFull:${canFull} limited:${limited}`);
-    res.json({
-      success:true, 
-      isVip, 
-      trialUsed, 
-      trialLimit:TRIAL_LIMIT, 
-      tabEnabled, 
-      canFull, 
-      limited, 
-      remaining: Math.max(0, TRIAL_LIMIT - trialUsed),
-      email,
-      _v13b:true
-    });
+    res.json({ success:true, isVip, trialUsed, trialLimit:TRIAL_LIMIT, tabEnabled, canFull, limited, remaining: Math.max(0, TRIAL_LIMIT - trialUsed), email, _v13b:true });
   }catch(e){
-    console.error('[trial-status] fatal', e.message, e.stack);
     res.json({success:true, isVip:false, trialUsed:0, trialLimit:TRIAL_LIMIT, tabEnabled:true, canFull:true, limited:false, remaining:TRIAL_LIMIT, _error:e.message});
   }
 });
@@ -398,34 +414,13 @@ router.post('/trial-consume', async (req,res)=>{
   try{
     const email = (req.body.email || req.headers['x-user-email'] || '').toLowerCase().trim();
     if(!email) return res.status(400).json({success:false, message:'Thiếu email'});
-    if(!supabaseAdmin){
-      console.error('[trial-consume] supabaseAdmin NULL');
-      return res.json({success:true, _mock:true});
-    }
-    
-    const {data:user, error:fetchErr} = await supabaseAdmin.from('users').select('is_vip, trial_used').eq('email', email).single();
-    if(fetchErr) console.warn('[trial-consume] fetch user error', fetchErr.message);
-    
-    if(user?.is_vip){
-      console.log(`[trial-consume] ${email} is VIP, skip`);
-      return res.json({success:true, isVip:true, trialUsed:user.trial_used||0, remaining:TRIAL_LIMIT, limited:false, trialLimit:TRIAL_LIMIT});
-    }
-    
+    if(!supabaseAdmin) return res.json({success:true, _mock:true});
+    const {data:user} = await supabaseAdmin.from('users').select('is_vip, trial_used').eq('email', email).single();
+    if(user?.is_vip) return res.json({success:true, isVip:true, trialUsed:user.trial_used||0, remaining:TRIAL_LIMIT, limited:false, trialLimit:TRIAL_LIMIT});
     const newCount = (user?.trial_used || 0) + 1;
-    const {error:updateErr} = await supabaseAdmin.from('users').update({trial_used:newCount, updated_at:new Date().toISOString()}).eq('email', email);
-    if(updateErr) console.error('[trial-consume] update error', updateErr.message);
-    else console.log(`[trial-consume] ${email} -> ${newCount}/${TRIAL_LIMIT}`);
-    
-    res.json({
-      success:true, 
-      trialUsed:newCount, 
-      remaining: Math.max(0, TRIAL_LIMIT - newCount), 
-      limited: newCount >= TRIAL_LIMIT,
-      trialLimit:TRIAL_LIMIT,
-      _v13b:true
-    });
+    await supabaseAdmin.from('users').update({trial_used:newCount, updated_at:new Date().toISOString()}).eq('email', email);
+    res.json({ success:true, trialUsed:newCount, remaining: Math.max(0, TRIAL_LIMIT - newCount), limited: newCount >= TRIAL_LIMIT, trialLimit:TRIAL_LIMIT, _v13b:true });
   }catch(e){
-    console.error('[trial-consume] fatal', e.message, e.stack);
     res.status(500).json({success:false, message:e.message});
   }
 });
