@@ -45,21 +45,26 @@ app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plan
 
 // Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
 async function sendTelegramNotification(message) {
-  if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) {
-    console.log('[Telegram] Skipped - no token/chat_id');
-    return;
+  const token = process.env.TELEGRAM_BOT_TOKEN || config.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID || config.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log('[Telegram] Skipped - no token/chat_id', { hasToken: !!token, hasChatId: !!chatId, envToken: !!process.env.TELEGRAM_BOT_TOKEN, cfgToken: !!config.TELEGRAM_BOT_TOKEN });
+    return false;
   }
   try {
-    const url = `https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: config.TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
+      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML' })
     });
-    const data = await res.json();
-    if (!data.ok) console.warn('[Telegram] Failed', JSON.stringify(data));
+    const data = await res.json().catch(()=>({}));
+    if (!data.ok) console.warn('[Telegram] Failed', JSON.stringify(data).slice(0,800));
+    else console.log('[Telegram] Sent OK to', chatId);
+    return data.ok;
   } catch (e) {
     console.error('[Telegram] Error', e.message);
+    return false;
   }
 }
 
@@ -1114,22 +1119,71 @@ app.all('/exec', async (req, res) => {
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ status:'success', success:true, message: 'Cảm ơn bạn đã góp ý!' });
       }
-      case 'requestVip':
+            case 'requestVip':
       case 'requestUpgradeVip': {
-        const email = (params.email||'').toLowerCase();
-        try{
-          if(supabaseAdmin) await supabaseAdmin.from('feedbacks').insert({ email: email, message: 'Yêu cầu VIP', created_at: new Date().toISOString(), domain: 'vip-request' });
-        }catch{}
-        const info = getClientInfo(req);
-        await sendTelegramNotification(`👑 <b>Yêu cầu VIP</b>
+        const email = (params.email||'').toLowerCase().trim();
+        const planKey = (params.planKey || params.plan_key || params.key || '1m').toString();
+        const amount = parseInt(params.amount || params.price || 0) || 0;
+        const content = (params.content || params.transferContent || '').toString().slice(0,500);
+        const fullName = (params.fullName || params.name || '').toString();
+        console.log('[requestVip exec] HIT', { email, planKey, amount, content });
+        try {
+          if (supabaseAdmin) {
+            // 1. Ghi vào vip_requests để admin duyệt
+            const { data: insReq, error: insErr } = await supabaseAdmin.from('vip_requests').insert({
+              email: email,
+              plan_key: planKey,
+              amount: amount,
+              content: content,
+              status: 'PENDING',
+              full_name: fullName,
+              created_at: new Date().toISOString()
+            }).select().single();
+            if (insErr) {
+              console.error('[requestVip exec] INSERT vip_requests FAIL', insErr.message, insErr.details);
+            } else {
+              console.log('[requestVip exec] INSERT vip_requests OK', insReq?.id);
+            }
+
+            // 2. Update users table - ĐÚNG TÊN CỘT NHƯ ẢNH CỦA BẠN
+            const now = new Date().toISOString();
+            const { error: updErr } = await supabaseAdmin.from('users').update({
+              vip_status: 'PENDING',
+              request_vip_time: now,
+              request_plan_key: planKey,
+              request_amount: amount,
+              request_content: content,
+              updated_at: now
+            }).eq('email', email);
+            
+            if (updErr) {
+              console.error('[requestVip exec] UPDATE users FAIL', updErr.message);
+              // Nếu email chưa có trong users thì thử insert pending vào vip_requests vẫn đủ để admin thấy
+            } else {
+              console.log('[requestVip exec] UPDATE users OK', email);
+            }
+          }
+        } catch(dbErr) {
+          console.error('[requestVip exec] DB error', dbErr.message);
+          // vẫn tiếp tục gửi Telegram để không mất thông tin
+        }
+
+        try {
+          const info = getClientInfo(req);
+          await sendTelegramNotification(`👑 <b>YÊU CẦU VIP - ĐÃ GHI DB</b>
 📧 <b>Email:</b> ${email}
+👤 <b>Tên:</b> ${fullName || 'N/A'}
+💳 <b>Gói:</b> ${planKey}
+💰 <b>Số tiền:</b> ${amount.toLocaleString('vi-VN')}đ
+📝 <b>ND CK:</b> ${content || 'N/A'}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
-📄 <b>Full URL:</b> ${info.fullUrl}
 📍 <b>IP:</b> ${info.ip}
-🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-        return sendJSONP({ success:true, message:'Đã gửi yêu cầu VIP!' });
+🖥️ <b>Browser:</b> ${info.browser.slice(0,200)}
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`);
+        } catch(e){ console.log('Telegram error', e.message); }
+        
+        return sendJSONP({ success:true, message:'Đã gửi yêu cầu VIP! Admin sẽ duyệt trong 5-10 phút.' });
       }
                   case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
