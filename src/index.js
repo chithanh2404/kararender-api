@@ -40,28 +40,27 @@ app.use((req, res, next) => {
 app.use('/api', upgradeRoutes);
 
 // Thêm health check ngay sau mount để test nhanh
-app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip'], time: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip','me'], time: new Date().toISOString() }));
 
-
-// Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
-async function sendTelegramNotification(message) {
-  const token = process.env.TELEGRAM_BOT_TOKEN || config.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID || config.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) {
-    console.log('[Telegram] Skipped - no token/chat_id', { hasToken: !!token, hasChatId: !!chatId, envToken: !!process.env.TELEGRAM_BOT_TOKEN, cfgToken: !!config.TELEGRAM_BOT_TOKEN });
-
-
-// ===== MỚI THÊM: API lấy user mới nhất để client tự refresh không cần logout/login =====
+// ===== FIX: THÊM /api/me ĐỂ CLIENT TỰ REFRESH TOKEN KHÔNG CẦN LOGOUT =====
 app.get('/api/me', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-User-Email, Authorization');
   try {
     const email = (req.headers['x-user-email'] || req.query.email || '').toLowerCase().trim();
-    if (!email) return res.status(400).json({ success:false, message:'Missing X-User-Email' });
-    const { supabaseAdmin } = require('./services/supabase');
-    if (!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
-    const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).single();
-    if (error || !user) return res.status(404).json({ success:false, message:'User not found' });
+    if (!email) return res.status(400).json({ success:false, message:'Missing X-User-Email or email query' });
     
-    // Trả về user với role thật
+    let supabaseAdmin;
+    try { supabaseAdmin = require('./services/supabase').supabaseAdmin; } catch(e) { supabaseAdmin = null; }
+    if (!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
+    
+    const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).single();
+    if (error || !user) {
+      console.log('[GET /api/me] user not found', email, error?.message);
+      return res.status(404).json({ success:false, message:'User not found: ' + email });
+    }
+    
+    // Dùng role thật từ DB, không tự đổi is_vip -> ADMIN như bug cũ
     const freshUser = {
       id: user.id,
       email: user.email,
@@ -78,51 +77,72 @@ app.get('/api/me', async (req, res) => {
       vip_status: user.vip_status,
       vipStatus: user.vip_status,
       request_vip_time: user.request_vip_time,
+      requestVipTime: user.request_vip_time,
       request_plan_key: user.request_plan_key,
+      requestPlanKey: user.request_plan_key,
       request_amount: user.request_amount,
       request_content: user.request_content,
       created_at: user.created_at,
       last_login_at: user.last_login_at
     };
     
-    // Tạo token mới nếu cần
-    const newToken = (() => {
-      try {
-        const payload = { 
-          email: freshUser.email, 
-          fullName: freshUser.full_name, 
-          full_name: freshUser.full_name,
-          role: freshUser.role,
-          isVip: freshUser.is_vip,
-          is_vip: freshUser.is_vip,
-          expiredDate: freshUser.expired_date,
-          expired_date: freshUser.expired_date,
-          id: freshUser.id,
-          vip_status: freshUser.vip_status
-        };
-        const data = { payload, signature: require('crypto').createHash('sha256').update(JSON.stringify(payload) + require('./config').JWT_SECRET).digest('hex') };
-        return Buffer.from(JSON.stringify(data)).toString('base64');
-      } catch(e){ return null; }
-    })();
+    // Tạo token mới giống createOldStyleToken nhưng dùng role thật
+    let newToken = null;
+    try {
+      const payload = { 
+        email: freshUser.email, 
+        fullName: freshUser.full_name, 
+        full_name: freshUser.full_name,
+        role: freshUser.role,
+        isVip: freshUser.is_vip,
+        is_vip: freshUser.is_vip,
+        is_vip_bool: freshUser.is_vip,
+        expiredDate: freshUser.expired_date,
+        expired_date: freshUser.expired_date,
+        id: freshUser.id,
+        vip_status: freshUser.vip_status,
+        vipStatus: freshUser.vip_status,
+        request_vip_time: freshUser.request_vip_time,
+        request_plan_key: freshUser.request_plan_key
+      };
+      const cfg = (() => { try { return require('./config'); } catch { return { JWT_SECRET: 'kararender-secret' }; } })();
+      const sig = require('crypto').createHash('sha256').update(JSON.stringify(payload) + (cfg.JWT_SECRET||'secret')).digest('hex');
+      const data = { payload, signature: sig };
+      newToken = Buffer.from(JSON.stringify(data)).toString('base64');
+    } catch(e) { console.log('[GET /api/me] token gen error', e.message); }
     
-    return res.json({ success:true, user: freshUser, data: freshUser, payload: freshUser, token: newToken, newToken });
+    console.log(`[GET /api/me] OK ${email} role=${freshUser.role} is_vip=${freshUser.is_vip}`);
+    return res.json({ 
+      success:true, 
+      user: freshUser, 
+      data: freshUser, 
+      payload: freshUser, 
+      token: newToken, 
+      newToken: newToken,
+      expired_date: freshUser.expired_date,
+      is_vip: freshUser.is_vip
+    });
   } catch(e){
-    console.error('[GET /api/me] error', e);
+    console.error('[GET /api/me] exception', e);
     return res.status(500).json({ success:false, message:e.message });
   }
 });
 
 app.get('/api/auth/me', async (req, res) => {
-  // alias
-  req.url = '/api/me';
-  return app._router.handle(req, res, () => {});
+  res.redirect(307, `/api/me?email=${encodeURIComponent(req.query.email||req.headers['x-user-email']||'')}`);
 });
-
 app.get('/api/user/me', async (req, res) => {
-  req.url = '/api/me';
-  return app._router.handle(req, res, () => {});
+  res.redirect(307, `/api/me?email=${encodeURIComponent(req.query.email||req.headers['x-user-email']||'')}`);
 });
 
+
+
+// Telegram với đầy đủ thông tin như mã nguồn cũ: domain, IP, browser, origin, fullUrl
+async function sendTelegramNotification(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN || config.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID || config.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    console.log('[Telegram] Skipped - no token/chat_id', { hasToken: !!token, hasChatId: !!chatId, envToken: !!process.env.TELEGRAM_BOT_TOKEN, cfgToken: !!config.TELEGRAM_BOT_TOKEN });
     return false;
   }
   try {
@@ -414,7 +434,7 @@ async function seedAdmin() {
     const { data: ex } = await supabaseAdmin.from('users').select('id').eq('email', adminEmail).maybeSingle();
     if (ex) return;
     const hash = await bcrypt.hash(adminPass, 10);
-    await supabaseAdmin.from('users').insert({ email: adminEmail, password_hash: hash, full_name: 'Lâm Chí Thành', is_vip: true, role: 'ADMIN', is_admin: true, created_at: new Date().toISOString() });
+    await supabaseAdmin.from('users').insert({ email: adminEmail, password_hash: hash, full_name: 'Lâm Chí Thành', is_vip: true, created_at: new Date().toISOString() });
   } catch {}
 }
 seedAdmin();
@@ -433,18 +453,13 @@ function createOldStyleToken(p) {
       email: p.email,
       fullName: p.full_name || p.fullName || p.email,
       full_name: p.full_name || p.fullName,
-      // FIX: Giữ role thật từ DB, không tự đổi is_vip thành ADMIN
       role: p.role || (p.is_vip ? 'VIP' : 'USER'),
-      isVip: !!p.is_vip, 
-      is_vip: !!p.is_vip,
       is_vip_bool: !!p.is_vip,
-      is_admin: p.role === 'ADMIN' || p.is_admin === true,
+      is_admin: p.role === 'ADMIN',
       vip_status: p.vip_status || (p.is_vip ? 'APPROVED' : 'NONE'),
-      // FIX: Dùng expired_date thật từ DB, không hardcode 365 ngày
       expired_date: p.expired_date || p.expiredDate || null,
+      isVip: !!p.is_vip, is_vip: !!p.is_vip,
       expiredDate: p.expired_date || p.expiredDate || new Date(Date.now() + 30*24*60*60*1000).toISOString(),
-      request_vip_time: p.request_vip_time || null,
-      request_plan_key: p.request_plan_key || null,
       id: p.id
     },
     signature: crypto.createHash('sha256').update(JSON.stringify(p) + config.JWT_SECRET).digest('hex')
