@@ -740,6 +740,17 @@ app.get('/api/admin/stats/languages', async (req,res)=>{
   }catch{ res.json({ count:0 }); }
 });
 
+app.get('/api/me', async (req,res) => {
+  const email = req.headers['x-user-email'];
+  const {data:user} = await supabaseAdmin.from('users').select('*').eq('email',email).single();
+  // trả về role thật từ DB, không tự đổi is_vip -> ADMIN nữa
+  return res.json({ 
+    success:true, 
+    user: { email:user.email, role:user.role, is_vip:user.is_vip, expired_date:user.expired_date, vip_status:user.vip_status },
+    token: newToken // token mới
+  });
+});
+
 app.post('/api/admin/test-telegram', async (req,res)=>{
   try{
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return res.json({ status:'error', message:'Chưa cấu hình Telegram' });
