@@ -1533,6 +1533,8 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       const { data: plans } = await supabaseAdmin.from('upgrade_plans').select('*').eq('key', planKey).single();
       if(plans && plans.price) expectedAmount = plans.price;
     }catch(e){}
+
+    // ===== NHÁNH THIẾU TIỀN =====
     if(amount < expectedAmount - 1000){
       console.log(`[Webhook] Amount ${amount} < expected ${expectedAmount} -> pending`);
       await supabaseAdmin.from('users').update({
@@ -1542,8 +1544,22 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
         request_content: content,
         request_vip_time: new Date().toISOString()
       }).eq('id', targetUser.id);
+
+      // FIX 1: Tạo/cập nhật vip_requests PENDING luôn
+      await supabaseAdmin.from('vip_requests').upsert({
+        email: targetUser.email,
+        full_name: targetUser.full_name || targetUser.email,
+        plan_key: planKey,
+        amount: amount,
+        content: content,
+        status: 'PENDING',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, {onConflict: 'email'});
+
       return res.json({ success:true, pending:true, reason:'Amount not enough' });
     }
+
     const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '1y':12, 'lifetime':1200 };
     const months = monthsMap[planKey] || 1;
     const now = new Date();
@@ -1553,8 +1569,11 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
     }
     expireDate.setMonth(expireDate.getMonth() + months);
     if(planKey==='lifetime') expireDate = new Date('2099-12-31');
+
+    // ===== NHÁNH ĐỦ TIỀN - AUTO APPROVED =====
     const { error: upErr } = await supabaseAdmin.from('users').update({
       is_vip: true,
+      is_vip_bool: true, // fix field bạn đang false
       role: 'VIP',
       vip_status: 'APPROVED',
       expired_date: expireDate.toISOString(),
@@ -1562,12 +1581,36 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       request_amount: amount,
       request_content: content,
       request_vip_time: new Date().toISOString(),
-      last_login_at: new Date().toISOString()
+      last_login_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
     }).eq('id', targetUser.id);
+
     if(upErr){
       console.error('[Webhook] Update VIP error', upErr);
       return res.status(500).json({ success:false, error: upErr.message });
     }
+
+    // FIX 2: QUAN TRỌNG - Update vip_requests thành APPROVED luôn
+    const { error: reqErr } = await supabaseAdmin.from('vip_requests').update({
+      status: 'APPROVED',
+      updated_at: new Date().toISOString()
+    }).eq('email', targetUser.email).eq('status', 'PENDING');
+
+    if(reqErr) {
+      console.warn('[Webhook] Update vip_requests error (không sao, vẫn APPROVED user)', reqErr.message);
+      // Nếu không có record PENDING thì tạo 1 record APPROVED để log
+      await supabaseAdmin.from('vip_requests').upsert({
+        email: targetUser.email,
+        full_name: targetUser.full_name || targetUser.email,
+        plan_key: planKey,
+        amount: amount,
+        content: content,
+        status: 'APPROVED',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, {onConflict: 'email'});
+    }
+
     console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
     return res.json({ success:true, autoApproved:true, email: targetUser.email, plan: planKey, expire: expireDate.toISOString() });
   }catch(e){
