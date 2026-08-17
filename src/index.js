@@ -1359,7 +1359,7 @@ app.all('/exec', async (req, res) => {
         // Gửi mail qua Apps Script ở background
         (async () => {
           try {
-            const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip);
+            const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip, 'register');
             await sendTelegramNotification(`🔐 <b>OTP ĐĂNG KÝ</b>\n👤 <b>Tên:</b> ${fullName || userInfo.fullName} - ${email}\n📧 <b>Email:</b> ${email}\n🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}\n🌐 <b>Domain:</b> ${info.domain}\n🔗 <b>Origin:</b> ${info.origin}\n📍 <b>IP:</b> ${info.ip}\n${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}\n🌐 <b>Browser:</b> ${info.browser}\n⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
           } catch (e) {
             console.log('Background sendRegisterOTP email/telegram error', e.message);
