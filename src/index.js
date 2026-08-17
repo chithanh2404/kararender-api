@@ -165,18 +165,20 @@ async function sendTelegramNotification(message) {
 // Email sending for OTP - Sử dụng Apps Script chính của user (đã có sẵn hàm xử lý)
 const PRIMARY_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbz_i60tGtyk_WOIAYiLuurAxs6dxWALfJ8ggmw5U2guscK-eyZ2enUMd4CRz8lRs8w/exec";
 
-async function sendOTPEmailViaAppsScript(toEmail, otp, userName = '', clientIp = '') {
+async function sendOTPEmailViaAppsScript(toEmail, otp, userName = '', clientIp = '', type = 'forgot') {
   try {
     const appsScriptUrl = process.env.APPS_SCRIPT_URL || process.env.APPS_SCRIPT_EMAIL_URL || PRIMARY_APPS_SCRIPT_URL;
+    const otpType = type === 'register' ? 'register' : 'forgot';
     
-    // Thử 3 URL khác nhau để đảm bảo gửi được mail
-    const urlsToTry = [
-      // 1. Action mới sendOTPEmail không callback - trả JSON
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
-      // 2. Action sendOTPEmail với callback cb
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
-      // 3. Action sendOTP cũ với otp param
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
+    const urlsToTry = otpType === 'register' ? [
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendRegisterOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&fullName=${encodeURIComponent(userName || '')}`,
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&purpose=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendRegisterOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
+    ] : [
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=forgot&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=forgot&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
+      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendForgotOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=forgot&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
     ];
     
     for (let i = 0; i < urlsToTry.length; i++) {
@@ -1366,16 +1368,49 @@ app.all('/exec', async (req, res) => {
         
         return;
       }
+      case 'sendRegisterOTP': {
+        const email=(params.email||'').toLowerCase().trim();
+        const fullName=(params.fullName||'').trim();
+        if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'❌ Email không hợp lệ' });
+        try {
+          const { data: ex } = await supabaseAdmin.from('users').select('id').eq('email',email).maybeSingle();
+          if(ex) return sendJSONP({ success:false, msg:'Email này đã được đăng ký! Vui lòng đăng nhập.' });
+        } catch(e) {}
+        const otp = Math.floor(100000+Math.random()*900000).toString();
+        const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
+        const createdAt = new Date().toISOString();
+        try {
+          await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','register').eq('is_used',false);
+          await supabaseAdmin.from('otps').insert({ email, otp, type:'register', expires_at: expiresAt, created_at: createdAt, is_used:false });
+          console.log(`[sendRegisterOTP] Saved ${otp} for ${email}`);
+        } catch (e) { 
+          console.log('sendRegisterOTP save error', e.message);
+          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register' }, { onConflict:'email' }); } catch(e2) {}
+        }
+        const info = getClientInfoFull(req);
+        const userInfo = getUserInfoFromRequest(req, params);
+        sendJSONP({ success:true, msg:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
+        (async () => {
+          try {
+            const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip, 'register');
+            await sendTelegramNotification(`🆕 <b>OTP ĐĂNG KÝ</b>\n👤 <b>Tên:</b> ${fullName || userInfo.fullName} - ${email}\n📧 <b>Email:</b> ${email}\n🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script (Đăng ký)' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}\n🌐 <b>Domain:</b> ${info.domain}\n🔗 <b>Origin:</b> ${info.origin}\n📍 <b>IP:</b> ${info.ip}\n${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}\n🌐 <b>Browser:</b> ${info.browser}\n⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+          } catch (e) { console.log('Background sendRegisterOTP error', e.message); }
+        })();
+        return;
+      }
       case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
         if (!email || !email.includes('@')) return sendJSONP('❌ Email không hợp lệ');
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
         try {
-          // Lưu OTP vào Supabase - là nguồn duy nhất để verify
-          await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString() }, { onConflict:'email' });
-          console.log(`[OTP] Saved ${otp} for ${email} to Supabase`);
-        } catch (e) { console.log('OTP save error', e.message); }
+          await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','forgot').eq('is_used',false);
+          await supabaseAdmin.from('otps').insert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false });
+          console.log(`[OTP] Saved ${otp} for ${email} to Supabase type=forgot`);
+        } catch (e) { 
+          console.log('OTP save error', e.message);
+          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString(), type:'forgot' }, { onConflict:'email' }); } catch(e2) {}
+        }
         const info = getClientInfoFull(req);
         const userInfo = getUserInfoFromRequest(req, params);
         
@@ -1388,7 +1423,7 @@ app.all('/exec', async (req, res) => {
         // Apps Script sẽ nhận otp param và dùng luôn, lưu vào cache của nó
         (async () => {
           try {
-            const emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip);
+            const emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip, 'forgot');
             await sendTelegramNotification(`🔑 <b>OTP Request</b>
 👤 <b>User:</b> ${userInfo.fullName} - ${email}
 📧 <b>Email:</b> ${email}
