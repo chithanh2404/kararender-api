@@ -1161,24 +1161,61 @@ app.all('/exec', async (req, res) => {
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ success:true, token:createOldStyleToken(user), user:{ email:user.email, fullName:user.full_name, role:user.role || (user.is_vip?'VIP':'USER'), isVip:!!user.is_vip, is_vip:!!user.is_vip, expired_date:user.expired_date, vip_status:user.vip_status } });
       }
-      case 'registerUser':
+            case 'registerUser':
       case 'register': {
         const email=(params.email||'').toLowerCase().trim();
+        const fullName=(params.fullName||'').trim();
+        const password=params.password||'';
+        const otp=(params.otp||'').trim();
+        
+        if (!email || !password) return sendJSONP({ success:false, msg:'Thiếu thông tin đăng ký!' });
+        if (!otp) return sendJSONP({ success:false, msg:'Vui lòng nhập mã OTP để xác minh email!' });
+
+        // Kiểm tra OTP đăng ký
+        try {
+          const { data: otpData, error: otpErr } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','register').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
+          if (otpErr || !otpData) {
+            return sendJSONP({ success:false, msg:'Không tìm thấy mã OTP. Vui lòng gửi lại OTP!' });
+          }
+          if (new Date(otpData.expires_at) < new Date()) {
+            return sendJSONP({ success:false, msg:'Mã OTP đã hết hạn (5 phút). Vui lòng gửi lại!' });
+          }
+          if (otpData.otp !== otp) {
+            return sendJSONP({ success:false, msg:'Mã OTP không đúng! Vui lòng kiểm tra lại email.' });
+          }
+          // Đánh dấu OTP đã dùng
+          await supabaseAdmin.from('otps').update({ is_used:true }).eq('id', otpData.id);
+        } catch (e) {
+          console.log('[registerUser] OTP verify error', e.message);
+          return sendJSONP({ success:false, msg:'Lỗi xác minh OTP: '+e.message });
+        }
+
         const { data: ex } = await supabaseAdmin.from('users').select('id').eq('email',email).maybeSingle();
         if(ex) return sendJSONP({ success:false, msg:'Email đã tồn tại' });
-        const hash=await bcrypt.hash(params.password||'',10);
-        await supabaseAdmin.from('users').insert({ email, password_hash:hash, full_name:params.fullName||email, is_vip:false, created_at:new Date().toISOString() });
+        if (password.length < 6) return sendJSONP({ success:false, msg:'Mật khẩu phải ít nhất 6 ký tự!' });
+        
+        const hash=await bcrypt.hash(password,10);
+        try {
+          await supabaseAdmin.from('users').insert({ email, password_hash:hash, full_name:fullName||email, is_vip:false, created_at:new Date().toISOString() });
+        } catch(e) {
+          // Fallback nếu bảng dùng cột password thay vì password_hash
+          try {
+            await supabaseAdmin.from('users').insert({ email, password:hash, full_name:fullName||email, fullName:fullName||email, is_vip:false, created_at:new Date().toISOString() });
+          } catch(e2) {
+            return sendJSONP({ success:false, msg:'Lỗi tạo tài khoản: '+e2.message });
+          }
+        }
         const info = getClientInfo(req);
-        await sendTelegramNotification(`✅ <b>Đăng ký mới</b>
+        await sendTelegramNotification(`✅ <b>Đăng ký mới (Đã xác minh OTP)</b>
 📧 <b>Email:</b> ${email}
-👤 <b>Tên:</b> ${params.fullName||email}
+👤 <b>Tên:</b> ${fullName||email}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
 📍 <b>IP:</b> ${info.ip}
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-        return sendJSONP({ success:true, msg:'Đăng ký thành công!' });
+        return sendJSONP({ success:true, msg:'Đăng ký thành công! Vui lòng đăng nhập.' });
       }
       case 'saveFeedback': {
         let payload={}; 
@@ -1283,7 +1320,53 @@ app.all('/exec', async (req, res) => {
         
         return sendJSONP({ success:true, message:'Đã gửi yêu cầu VIP! Admin sẽ duyệt trong 5-10 phút.' });
       }
-                  case 'sendOTP': {
+                  case 'sendRegisterOTP': {
+        const email=(params.email||'').toLowerCase().trim();
+        const fullName=(params.fullName||'').trim();
+        if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'❌ Email không hợp lệ' });
+        
+        // Check email đã tồn tại chưa
+        try {
+          const { data: ex } = await supabaseAdmin.from('users').select('id').eq('email',email).maybeSingle();
+          if(ex) return sendJSONP({ success:false, msg:'Email này đã được đăng ký! Vui lòng đăng nhập.' });
+        } catch(e) {}
+        
+        const otp = Math.floor(100000+Math.random()*900000).toString();
+        const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
+        const createdAt = new Date().toISOString();
+        try {
+          // Xóa OTP cũ chưa dùng type register
+          await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','register').eq('is_used',false);
+          // Lưu OTP mới với type=register
+          await supabaseAdmin.from('otps').insert({ email, otp, type:'register', expires_at: expiresAt, created_at: createdAt, is_used:false });
+          console.log(`[sendRegisterOTP] Saved ${otp} for ${email}`);
+        } catch (e) { 
+          console.log('sendRegisterOTP save error', e.message);
+          // fallback upsert cũ nếu bảng chưa có type
+          try {
+            await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register' }, { onConflict:'email' });
+          } catch(e2) {}
+        }
+        
+        const info = getClientInfoFull(req);
+        const userInfo = getUserInfoFromRequest(req, params);
+        
+        // Trả về ngay để frontend không đợi lâu (giống sendOTP)
+        sendJSONP({ success:true, msg:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
+        
+        // Gửi mail qua Apps Script ở background
+        (async () => {
+          try {
+            const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip);
+            await sendTelegramNotification(`🔐 <b>OTP ĐĂNG KÝ</b>\n👤 <b>Tên:</b> ${fullName || userInfo.fullName} - ${email}\n📧 <b>Email:</b> ${email}\n🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}\n🌐 <b>Domain:</b> ${info.domain}\n🔗 <b>Origin:</b> ${info.origin}\n📍 <b>IP:</b> ${info.ip}\n${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}\n🌐 <b>Browser:</b> ${info.browser}\n⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+          } catch (e) {
+            console.log('Background sendRegisterOTP email/telegram error', e.message);
+          }
+        })();
+        
+        return;
+      }
+      case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
         if (!email || !email.includes('@')) return sendJSONP('❌ Email không hợp lệ');
         const otp = Math.floor(100000+Math.random()*900000).toString();
