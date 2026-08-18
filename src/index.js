@@ -7,7 +7,28 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
-const { otpLimitByIP, otpLimitByEmail } = require('./middleware/rateLimit_fixed');
+
+// ===== ANTI-SPAM RATE LIMIT TỰ CHỨA - KHÔNG CẦN FILE NGOÀI =====
+const __otpBuckets = new Map();
+function __checkRateLimit(key, max, windowMs) {
+  const now = Date.now();
+  let entry = __otpBuckets.get(key);
+  if (!entry || now - entry.start > windowMs) {
+    __otpBuckets.set(key, { count: 1, start: now });
+    return { blocked: false };
+  }
+  if (entry.count >= max) {
+    const retry = Math.ceil((entry.start + windowMs - now)/1000);
+    return { blocked: true, retry };
+  }
+  entry.count++;
+  return { blocked: false };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [k,v] of __otpBuckets) if (now - v.start > 3600000) __otpBuckets.delete(k);
+}, 60000);
+
 const upgradeRoutes = require('./routes/upgrade');
 
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
@@ -1403,25 +1424,35 @@ app.all('/exec', async (req, res) => {
         const email=(params.email||'').toLowerCase().trim();
         if (!email || !email.includes('@')) return sendJSONP('❌ Email không hợp lệ');
 
-        // ===== BƯỚC CHỐNG SPAM BẠN YÊU CẦU: Check email tồn tại trong DB trước khi gửi =====
+        // ===== CHẶN SPAM IP: 20 lần / giờ =====
+        const clientIpForLimit = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+        const ipLimit = __checkRateLimit('ip:'+clientIpForLimit, 20, 60*60*1000);
+        if (ipLimit.blocked) {
+          console.log(`[RateLimit IP BLOCK] ${clientIpForLimit} - sendOTP`);
+          return sendJSONP({ success: false, msg: '❌ IP của bạn đã gửi quá nhiều yêu cầu. Vui lòng đợi 1 giờ!', error: 'IP rate limit' });
+        }
+
+        // ===== BƯỚC QUAN TRỌNG NHẤT: CHECK EMAIL TỒN TẠI TRONG DB =====
         try {
           const { data: existingUser, error: checkErr } = await supabaseAdmin.from('users').select('id,email').eq('email', email).maybeSingle();
-          if (checkErr) {
-            console.log('[sendOTP] Check user error', checkErr.message);
-          }
+          if (checkErr) console.log('[sendOTP] Check user error', checkErr.message);
           if (!existingUser) {
-            console.log(`[sendOTP BLOCK] Email không tồn tại: ${email} - IP: ${req.ip}`);
+            console.log(`[sendOTP BLOCK] Email không tồn tại: ${email} - IP: ${clientIpForLimit}`);
             return sendJSONP({ success: false, msg: 'Email này không tồn tại trong hệ thống', error: 'Email không tồn tại' });
           }
-          // Cooldown 60s - chống spam liên tục 1 email
+          // Chặn theo email: 5 lần / giờ / 1 email
+          const emailLimit = __checkRateLimit('email:'+email, 5, 60*60*1000);
+          if (emailLimit.blocked) {
+            console.log(`[RateLimit Email BLOCK] ${email}`);
+            return sendJSONP({ success: false, msg: '❌ Email này đã yêu cầu OTP quá nhiều lần. Vui lòng đợi 1 giờ!' });
+          }
+          // Cooldown 60s
           const { data: recent } = await supabaseAdmin.from('otps').select('created_at').eq('email', email).gt('created_at', new Date(Date.now() - 60*1000).toISOString()).limit(1).maybeSingle();
           if (recent) {
             return sendJSONP({ success: false, msg: 'Vui lòng đợi 60s trước khi yêu cầu lại OTP' });
           }
         } catch (checkEx) {
           console.log('[sendOTP] Exception check email', checkEx.message);
-          // Nếu lỗi DB thì vẫn chặn để an toàn, hoặc cho qua tùy bạn - ở đây mình chặn
-          // return sendJSONP({ success: false, msg: 'Lỗi kiểm tra email: ' + checkEx.message });
         }
 
         const otp = Math.floor(100000+Math.random()*900000).toString();
