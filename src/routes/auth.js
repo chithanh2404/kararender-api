@@ -4,15 +4,56 @@ const jwt = require('jsonwebtoken');
 const { supabaseAdmin } = require('../services/supabase');
 const config = require('../config');
 const { sendTelegramNotification } = require('../services/telegram');
+const { otpLimitByIP, otpLimitByEmail } = require('../middleware/rateLimit_fixed');
 
 const router = express.Router();
 
-// Helper tạo JWT riêng nếu cần giữ tương thích cũ
 function createJWT(payload) {
   return jwt.sign(payload, config.JWT_SECRET, { expiresIn: '7d' });
 }
 
-// POST /api/auth/register
+// ===== MIDDLEWARE QUAN TRỌNG: CHECK EMAIL TỒN TẠI TRƯỚC KHI GỬI OTP =====
+async function checkEmailExistsSupabase(req, res, next) {
+  try {
+    const emailRaw = req.body?.email || '';
+    const email = String(emailRaw).toLowerCase().trim();
+
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+      return res.status(400).json({ success: false, msg: 'Email không hợp lệ' });
+    }
+
+    if (!supabaseAdmin) {
+      return res.status(500).json({ success: false, msg: 'Supabase chưa cấu hình' });
+    }
+
+    // BƯỚC CHỐNG SPAM: Kiểm tra email có trong users không
+    const { data: user, error } = await supabaseAdmin
+      .from('users')
+      .select('id,email')
+      .eq('email', email)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[checkEmail] supabase error', error.message);
+      return res.status(500).json({ success: false, msg: 'Lỗi kiểm tra email' });
+    }
+
+    if (!user) {
+      // DỪNG TẠI ĐÂY - Không tạo OTP, không gửi mail
+      console.log(`[OTP Block] Email không tồn tại: ${email} - IP: ${req.ip}`);
+      return res.status(404).json({ success: false, msg: 'Email này không tồn tại trong hệ thống' });
+    }
+
+    req.foundUser = user;
+    req.normalizedEmail = email;
+    next();
+  } catch (e) {
+    console.error('checkEmailExists error', e);
+    return res.status(500).json({ success: false, msg: e.message });
+  }
+}
+
+// POST /api/auth/register - giữ nguyên
 router.post('/register', async (req, res) => {
   try {
     const { email, password, fullName } = req.body;
@@ -22,7 +63,6 @@ router.post('/register', async (req, res) => {
       return res.status(500).json({ success: false, msg: 'Supabase chưa cấu hình' });
     }
 
-    // Kiểm tra user tồn tại
     const { data: existing } = await supabaseAdmin.from('users').select('id').eq('email', email.toLowerCase()).maybeSingle();
     if (existing) return res.json({ success: false, msg: 'Email đã tồn tại' });
 
@@ -46,7 +86,7 @@ router.post('/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login
+// POST /api/auth/login - giữ nguyên
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -71,39 +111,65 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// POST /api/auth/send-otp - dùng Supabase hoặc tự tạo OTP lưu trong bảng otps
-router.post('/send-otp', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Thiếu email' });
+// POST /api/auth/send-otp - ĐÃ FIX CHỐNG SPAM
+router.post('/send-otp',
+  otpLimitByIP,               // 1. Chặn IP quét 20/h trước để đỡ tốn DB
+  checkEmailExistsSupabase,   // 2. CHECK TỒN TẠI - Không có thì dừng luôn, không gửi
+  otpLimitByEmail,            // 3. Chỉ khi email tồn tại mới tính limit 5/h
+  async (req, res) => {
+    try {
+      const email = req.normalizedEmail; // đã được chuẩn hóa từ middleware
+      const user = req.foundUser;
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+      // Cooldown 60s chống bấm liên tục 1 email
+      const { data: recent } = await supabaseAdmin
+        .from('otps')
+        .select('created_at')
+        .eq('email', email)
+        .gt('created_at', new Date(Date.now() - 60 * 1000).toISOString())
+        .limit(1)
+        .maybeSingle();
 
-    if (supabaseAdmin) {
-      await supabaseAdmin.from('otps').upsert({
-        email: email.toLowerCase(),
+      if (recent) {
+        return res.status(429).json({ success: false, msg: 'Vui lòng đợi 60s trước khi yêu cầu lại' });
+      }
+
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+      // Chỉ khi email TỒN TẠI mới upsert OTP
+      const { error: upsertErr } = await supabaseAdmin.from('otps').upsert({
+        email: email,
         otp,
         expires_at: expiresAt,
         created_at: new Date().toISOString()
       }, { onConflict: 'email' });
 
-      // Gửi email OTP qua Supabase Auth hoặc dịch vụ email của bạn
-      // Ở đây ví dụ gửi qua Supabase Auth signInWithOtp nếu dùng email
-      // Hoặc gửi qua Telegram/Email service
+      if (upsertErr) throw upsertErr;
+
+      // Gửi thông báo - chỉ gửi khi email thật
+      await sendTelegramNotification(`🔑 <b>OTP Request (Đã check DB)</b>\n📧 ${email}\n🔢 OTP: ${otp} (5 phút)\n👤 ID: ${user.id}\n🌐 IP: ${req.ip}`);
+
+      // TODO: Thay bằng hàm sendOTPEmailViaAppsScript của bạn nếu muốn gửi mail thật
+      // await sendOTPEmailViaAppsScript(email, otp, '', req.ip, 'forgot');
+
+      console.log(`[OTP OK] Đã gửi OTP cho ${email}`);
+
+      // Production thì KHÔNG trả OTP về client
+      const isDev = process.env.NODE_ENV !== 'production';
+      res.json({ 
+        success: true, 
+        message: 'OTP đã gửi tới email của bạn',
+        ...(isDev ? { debug_otp: otp } : {})
+      });
+    } catch (e) {
+      console.error('send-otp error', e);
+      res.status(500).json({ success: false, msg: e.message });
     }
-
-    await sendTelegramNotification(`🔑 <b>OTP Request</b>\n📧 ${email}\n🔢 OTP: ${otp} (5 phút)`);
-
-    // QUAN TRỌNG: production thì KHÔNG trả OTP về client, chỉ log
-    res.json({ success: true, message: 'OTP đã gửi', debug_otp: otp });
-  } catch (e) {
-    console.error('send-otp error', e);
-    res.status(500).json({ error: e.message });
   }
-});
+);
 
-// POST /api/auth/verify-and-reset
+// POST /api/auth/verify-and-reset - giữ nguyên
 router.post('/verify-and-reset', async (req, res) => {
   try {
     const { email, otp, newPass } = req.body;
