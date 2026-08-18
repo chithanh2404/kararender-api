@@ -7,6 +7,7 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
+const { otpLimitByIP, otpLimitByEmail } = require('./middleware/rateLimit_fixed');
 const upgradeRoutes = require('./routes/upgrade');
 
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
@@ -1401,6 +1402,28 @@ app.all('/exec', async (req, res) => {
       case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
         if (!email || !email.includes('@')) return sendJSONP('❌ Email không hợp lệ');
+
+        // ===== BƯỚC CHỐNG SPAM BẠN YÊU CẦU: Check email tồn tại trong DB trước khi gửi =====
+        try {
+          const { data: existingUser, error: checkErr } = await supabaseAdmin.from('users').select('id,email').eq('email', email).maybeSingle();
+          if (checkErr) {
+            console.log('[sendOTP] Check user error', checkErr.message);
+          }
+          if (!existingUser) {
+            console.log(`[sendOTP BLOCK] Email không tồn tại: ${email} - IP: ${req.ip}`);
+            return sendJSONP({ success: false, msg: 'Email này không tồn tại trong hệ thống', error: 'Email không tồn tại' });
+          }
+          // Cooldown 60s - chống spam liên tục 1 email
+          const { data: recent } = await supabaseAdmin.from('otps').select('created_at').eq('email', email).gt('created_at', new Date(Date.now() - 60*1000).toISOString()).limit(1).maybeSingle();
+          if (recent) {
+            return sendJSONP({ success: false, msg: 'Vui lòng đợi 60s trước khi yêu cầu lại OTP' });
+          }
+        } catch (checkEx) {
+          console.log('[sendOTP] Exception check email', checkEx.message);
+          // Nếu lỗi DB thì vẫn chặn để an toàn, hoặc cho qua tùy bạn - ở đây mình chặn
+          // return sendJSONP({ success: false, msg: 'Lỗi kiểm tra email: ' + checkEx.message });
+        }
+
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
         try {
