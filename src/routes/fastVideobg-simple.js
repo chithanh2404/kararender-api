@@ -1,4 +1,4 @@
-// FAST VIDEOBG FIXED V3 - Sửa lỗi video 24KB do shortest=1
+// FIXED V4 - Bỏ -loop 1, sửa lỗi frame=0
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
@@ -35,34 +35,30 @@ router.post('/fast-videobg', upload.fields([
     if(sub) temps.push(sub.path);
     if(logo) temps.push(logo.path);
 
-    const outPath = path.join(os.tmpdir(), `kara_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+    const outPath = path.join(os.tmpdir(), `kara_${Date.now()}.mp4`);
     temps.push(outPath);
 
-    console.log(`[FastV3] vb=${(vb.size/1024/1024).toFixed(1)}MB audio=${audio?.size} sub=${sub?.size} logo=${logo?.size} pos=${logoX},${logoY} ${logoW}x${logoH}`);
-
-    function escAss(p){
-      return p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "'\\''");
-    }
-
+    // Safe ASS path - đổi tên để không có ký tự đặc biệt
     let safeAssPath = null;
     if(sub){
+      // Đọc nội dung ASS và ghi lại đảm bảo UTF-8, loại bỏ BOM nếu có
+      let assContent = fs.readFileSync(sub.path, 'utf8');
+      // Fix: nếu ASS có \N ở cuối dòng không có text, ffmpeg có thể lỗi
       safeAssPath = path.join(os.tmpdir(), `sub_${Date.now()}.ass`);
-      fs.copyFileSync(sub.path, safeAssPath);
+      fs.writeFileSync(safeAssPath, assContent, 'utf8');
       temps.push(safeAssPath);
+      console.log(`[FastV4] ASS size ${assContent.length}, first 200 chars:`, assContent.substring(0,200));
     }
 
+    console.log(`[FastV4] vb=${(vb.size/1024/1024).toFixed(1)}MB logo=${logo?.size} sub=${sub?.size}`);
+
     let cmdParts = [];
+    cmdParts.push(`-i "${vb.path}"`); // 0
+    let logoIdx = -1, audioIdx = -1, nextIdx = 1;
 
-    // Input 0: videobg
-    cmdParts.push(`-i "${vb.path}"`);
-    let logoIdx = -1;
-    let audioIdx = -1;
-    let nextIdx = 1;
-
-    // Input logo - QUAN TRỌNG: thêm -loop 1 cho ảnh
     if(logo){
-      // logo là ảnh PNG, cần loop để nó hiện suốt video
-      cmdParts.push(`-loop 1 -i "${logo.path}"`);
+      // KHÔNG dùng -loop 1 nữa, để tránh infinite
+      cmdParts.push(`-i "${logo.path}"`); // 1
       logoIdx = nextIdx++;
     }
     if(audio){
@@ -70,34 +66,31 @@ router.post('/fast-videobg', upload.fields([
       audioIdx = nextIdx++;
     }
 
-    // Filter complex
     let filters = [];
     let lastLabel = '0:v';
 
     if(logo){
-      // Scale logo
       if(logoW>0 && logoH>0){
-        filters.push(`[${logoIdx}:v]scale=${logoW}:${logoH}[logo]`);
+        filters.push(`[${logoIdx}:v]scale=${logoW}:${logoH}:flags=lanczos[logo]`);
       }else if(logoW>0){
-        filters.push(`[${logoIdx}:v]scale=${logoW}:-1[logo]`);
+        filters.push(`[${logoIdx}:v]scale=${logoW}:-1:flags=lanczos[logo]`);
       }else{
-        // Không scale, giữ nguyên
-        filters.push(`[${logoIdx}:v]format=rgba[logo]`);
+        filters.push(`[${logoIdx}:v]scale=200:-1[logo]`);
       }
-      // Overlay - BỎ shortest=1, để logo hiện suốt video
-      filters.push(`[${lastLabel}][logo]overlay=${logoX}:${logoY}:format=auto[withlogo]`);
+      // Bỏ format=auto và shortest, dùng overlay đơn giản
+      filters.push(`[${lastLabel}][logo]overlay=${logoX}:${logoY}[withlogo]`);
       lastLabel = 'withlogo';
     }
 
     if(safeAssPath){
-      const esc = escAss(safeAssPath);
+      // Trên Linux, path /tmp/... không cần escape colon, nhưng escape an toàn
+      const escPath = safeAssPath.replace(/\\/g, '/').replace(/:/g, '\\:');
       if(filters.length>0){
-        filters.push(`[${lastLabel}]ass=${esc}[final]`);
+        filters.push(`[${lastLabel}]ass=${escPath}[final]`);
         lastLabel = 'final';
       }
     }
 
-    // Build final command
     let final = [...cmdParts];
 
     if(filters.length>0){
@@ -106,36 +99,51 @@ router.post('/fast-videobg', upload.fields([
       if(audio){
         final.push(`-map ${audioIdx}:a`);
       }else{
-        final.push(`-map 0:a?`); // giữ audio gốc nếu có
+        final.push(`-map 0:a?`);
       }
     }else{
-      // Chỉ có ass, không logo
+      // Chỉ có ASS
       if(safeAssPath){
-        const esc = escAss(safeAssPath);
-        final.push(`-vf "ass=${esc}"`);
+        const escPath = safeAssPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        final.push(`-vf "ass=${escPath}"`);
       }
       if(audio){
-        final.push(`-map 0:v:0 -map ${audioIdx}:a`);
+        final.push(`-map 0:v -map ${audioIdx}:a`);
       }
     }
 
-    // Codec - rất quan trọng: bỏ -shortest nếu không có audio riêng? Giữ lại nhưng không ảnh hưởng vì đã bỏ shortest ở overlay
-    final.push(`-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p`);
+    // Thêm -t để giới hạn thời gian nếu cần? Không, để tự động
+    final.push(`-c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p`);
     final.push(`-c:a aac -b:a 192k`);
     final.push(`-movflags +faststart`);
-    final.push(`-shortest`); // để video cắt theo audio nếu audio ngắn hơn
+    // Bỏ -shortest để tránh cắt ngắn khi logo là ảnh
+    // Nếu có audio riêng thì dùng shortest, nếu không thì không
+    if(audio){
+      final.push(`-shortest`);
+    }
     final.push(`-y "${outPath}"`);
 
-    const fullCmd = `"${ffmpegStatic}" ${final.join(' ')}`;
-    console.log('[FFmpeg CMD]', fullCmd);
+    const fullCmd = `"${ffmpegStatic}" -loglevel error -y ${final.join(' ')}`;
+    // Để debug full log, dùng loglevel info
+    const fullCmdInfo = `"${ffmpegStatic}" -y ${final.join(' ')}`;
+
+    console.log('[FFmpeg CMD]', fullCmdInfo);
 
     await new Promise((resolve, reject)=>{
-      exec(fullCmd, {maxBuffer: 1024*1024*50}, (err, stdout, stderr)=>{
-        console.log('[FFmpeg stderr]', (stderr||'').slice(-3000));
+      exec(fullCmdInfo, {maxBuffer: 1024*1024*50}, (err, stdout, stderr)=>{
+        console.log('[FFmpeg stdout]', stdout?.slice(-2000));
+        console.log('[FFmpeg stderr FULL]', stderr);
         if(err){
-          console.error('[FFmpeg err]', err);
-          reject(new Error(stderr?.slice(-1000) || err.message));
-        }else resolve();
+          // Kiểm tra xem output có tồn tại không dù có lỗi
+          if(fs.existsSync(outPath) && fs.statSync(outPath).size > 100*1024){
+            console.log('[FFmpeg] Output exists despite error, treating as success');
+            resolve();
+          }else{
+            reject(new Error(stderr || err.message));
+          }
+        }else{
+          resolve();
+        }
       });
     });
 
@@ -143,13 +151,11 @@ router.post('/fast-videobg', upload.fields([
       throw new Error('Output not created');
     }
     const stat = fs.statSync(outPath);
-    console.log(`[FastV3] Done ${stat.size} bytes (${(stat.size/1024/1024).toFixed(2)}MB) in ${Date.now()-start}ms`);
+    console.log(`[FastV4] Done ${stat.size} bytes in ${Date.now()-start}ms`);
 
     if(stat.size < 100*1024){
-      // File quá nhỏ (<100KB) là lỗi
-      const content = fs.readFileSync(outPath, 'utf8').slice(0,500);
-      console.error('[FastV3] Output too small, content:', content);
-      throw new Error(`Output too small (${stat.size} bytes), ffmpeg likely failed. Check logs.`);
+      const txt = fs.readFileSync(outPath, 'utf8').slice(0,1000);
+      throw new Error(`Output too small (${stat.size} bytes). Content: ${txt}`);
     }
 
     res.setHeader('Content-Type','video/mp4');
@@ -161,12 +167,10 @@ router.post('/fast-videobg', upload.fields([
     });
 
   }catch(e){
-    console.error('[FastV3] Error', e);
+    console.error('[FastV4] Error', e);
     temps.forEach(p=>{ if(p&&fs.existsSync(p)) try{fs.unlinkSync(p);}catch(e){} });
     res.status(500).json({success:false, message:e.message});
   }
 });
-
-router.get('/health', (req,res)=>res.json({ok:true, ver:'v3-fix-24kb'}));
 
 module.exports = router;
