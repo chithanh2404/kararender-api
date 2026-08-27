@@ -1,4 +1,4 @@
-// FIXED V4 - Bỏ -loop 1, sửa lỗi frame=0
+// FIXED V4.1 - Thêm CORS để không bị lỗi Không kết nối được Railway
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
@@ -8,6 +8,19 @@ const { exec } = require('child_process');
 const ffmpegStatic = require('ffmpeg-static');
 
 const router = express.Router();
+
+// === THÊM CORS ===
+router.use((req, res, next)=>{
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Expose-Headers', 'Content-Disposition, X-Render-Time');
+  if(req.method === 'OPTIONS'){
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 1024*1024*800 } });
 
 router.post('/fast-videobg', upload.fields([
@@ -38,27 +51,22 @@ router.post('/fast-videobg', upload.fields([
     const outPath = path.join(os.tmpdir(), `kara_${Date.now()}.mp4`);
     temps.push(outPath);
 
-    // Safe ASS path - đổi tên để không có ký tự đặc biệt
     let safeAssPath = null;
     if(sub){
-      // Đọc nội dung ASS và ghi lại đảm bảo UTF-8, loại bỏ BOM nếu có
       let assContent = fs.readFileSync(sub.path, 'utf8');
-      // Fix: nếu ASS có \N ở cuối dòng không có text, ffmpeg có thể lỗi
       safeAssPath = path.join(os.tmpdir(), `sub_${Date.now()}.ass`);
       fs.writeFileSync(safeAssPath, assContent, 'utf8');
       temps.push(safeAssPath);
-      console.log(`[FastV4] ASS size ${assContent.length}, first 200 chars:`, assContent.substring(0,200));
     }
 
-    console.log(`[FastV4] vb=${(vb.size/1024/1024).toFixed(1)}MB logo=${logo?.size} sub=${sub?.size}`);
+    console.log(`[FastV4.1] vb=${(vb.size/1024/1024).toFixed(1)}MB`);
 
     let cmdParts = [];
-    cmdParts.push(`-i "${vb.path}"`); // 0
+    cmdParts.push(`-i "${vb.path}"`);
     let logoIdx = -1, audioIdx = -1, nextIdx = 1;
 
     if(logo){
-      // KHÔNG dùng -loop 1 nữa, để tránh infinite
-      cmdParts.push(`-i "${logo.path}"`); // 1
+      cmdParts.push(`-i "${logo.path}"`);
       logoIdx = nextIdx++;
     }
     if(audio){
@@ -71,19 +79,17 @@ router.post('/fast-videobg', upload.fields([
 
     if(logo){
       if(logoW>0 && logoH>0){
-        filters.push(`[${logoIdx}:v]scale=${logoW}:${logoH}:flags=lanczos[logo]`);
+        filters.push(`[${logoIdx}:v]scale=${logoW}:${logoH}[logo]`);
       }else if(logoW>0){
-        filters.push(`[${logoIdx}:v]scale=${logoW}:-1:flags=lanczos[logo]`);
+        filters.push(`[${logoIdx}:v]scale=${logoW}:-1[logo]`);
       }else{
         filters.push(`[${logoIdx}:v]scale=200:-1[logo]`);
       }
-      // Bỏ format=auto và shortest, dùng overlay đơn giản
       filters.push(`[${lastLabel}][logo]overlay=${logoX}:${logoY}[withlogo]`);
       lastLabel = 'withlogo';
     }
 
     if(safeAssPath){
-      // Trên Linux, path /tmp/... không cần escape colon, nhưng escape an toàn
       const escPath = safeAssPath.replace(/\\/g, '/').replace(/:/g, '\\:');
       if(filters.length>0){
         filters.push(`[${lastLabel}]ass=${escPath}[final]`);
@@ -102,7 +108,6 @@ router.post('/fast-videobg', upload.fields([
         final.push(`-map 0:a?`);
       }
     }else{
-      // Chỉ có ASS
       if(safeAssPath){
         const escPath = safeAssPath.replace(/\\/g, '/').replace(/:/g, '\\:');
         final.push(`-vf "ass=${escPath}"`);
@@ -112,54 +117,34 @@ router.post('/fast-videobg', upload.fields([
       }
     }
 
-    // Thêm -t để giới hạn thời gian nếu cần? Không, để tự động
     final.push(`-c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p`);
     final.push(`-c:a aac -b:a 192k`);
     final.push(`-movflags +faststart`);
-    // Bỏ -shortest để tránh cắt ngắn khi logo là ảnh
-    // Nếu có audio riêng thì dùng shortest, nếu không thì không
-    if(audio){
-      final.push(`-shortest`);
-    }
+    if(audio) final.push(`-shortest`);
     final.push(`-y "${outPath}"`);
 
-    const fullCmd = `"${ffmpegStatic}" -loglevel error -y ${final.join(' ')}`;
-    // Để debug full log, dùng loglevel info
-    const fullCmdInfo = `"${ffmpegStatic}" -y ${final.join(' ')}`;
-
-    console.log('[FFmpeg CMD]', fullCmdInfo);
+    const fullCmd = `"${ffmpegStatic}" -y ${final.join(' ')}`;
+    console.log('[FFmpeg CMD]', fullCmd);
 
     await new Promise((resolve, reject)=>{
-      exec(fullCmdInfo, {maxBuffer: 1024*1024*50}, (err, stdout, stderr)=>{
-        console.log('[FFmpeg stdout]', stdout?.slice(-2000));
-        console.log('[FFmpeg stderr FULL]', stderr);
-        if(err){
-          // Kiểm tra xem output có tồn tại không dù có lỗi
-          if(fs.existsSync(outPath) && fs.statSync(outPath).size > 100*1024){
-            console.log('[FFmpeg] Output exists despite error, treating as success');
-            resolve();
-          }else{
-            reject(new Error(stderr || err.message));
-          }
-        }else{
-          resolve();
-        }
+      exec(fullCmd, {maxBuffer: 1024*1024*50}, (err, stdout, stderr)=>{
+        console.log('[FFmpeg stderr]', stderr?.slice(-3000));
+        if(err && !fs.existsSync(outPath)){
+          reject(new Error(stderr || err.message));
+        }else resolve();
       });
     });
 
-    if(!fs.existsSync(outPath)){
-      throw new Error('Output not created');
-    }
     const stat = fs.statSync(outPath);
-    console.log(`[FastV4] Done ${stat.size} bytes in ${Date.now()-start}ms`);
+    console.log(`[FastV4.1] Done ${stat.size} bytes`);
 
     if(stat.size < 100*1024){
-      const txt = fs.readFileSync(outPath, 'utf8').slice(0,1000);
-      throw new Error(`Output too small (${stat.size} bytes). Content: ${txt}`);
+      throw new Error(`Output too small ${stat.size}`);
     }
 
     res.setHeader('Content-Type','video/mp4');
     res.setHeader('Content-Disposition',`attachment; filename="kara_${Date.now()}.mp4"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
     const stream = fs.createReadStream(outPath);
     stream.pipe(res);
     stream.on('end', ()=>{
@@ -167,10 +152,23 @@ router.post('/fast-videobg', upload.fields([
     });
 
   }catch(e){
-    console.error('[FastV4] Error', e);
+    console.error('[FastV4.1] Error', e);
     temps.forEach(p=>{ if(p&&fs.existsSync(p)) try{fs.unlinkSync(p);}catch(e){} });
     res.status(500).json({success:false, message:e.message});
   }
+});
+
+router.get('/health', (req,res)=>{
+  res.header('Access-Control-Allow-Origin','*');
+  res.json({ok:true, ver:'v4.1-cors'});
+});
+
+// OPTIONS handler cho preflight
+router.options('/fast-videobg', (req,res)=>{
+  res.header('Access-Control-Allow-Origin','*');
+  res.header('Access-Control-Allow-Methods','GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers','Content-Type');
+  res.sendStatus(200);
 });
 
 module.exports = router;
