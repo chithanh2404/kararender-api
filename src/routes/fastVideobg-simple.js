@@ -1,16 +1,11 @@
-// FAST VIDEOBG FULL - FIXED VERSION v2 - Sửa lỗi Invalid argument
-// Thay thế file cũ src/routes/fastVideobg-simple.js hoặc fastVideobg-full.js
-
+// FAST VIDEOBG FIXED V3 - Sửa lỗi video 24KB do shortest=1
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { exec } = require('child_process');
-const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
-
-ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const router = express.Router();
 const upload = multer({ dest: os.tmpdir(), limits: { fileSize: 1024*1024*800 } });
@@ -40,24 +35,15 @@ router.post('/fast-videobg', upload.fields([
     if(sub) temps.push(sub.path);
     if(logo) temps.push(logo.path);
 
-    const outPath = path.join(os.tmpdir(), `kara_full_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+    const outPath = path.join(os.tmpdir(), `kara_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
     temps.push(outPath);
 
-    console.log(`[FastFullFixed] vb=${vb.path} audio=${audio?.path} sub=${sub?.path} logo=${logo?.path} x=${logoX} y=${logoY} w=${logoW} h=${logoH}`);
+    console.log(`[FastV3] vb=${(vb.size/1024/1024).toFixed(1)}MB audio=${audio?.size} sub=${sub?.size} logo=${logo?.size} pos=${logoX},${logoY} ${logoW}x${logoH}`);
 
-    // Build ffmpeg command manually to avoid fluent-ffmpeg quirks
-    // Escape ASS path for ffmpeg: replace \ with / and : with \:
     function escAss(p){
-      // Trong filter ass, cần escape \ : ' 
-      // Cách an toàn nhất: dùng single quote bao quanh path và escape bên trong
-      let np = p.replace(/\\/g, '/');
-      // ffmpeg ass filter: nếu path có dấu : thì phải escape \:
-      // Nhưng nếu dùng trong filter_complex với = thì cần escape thêm
-      // Để đơn giản, đổi tên file ass thành không có dấu cách và dùng trực tiếp
-      return np.replace(/:/g, '\\:').replace(/'/g, "'\\''");
+      return p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "'\\''");
     }
 
-    // Copy ass file to safe path without spaces
     let safeAssPath = null;
     if(sub){
       safeAssPath = path.join(os.tmpdir(), `sub_${Date.now()}.ass`);
@@ -65,121 +51,122 @@ router.post('/fast-videobg', upload.fields([
       temps.push(safeAssPath);
     }
 
-    let cmdArgs = [];
+    let cmdParts = [];
 
-    // Inputs
-    cmdArgs.push(`-i "${vb.path}"`); // 0:v
-    let inputIdx = 1;
-    let logoInputIdx = -1;
-    let audioInputIdx = -1;
+    // Input 0: videobg
+    cmdParts.push(`-i "${vb.path}"`);
+    let logoIdx = -1;
+    let audioIdx = -1;
+    let nextIdx = 1;
 
+    // Input logo - QUAN TRỌNG: thêm -loop 1 cho ảnh
     if(logo){
-      cmdArgs.push(`-i "${logo.path}"`); // 1:v
-      logoInputIdx = inputIdx++;
+      // logo là ảnh PNG, cần loop để nó hiện suốt video
+      cmdParts.push(`-loop 1 -i "${logo.path}"`);
+      logoIdx = nextIdx++;
     }
     if(audio){
-      cmdArgs.push(`-i "${audio.path}"`); // 2:a or 1:a
-      audioInputIdx = inputIdx++;
+      cmdParts.push(`-i "${audio.path}"`);
+      audioIdx = nextIdx++;
     }
 
-    // Build filter_complex
-    let filterComplex = [];
+    // Filter complex
+    let filters = [];
     let lastLabel = '0:v';
 
     if(logo){
-      // Scale logo if needed
+      // Scale logo
       if(logoW>0 && logoH>0){
-        filterComplex.push(`[${logoInputIdx}:v]scale=${logoW}:${logoH}[logo]`);
+        filters.push(`[${logoIdx}:v]scale=${logoW}:${logoH}[logo]`);
       }else if(logoW>0){
-        filterComplex.push(`[${logoInputIdx}:v]scale=${logoW}:-1[logo]`);
+        filters.push(`[${logoIdx}:v]scale=${logoW}:-1[logo]`);
       }else{
-        filterComplex.push(`[${logoInputIdx}:v]copy[logo]`);
+        // Không scale, giữ nguyên
+        filters.push(`[${logoIdx}:v]format=rgba[logo]`);
       }
-      // Overlay
-      filterComplex.push(`[${lastLabel}][logo]overlay=${logoX}:${logoY}:format=auto:shortest=1[withlogo]`);
+      // Overlay - BỎ shortest=1, để logo hiện suốt video
+      filters.push(`[${lastLabel}][logo]overlay=${logoX}:${logoY}:format=auto[withlogo]`);
       lastLabel = 'withlogo';
     }
 
     if(safeAssPath){
       const esc = escAss(safeAssPath);
-      // Nếu đã có filter_complex thì nối tiếp ass vào
-      if(filterComplex.length>0){
-        filterComplex.push(`[${lastLabel}]ass=${esc}[final]`);
+      if(filters.length>0){
+        filters.push(`[${lastLabel}]ass=${esc}[final]`);
         lastLabel = 'final';
-      }else{
-        // Chỉ có ass, không logo -> dùng -vf thay vì -filter_complex cho đơn giản
-        // Sẽ xử lý ở dưới
       }
     }
 
-    let finalArgs = [...cmdArgs];
+    // Build final command
+    let final = [...cmdParts];
 
-    if(filterComplex.length>0){
-      finalArgs.push(`-filter_complex "${filterComplex.join(';')}"`);
-      finalArgs.push(`-map "[${lastLabel}]"`);
+    if(filters.length>0){
+      final.push(`-filter_complex "${filters.join(';')}"`);
+      final.push(`-map "[${lastLabel}]"`);
       if(audio){
-        finalArgs.push(`-map ${audioInputIdx}:a`);
+        final.push(`-map ${audioIdx}:a`);
       }else{
-        // Giữ audio gốc của videobg nếu có
-        finalArgs.push(`-map 0:a?`);
+        final.push(`-map 0:a?`); // giữ audio gốc nếu có
       }
     }else{
-      // Không có filter_complex, chỉ có ass hoặc không có gì
+      // Chỉ có ass, không logo
       if(safeAssPath){
         const esc = escAss(safeAssPath);
-        finalArgs.push(`-vf "ass=${esc}"`);
+        final.push(`-vf "ass=${esc}"`);
       }
       if(audio){
-        finalArgs.push(`-map 0:v:0 -map ${audioInputIdx}:a`);
+        final.push(`-map 0:v:0 -map ${audioIdx}:a`);
       }
-      // Nếu không có audio riêng thì giữ nguyên
     }
 
-    // Output codec - dùng veryfast để nhanh, crf 20 giữ chất lượng
-    finalArgs.push(`-c:v libx264 -preset veryfast -crf 20`);
-    finalArgs.push(`-c:a aac -b:a 192k`);
-    finalArgs.push(`-movflags faststart -shortest`);
-    finalArgs.push(`-y "${outPath}"`);
+    // Codec - rất quan trọng: bỏ -shortest nếu không có audio riêng? Giữ lại nhưng không ảnh hưởng vì đã bỏ shortest ở overlay
+    final.push(`-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p`);
+    final.push(`-c:a aac -b:a 192k`);
+    final.push(`-movflags +faststart`);
+    final.push(`-shortest`); // để video cắt theo audio nếu audio ngắn hơn
+    final.push(`-y "${outPath}"`);
 
-    const fullCmd = `"${ffmpegStatic}" ${finalArgs.join(' ')}`;
+    const fullCmd = `"${ffmpegStatic}" ${final.join(' ')}`;
     console.log('[FFmpeg CMD]', fullCmd);
 
     await new Promise((resolve, reject)=>{
-      exec(fullCmd, {maxBuffer: 1024*1024*20}, (err, stdout, stderr)=>{
-        console.log('[FFmpeg stdout]', stdout?.substring(0,1000));
-        console.log('[FFmpeg stderr]', stderr?.substring(0,2000));
+      exec(fullCmd, {maxBuffer: 1024*1024*50}, (err, stdout, stderr)=>{
+        console.log('[FFmpeg stderr]', (stderr||'').slice(-3000));
         if(err){
-          console.error('[FFmpeg error]', err);
-          reject(new Error(`ffmpeg failed: ${stderr?.substring(0,1000)} - ${err.message}`));
+          console.error('[FFmpeg err]', err);
+          reject(new Error(stderr?.slice(-1000) || err.message));
         }else resolve();
       });
     });
 
-    if(!fs.existsSync(outPath)) throw new Error('Output not created');
-
+    if(!fs.existsSync(outPath)){
+      throw new Error('Output not created');
+    }
     const stat = fs.statSync(outPath);
-    console.log(`[FastFullFixed] Done ${stat.size} bytes in ${Date.now()-start}ms`);
+    console.log(`[FastV3] Done ${stat.size} bytes (${(stat.size/1024/1024).toFixed(2)}MB) in ${Date.now()-start}ms`);
+
+    if(stat.size < 100*1024){
+      // File quá nhỏ (<100KB) là lỗi
+      const content = fs.readFileSync(outPath, 'utf8').slice(0,500);
+      console.error('[FastV3] Output too small, content:', content);
+      throw new Error(`Output too small (${stat.size} bytes), ffmpeg likely failed. Check logs.`);
+    }
 
     res.setHeader('Content-Type','video/mp4');
-    res.setHeader('Content-Disposition',`attachment; filename="kara_full_${Date.now()}.mp4"`);
+    res.setHeader('Content-Disposition',`attachment; filename="kara_${Date.now()}.mp4"`);
     const stream = fs.createReadStream(outPath);
     stream.pipe(res);
     stream.on('end', ()=>{
       temps.forEach(p=>{ if(p&&fs.existsSync(p)) try{fs.unlinkSync(p);}catch(e){} });
     });
-    stream.on('error', (e)=>{
-      console.error('Stream error', e);
-      res.status(500).end();
-    });
 
   }catch(e){
-    console.error('[FastFullFixed] Exception', e);
+    console.error('[FastV3] Error', e);
     temps.forEach(p=>{ if(p&&fs.existsSync(p)) try{fs.unlinkSync(p);}catch(e){} });
-    res.status(500).json({success:false, message:e.message, stack:e.stack?.substring(0,2000)});
+    res.status(500).json({success:false, message:e.message});
   }
 });
 
-// Health check
-router.get('/health', (req,res)=>res.json({ok:true, version:'fixed-v2'}));
+router.get('/health', (req,res)=>res.json({ok:true, ver:'v3-fix-24kb'}));
 
 module.exports = router;
