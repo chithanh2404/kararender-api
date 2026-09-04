@@ -1,7 +1,7 @@
 {
   "name": "kararender-backend",
   "version": "2.0.0",
-  "description": "KaraRender backend - Supabase + Cloud Run replacement for Apps Script",
+  "description": "KaraRender backend - Supabase + Cloud Run replacement for Apps Script - with Vocal Remover Stereo",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -18,9 +18,11 @@
     "googleapis": "^128.0.0",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "multer": "^2.2.0",
+    "multer": "^2.0.1",
     "nodemailer": "^6.9.8",
-    "ws": "^8.13.0"
+    "ws": "^8.13.0",
+    "uuid": "^9.0.0",
+    "onnxruntime-node": "^1.17.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
