@@ -7,6 +7,8 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
+const vocalRouter = require('./routes/vocal');
+
 
 // ===== ANTI-SPAM RATE LIMIT TỰ CHỨA - KHÔNG CẦN FILE NGOÀI =====
 const __otpBuckets = new Map();
@@ -45,6 +47,7 @@ app.set('trust proxy', true);
 app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use('/api/vocal', vocalRouter);
 
 // FIX CORS - THÊM X-User-Email, X-Admin-Token, Authorization
 const corsOptions = {
