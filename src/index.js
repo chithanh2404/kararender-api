@@ -44,12 +44,17 @@ if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
 const app = express();
 const PORT = config.PORT;
 app.set('trust proxy', true);
-app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/api/vocal', vocalRouter);
 
-// FIX CORS - THÊM X-User-Email, X-Admin-Token, Authorization
+// FIX: Helmet phải tắt hết cross-origin để không bị Failed to fetch từ Blogger
+app.use(helmet({ 
+  crossOriginResourcePolicy: false, 
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginOpenerPolicy: false
+}));
+
+// FIX CORS - PHẢI ĐẶT TRƯỚC /api/vocal để không bị Failed to fetch
+// Lỗi cũ: app.use('/api/vocal') đặt trước cors() nên preflight OPTIONS bị block
 const corsOptions = {
   origin: (o, cb) => cb(null, true),
   credentials: true,
@@ -58,6 +63,12 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Sau khi cors mới mount vocalRouter
+app.use('/api/vocal', vocalRouter);
 
 // FIX: Thêm middleware log + đảm bảo /api/health luôn trả về
 app.use((req, res, next) => {
