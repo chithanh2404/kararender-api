@@ -3,15 +3,17 @@ const fs = require('fs');
 const path = require('path');
 const config = require('../config');
 const { xorEncodeToBase64 } = require('../services/xor');
-const { checkCorsGuard, checkCorsGuardStrict, verifyTk, isSecureDesktopRequest, isAllowedDomain } = require('../middleware/domainGuard');
+const { checkCorsGuard } = require('../middleware/domainGuard');
 const { getFileContentAsString, listFilesInFolder } = require('../services/drive');
 
 const router = express.Router();
 
+// Cache module trong RAM - nhanh hơn đọc file mỗi lần
 let cachedModule = null;
 let cacheTime = 0;
 
 async function getSecureRenderModuleContent() {
+  // 1. Thử đọc từ file local ./secure-render-engine.js (khuyên dùng)
   try {
     const localPath = path.join(__dirname, '../../secure-render-engine.js');
     if (fs.existsSync(localPath)) {
@@ -28,6 +30,7 @@ async function getSecureRenderModuleContent() {
   } catch (e) {
     console.warn('Local secure module not found', e.message);
   }
+  // 2. Từ Drive folder
   if (config.DRIVE.SECURE_RENDER_FOLDER_ID) {
     try {
       const files = await listFilesInFolder(config.DRIVE.SECURE_RENDER_FOLDER_ID);
@@ -44,29 +47,10 @@ async function getSecureRenderModuleContent() {
 }
 
 router.get('/', async (req, res) => {
-  // BẢO MẬT: Dùng guard mới có verifyTk + desktop secret, KHÔNG thêm 127.0.0.1 vào allowedHosts
-  const guard = checkCorsGuardStrict ? checkCorsGuardStrict(req) : checkCorsGuard(req);
-  
-  // Cho phép desktop nếu có secret + tk hợp lệ
-  const isDesktop = isSecureDesktopRequest ? isSecureDesktopRequest(req) : false;
-  const tkParam = req.query.tk || '';
-  const tkCheck = verifyTk ? verifyTk(tkParam) : { valid: false };
-
-  if (guard.blocked && !isDesktop) {
-    console.warn(`[SecureRender] BLOCKED domain: ${guard.source} reason: ${guard.reason}`);
+  const guard = checkCorsGuard(req);
+  if (guard.blocked && !guard.isDirect) {
+    console.warn(`[SecureRender] BLOCKED domain: ${guard.source}`);
     return res.type('text/plain').send(`ERROR_DOMAIN_BLOCKED: Domain not allowed - ${guard.source}. Allowed: ${config.ALLOWED_HOSTS_STRICT.join(', ')}`);
-  }
-
-  // BẢO MẬT: Nếu có tk thì phải valid, chống replay
-  if (tkParam && !tkCheck.valid && !isDesktop) {
-    console.warn(`[SecureRender] Invalid tk: ${tkCheck.reason}`);
-    // Vẫn cho qua nếu domain ok, nhưng log lại - không block cứng để tránh break web cũ
-    // Nếu muốn chặt hơn thì return 403 ở đây
-    // return res.type('text/plain').status(403).send(`ERROR_TOKEN_INVALID: ${tkCheck.reason}`);
-  }
-
-  if (isDesktop) {
-    console.log(`[SecureRender] Secure desktop request allowed, tk domain: ${tkCheck.domainInTk || 'n/a'}`);
   }
 
   try {
@@ -80,14 +64,8 @@ router.get('/', async (req, res) => {
     if (ts > 1000000000 && ts < 1000000000000) ts = ts * 1000;
     if (ts < 1000000000000) ts = now;
 
-    // BẢO MẬT: Check token age 5 phút thay vì log rồi bỏ qua
-    if (Math.abs(now - ts) > (config.SECURE_TOKEN_MAX_AGE_MS || 300000)) {
-      console.warn(`[SecureRender] Token expired: diff=${now-ts}ms origin=${originParam} isDesktop=${isDesktop}`);
-      if (!isDesktop) {
-        // Web thường thì block nếu token quá cũ
-        // Desktop đã có secret nên cho phép với cảnh báo
-        console.log(`[SecureRender] Token old but allow for web with warning`);
-      }
+    if (Math.abs(now - ts) > config.SECURE_TOKEN_MAX_AGE_MS) {
+      console.log(`[SecureRender] Token old but allow: diff=${now-ts} origin=${originParam}`);
     }
 
     if (tkParam) {
@@ -101,20 +79,13 @@ router.get('/', async (req, res) => {
         if (tokenTs && Math.abs(tokenTs - ts) > 60000) {
           console.log(`[SecureRender] Token ts mismatch: ${tokenTs} vs ${ts}`);
         }
-        // BẢO MẬT: Check domain trong tk phải là allowed domain
-        const domainInTk = parts[0] || '';
-        if (domainInTk && !isAllowedDomain(domainInTk)) {
-          console.warn(`[SecureRender] Domain in tk not allowed: ${domainInTk}`);
-          if (!isDesktop) {
-            return res.type('text/plain').status(403).send(`ERROR_DOMAIN_IN_TK_NOT_ALLOWED: ${domainInTk}`);
-          }
-        }
       } catch (err) {
         console.log(`[SecureRender] Token decode failed: ${err.message}`);
       }
     }
 
     let jsContent = null;
+    // dùng cache 5 phút
     if (cachedModule && Date.now() - cacheTime < 300000) {
       jsContent = cachedModule;
     } else {
@@ -129,12 +100,13 @@ router.get('/', async (req, res) => {
       return res.type('text/plain').status(404).send('ERROR_MODULE_NOT_FOUND: secure-render-engine file not found');
     }
 
+    let output;
     const xorKey = config.SECURE_XOR_SALT + '_' + ts.toString();
     const b64 = xorEncodeToBase64(jsContent, xorKey);
-    const output = b64.replace(/\r?\n/g, '').trim();
+    output = b64.replace(/\r?\n/g, '').trim();
 
     if (Math.random() < 0.1) {
-      console.log(`[SecureRender] Served ENC to ${originParam} len=${output.length} desktop=${isDesktop}`);
+      console.log(`[SecureRender] Served ENC to ${originParam} len=${output.length}`);
     }
 
     res.type('text/plain').send(output);
