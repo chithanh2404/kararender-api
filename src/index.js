@@ -8,7 +8,6 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
 const vocalRouter = require('./routes/vocal');
-const { otpLimitByEmail, otpLimitByIP } = require('./middleware/rateLimit'); // DÙNG FILE CÓ SẴN
 
 
 // ===== ANTI-SPAM RATE LIMIT TỰ CHỨA - KHÔNG CẦN FILE NGOÀI =====
@@ -37,14 +36,10 @@ const upgradeRoutes = require('./routes/upgrade');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 
 
-// BẢO MẬT: Không thêm localhost/127.0.0.1 vào allowedHosts - dùng config_fixed đã lọc
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
-  config.ALLOWED_HOSTS = ['kararender.com', 'www.kararender.com'];
+  config.ALLOWED_HOSTS = ['kararender.com', 'www.kararender.com', 'localhost', '127.0.0.1'];
   config.ALLOWED_HOSTS_STRICT = ['https://kararender.com', 'https://www.kararender.com'];
 }
-// Đảm bảo không có localhost dù env có gửi
-config.ALLOWED_HOSTS = config.ALLOWED_HOSTS.filter(h => !h.includes('127.0.0.1') && !h.includes('localhost'));
-config.ALLOWED_HOSTS_STRICT = config.ALLOWED_HOSTS_STRICT.filter(h => !h.toLowerCase().includes('127.0.0.1') && !h.toLowerCase().includes('localhost'));
 
 const app = express();
 const PORT = config.PORT;
@@ -64,7 +59,7 @@ const corsOptions = {
   origin: (o, cb) => cb(null, true),
   credentials: true,
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With','X-User-Email','X-Admin-Token','Authorization','X-Kara-Desktop','X-Kara-Desktop-Secret']
+  allowedHeaders: ['Content-Type','Origin','Referer','X-Requested-With','X-User-Email','X-Admin-Token','Authorization']
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
