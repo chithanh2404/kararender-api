@@ -80,3 +80,4 @@ function domainGuard(protectedActions = []) {
 }
 
 module.exports = { domainGuard, checkCorsGuard, isAllowedDomain, getClientDomainFromRequest };
+
