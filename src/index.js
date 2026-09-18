@@ -1475,22 +1475,32 @@ app.all('/exec', async (req, res) => {
         const ipLimit = __checkRateLimit('ip:'+clientIpForLimit, 20, 60*60*1000);
         if (ipLimit.blocked) {
           console.log(`[RateLimit IP BLOCK] ${clientIpForLimit} - sendOTP`);
-          return sendJSONP({ success: false, msg: '❌ IP của bạn đã gửi quá nhiều yêu cầu. Vui lòng đợi 1 giờ!', error: 'IP rate limit' });
+          return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT' });
         }
 
-        // ===== BƯỚC QUAN TRỌNG NHẤT: CHECK EMAIL TỒN TẠI TRONG DB =====
+        // ===== CHECK EMAIL TỒN TẠI + RATE LIMIT BỀN VỮNG (DB + MEMORY) =====
         try {
           const { data: existingUser, error: checkErr } = await supabaseAdmin.from('users').select('id,email').eq('email', email).maybeSingle();
           if (checkErr) console.log('[sendOTP] Check user error', checkErr.message);
           if (!existingUser) {
             console.log(`[sendOTP BLOCK] Email không tồn tại: ${email} - IP: ${clientIpForLimit}`);
-            return sendJSONP({ success: false, msg: 'Email này không tồn tại trong hệ thống', error: 'Email không tồn tại' });
+            return sendJSONP({ success: false, msg: 'Email này không tồn tại trong hệ thống' });
           }
-          // Chặn theo email: 5 lần / giờ / 1 email
+          // DB check: đếm số OTP trong 60 phút qua (chống restart server làm mất Map)
+          const oneHourAgo = new Date(Date.now() - 60*60*1000).toISOString();
+          try {
+            const { count: hourCount, error: countErr } = await supabaseAdmin.from('otps').select('*', { count: 'exact', head: true }).eq('email', email).gte('created_at', oneHourAgo);
+            if (!countErr && hourCount !== null && hourCount >= 5) {
+              console.log(`[RateLimit DB BLOCK] ${email} count=${hourCount}`);
+              return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT' });
+            }
+          } catch(e) { console.log('[sendOTP] DB count error', e.message); }
+          
+          // Memory check: 5 lần / giờ / email
           const emailLimit = __checkRateLimit('email:'+email, 5, 60*60*1000);
           if (emailLimit.blocked) {
             console.log(`[RateLimit Email BLOCK] ${email}`);
-            return sendJSONP({ success: false, msg: '❌ Email này đã yêu cầu OTP quá nhiều lần. Vui lòng đợi 1 giờ!' });
+            return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT' });
           }
           // Cooldown 60s
           const { data: recent } = await supabaseAdmin.from('otps').select('created_at').eq('email', email).gt('created_at', new Date(Date.now() - 60*1000).toISOString()).limit(1).maybeSingle();
@@ -1555,7 +1565,6 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
           return sendJSONP({ success:false, msg:'Mật khẩu mới phải từ 6 ký tự!' });
         }
         try {
-          // Lấy OTP mới nhất chưa dùng loại forgot
           const { data: otpData, error: otpErr } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','forgot').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
           if (otpErr || !otpData) {
             return sendJSONP({ success:false, msg:'Không tìm thấy mã OTP. Vui lòng gửi lại OTP!' });
@@ -1566,19 +1575,14 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
           if (otpData.otp !== otp) {
             return sendJSONP({ success:false, msg:'Mã OTP không đúng! Vui lòng kiểm tra lại email.' });
           }
-          // Hash mật khẩu mới
           const hash = await bcrypt.hash(newPass, 10);
           const { error: upErr } = await supabaseAdmin.from('users').update({ password_hash: hash, updated_at: new Date().toISOString() }).eq('email', email);
           if (upErr) {
-            console.log('[verifyAndResetPassword] Update error', upErr.message);
             return sendJSONP({ success:false, msg:'Lỗi cập nhật mật khẩu: '+upErr.message });
           }
-          // Đánh dấu OTP đã dùng
           await supabaseAdmin.from('otps').update({ is_used:true }).eq('id', otpData.id);
-          console.log(`[verifyAndResetPassword] OK ${email} - password reset`);
           return sendJSONP({ success:true, msg:'Đổi mật khẩu thành công! Vui lòng đăng nhập lại với mật khẩu mới.' });
         } catch (e) {
-          console.log('[verifyAndResetPassword] Exception', e.message);
           return sendJSONP({ success:false, msg:'Lỗi server: '+e.message });
         }
       }
