@@ -210,61 +210,53 @@ async function sendOTPEmailViaAppsScript(toEmail, otp, userName = '', clientIp =
     const appsScriptUrl = process.env.APPS_SCRIPT_URL || process.env.APPS_SCRIPT_EMAIL_URL || PRIMARY_APPS_SCRIPT_URL;
     const otpType = type === 'register' ? 'register' : 'forgot';
     
-    const urlsToTry = otpType === 'register' ? [
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendRegisterOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&fullName=${encodeURIComponent(userName || '')}`,
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&purpose=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendRegisterOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=register&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
-    ] : [
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=forgot&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=forgot&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}&callback=cb`,
-      `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendForgotOTP&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=forgot&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`,
-    ];
+    // OPTIMIZED V8: Chỉ thử 1 URL chính, không thử 3 URL nữa để nhanh hơn
+    const mainUrl = `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=${otpType}&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`;
     
-    for (let i = 0; i < urlsToTry.length; i++) {
-      const url = urlsToTry[i];
-      try {
-        console.log(`[Email AppsScript] Attempt ${i+1}/3: ${url.slice(0,150)}...`);
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-        
-        const res = await fetch(url, { 
-          method: 'GET', 
-          headers: { 'User-Agent': 'KaraRender-Backend' },
-          redirect: 'follow',
-          signal: controller.signal
-        });
-        clearTimeout(timeout);
-        
-        const result = await res.text();
-        console.log(`[Email AppsScript] Attempt ${i+1} response (${result.length} chars): ${result.slice(0,600)}`);
-        
-        // Thành công nếu có các từ khóa này
-        if (result.includes('Đã gửi') || result.includes('Mã OTP đã được gửi') || result.includes('success') || result.includes('"success":true') || result.includes('cb(')) {
-          // Nếu response là JSON error thì check
-          if (result.includes('"success":false') || result.includes('❌')) {
-            console.log(`[Email AppsScript] Attempt ${i+1} reported failure: ${result.slice(0,300)}`);
-            if (result.includes('quá nhiều')) {
-              return { success: false, error: result.slice(0,300), via: 'appscript-rate-limit' };
-            }
-            continue; // Thử URL tiếp theo
-          }
-          console.log(`[Email AppsScript] Attempt ${i+1} SUCCESS with OTP ${otp}`);
-          return { success: true, via: 'appscript-attempt-' + (i+1), raw: result.slice(0,300), usedOtp: otp };
+    console.log(`[Email AppsScript V8] Sending OTP ${otp} to ${toEmail} via ${mainUrl.slice(0,120)}...`);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000); // Giảm từ 15s xuống 8s
+    
+    try {
+      const res = await fetch(mainUrl, { 
+        method: 'GET', 
+        headers: { 'User-Agent': 'KaraRender-Backend' },
+        redirect: 'follow',
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      
+      const result = await res.text();
+      console.log(`[Email AppsScript V8] Response (${result.length} chars): ${result.slice(0,400)}`);
+      
+      if (result.includes('"success":false') || result.includes('❌')) {
+        if (result.toLowerCase().includes('quá nhiều') || result.includes('1 giờ') || result.includes('IP')) {
+          return { success: false, error: result.slice(0,500), isRateLimit: true };
         }
-      } catch (e) {
-        console.log(`[Email AppsScript] Attempt ${i+1} exception: ${e.message}`);
-        continue;
+        return { success: false, error: result.slice(0,500) };
       }
+      
+      if (result.includes('Đã gửi') || result.includes('Mã OTP đã được gửi') || result.includes('success') || result.includes('"success":true') || result.includes('cb(')) {
+        return { success: true, via: 'appscript-v8', raw: result.slice(0,300), usedOtp: otp };
+      }
+      
+      // Nếu không rõ, coi như thành công nếu status 200
+      if (res.ok) {
+        return { success: true, via: 'appscript-v8-fallback', raw: result.slice(0,300), usedOtp: otp };
+      }
+      
+      return { success: false, error: result.slice(0,500) };
+    } catch (fetchErr) {
+      clearTimeout(timeout);
+      console.log('[Email AppsScript V8] Fetch error:', fetchErr.message);
+      return { success: false, error: fetchErr.message };
     }
-    
-    console.log('[Email AppsScript] All 3 attempts failed');
-    return { success: false, error: 'All Apps Script attempts failed - no email sent', via: 'appscript-all-failed' };
   } catch (e) {
-    console.error('[Email AppsScript] Fatal error', e.message);
-    return { success: false, error: e.message, via: 'appscript-fatal' };
+    console.error('[Email AppsScript V8] Outer error', e.message);
+    return { success: false, error: e.message };
   }
 }
+
 
 
 async function sendOTPEmail(toEmail, otp, userName = '') {
@@ -1509,7 +1501,7 @@ app.all('/exec', async (req, res) => {
           console.log('[sendOTP] Exception check email', checkEx.message);
         }
 
-        // ===== TẠO OTP VÀ GỬI MAIL QUA APPS SCRIPT TRƯỚC, CHỜ KẾT QUẢ =====
+        // ===== TẠO OTP + LƯU NHANH V8 =====
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
         const info = getClientInfoFull(req);
