@@ -1468,9 +1468,9 @@ app.all('/exec', async (req, res) => {
       }
       case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
-        if (!email || !email.includes('@')) return sendJSONP('❌ Email không hợp lệ');
+        if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'❌ Email không hợp lệ' });
 
-        // ===== CHẶN SPAM IP: 20 lần / giờ =====
+        // ===== CHẶN SPAM IP: 20 lần / giờ (Memory) =====
         const clientIpForLimit = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
         const ipLimit = __checkRateLimit('ip:'+clientIpForLimit, 20, 60*60*1000);
         if (ipLimit.blocked) {
@@ -1478,31 +1478,29 @@ app.all('/exec', async (req, res) => {
           return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT' });
         }
 
-        // ===== CHECK EMAIL TỒN TẠI + RATE LIMIT BỀN VỮNG (DB + MEMORY) =====
+        // ===== CHECK EMAIL + RATE LIMIT DB =====
         try {
           const { data: existingUser, error: checkErr } = await supabaseAdmin.from('users').select('id,email').eq('email', email).maybeSingle();
           if (checkErr) console.log('[sendOTP] Check user error', checkErr.message);
           if (!existingUser) {
-            console.log(`[sendOTP BLOCK] Email không tồn tại: ${email} - IP: ${clientIpForLimit}`);
+            console.log(`[sendOTP BLOCK] Email không tồn tại: ${email}`);
             return sendJSONP({ success: false, msg: 'Email này không tồn tại trong hệ thống' });
           }
-          // DB check: đếm số OTP trong 60 phút qua (chống restart server làm mất Map)
+          // DB: đếm số OTP trong 60 phút qua
           const oneHourAgo = new Date(Date.now() - 60*60*1000).toISOString();
           try {
-            const { count: hourCount, error: countErr } = await supabaseAdmin.from('otps').select('*', { count: 'exact', head: true }).eq('email', email).gte('created_at', oneHourAgo);
-            if (!countErr && hourCount !== null && hourCount >= 5) {
+            const { count: hourCount } = await supabaseAdmin.from('otps').select('*', { count: 'exact', head: true }).eq('email', email).gte('created_at', oneHourAgo);
+            if (hourCount !== null && hourCount >= 5) {
               console.log(`[RateLimit DB BLOCK] ${email} count=${hourCount}`);
               return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT' });
             }
           } catch(e) { console.log('[sendOTP] DB count error', e.message); }
           
-          // Memory check: 5 lần / giờ / email
           const emailLimit = __checkRateLimit('email:'+email, 5, 60*60*1000);
           if (emailLimit.blocked) {
             console.log(`[RateLimit Email BLOCK] ${email}`);
             return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT' });
           }
-          // Cooldown 60s
           const { data: recent } = await supabaseAdmin.from('otps').select('created_at').eq('email', email).gt('created_at', new Date(Date.now() - 60*1000).toISOString()).limit(1).maybeSingle();
           if (recent) {
             return sendJSONP({ success: false, msg: 'Vui lòng đợi 60s trước khi yêu cầu lại OTP' });
@@ -1511,8 +1509,35 @@ app.all('/exec', async (req, res) => {
           console.log('[sendOTP] Exception check email', checkEx.message);
         }
 
+        // ===== TẠO OTP VÀ GỬI MAIL QUA APPS SCRIPT TRƯỚC, CHỜ KẾT QUẢ =====
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
+        const info = getClientInfoFull(req);
+        const userInfo = getUserInfoFromRequest(req, params);
+
+        // Gửi qua Apps Script và CHỜ kết quả để biết có bị chặn IP không
+        let emailResult;
+        try {
+          emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip, 'forgot');
+          console.log(`[sendOTP] Apps Script result for ${email}:`, JSON.stringify(emailResult).slice(0,500));
+        } catch (e) {
+          console.log('[sendOTP] Apps Script exception', e.message);
+          emailResult = { success: false, error: e.message };
+        }
+
+        // Nếu Apps Script báo chặn -> trả về lỗi chặn ngay, KHÔNG lưu OTP vào Supabase
+        if (!emailResult || !emailResult.success) {
+          const errStr = (emailResult && (emailResult.error || JSON.stringify(emailResult)) || '').toString();
+          const lower = errStr.toLowerCase();
+          if (lower.includes('quá nhiều') || lower.includes('1 giờ') || lower.includes('ip') || lower.includes('rate limit') || lower.includes('quá số lần')) {
+            return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT', detail: errStr.slice(0,300) });
+          }
+          // Lỗi gửi mail khác
+          console.log(`[sendOTP] Email failed for ${email}: ${errStr}`);
+          return sendJSONP({ success: false, msg: 'Không gửi được email OTP, vui lòng thử lại sau: ' + errStr.slice(0,200) });
+        }
+
+        // Email gửi thành công -> mới lưu OTP vào Supabase
         try {
           await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','forgot').eq('is_used',false);
           await supabaseAdmin.from('otps').insert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false });
@@ -1521,35 +1546,23 @@ app.all('/exec', async (req, res) => {
           console.log('OTP save error', e.message);
           try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString(), type:'forgot' }, { onConflict:'email' }); } catch(e2) {}
         }
-        const info = getClientInfoFull(req);
-        const userInfo = getUserInfoFromRequest(req, params);
-        
-        // FIX 1: Toast gọn - trả về string trực tiếp, không phải object JSON
-        // Trước: sendJSONP({success:true, message:"..."}) → frontend JSON.stringify → hiện cả {"success":true,"message":...}
-        // Sau: sendJSONP("Mã OTP đã được gửi...") → frontend hiện gọn
-        sendJSONP(`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).`);
 
-        // FIX 2: OTP đồng nhất - Gửi đúng OTP này (807781) qua Apps Script, không để Apps Script tự sinh OTP mới (570810)
-        // Apps Script sẽ nhận otp param và dùng luôn, lưu vào cache của nó
-        (async () => {
-          try {
-            const emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip, 'forgot');
-            await sendTelegramNotification(`🔑 <b>OTP Request</b>
+        // Gửi Telegram báo thành công
+        try {
+          await sendTelegramNotification(`🔑 <b>OTP Request - THÀNH CÔNG</b>
 👤 <b>User:</b> ${userInfo.fullName} - ${email}
 📧 <b>Email:</b> ${email}
-🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}
+🔢 <b>OTP:</b> ${otp} (5 phút) - Đã gửi mail ✅ via Apps Script
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📍 <b>IP:</b> ${info.ip}
 ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
 🌐 <b>Browser:</b> ${info.browser}
-⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-          } catch (e) {
-            console.log('Background OTP email/telegram error', e.message);
-          }
-        })();
-        
-        return;
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`);
+        } catch(e) { console.log('Telegram error', e.message); }
+
+        // Trả về client thành công thật sự
+        return sendJSONP({ success: true, msg: `Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
       }
 
       case 'verifyAndResetPassword':
@@ -1565,8 +1578,8 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
           return sendJSONP({ success:false, msg:'Mật khẩu mới phải từ 6 ký tự!' });
         }
         try {
-          const { data: otpData, error: otpErr } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','forgot').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
-          if (otpErr || !otpData) {
+          const { data: otpData } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','forgot').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
+          if (!otpData) {
             return sendJSONP({ success:false, msg:'Không tìm thấy mã OTP. Vui lòng gửi lại OTP!' });
           }
           if (new Date(otpData.expires_at) < new Date()) {
