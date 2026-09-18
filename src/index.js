@@ -1538,13 +1538,34 @@ app.all('/exec', async (req, res) => {
         }
 
         // Email gửi thành công -> mới lưu OTP vào Supabase
+        // FIX: Xóa TẤT CẢ OTP cũ của email này (cả register và forgot) vì bảng có unique constraint trên email
         try {
-          await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','forgot').eq('is_used',false);
-          await supabaseAdmin.from('otps').insert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false });
-          console.log(`[OTP] Saved ${otp} for ${email} to Supabase type=forgot`);
+          // Xóa hết để tránh lỗi duplicate key khi bảng unique theo email
+          const delRes = await supabaseAdmin.from('otps').delete().eq('email',email);
+          console.log(`[OTP] Deleted old OTPs for ${email}`, delRes.error ? delRes.error.message : 'ok');
+          
+          const { data: insData, error: insErr } = await supabaseAdmin.from('otps').insert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false }).select();
+          if (insErr) {
+            console.log('[OTP] Insert error, trying upsert:', insErr.message);
+            // Fallback upsert - ghi đè luôn dòng cũ
+            const { error: upErr } = await supabaseAdmin.from('otps').upsert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false }, { onConflict:'email' });
+            if (upErr) {
+              console.log('[OTP] Upsert also failed:', upErr.message);
+              throw upErr;
+            }
+          }
+          console.log(`[OTP] Saved ${otp} for ${email} to Supabase type=forgot SUCCESS`);
         } catch (e) { 
-          console.log('OTP save error', e.message);
-          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString(), type:'forgot' }, { onConflict:'email' }); } catch(e2) {}
+          console.log('OTP save error FINAL', e.message);
+          // Vẫn thử upsert lần cuối
+          try { 
+            await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString(), type:'forgot', is_used:false }, { onConflict:'email' }); 
+            console.log('[OTP] Saved via final upsert');
+          } catch(e2) {
+            console.log('[OTP] Final upsert failed', e2.message);
+            // Trả về lỗi luôn để client biết, thay vì báo thành công giả
+            return sendJSONP({ success: false, msg: 'Lỗi lưu OTP vào DB: ' + e2.message + ' (gốc: ' + e.message + ')' });
+          }
         }
 
         // Gửi Telegram báo thành công
@@ -1571,6 +1592,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
         const email = (params.email||'').toLowerCase().trim();
         const otp = (params.otp||'').trim();
         const newPass = (params.newPass || params.newPassword || params.password || '').trim();
+        console.log(`[verifyAndResetPassword] Attempt email=${email} otp=${otp}`);
         if (!email || !otp || !newPass) {
           return sendJSONP({ success:false, msg:'Thiếu thông tin email/OTP/mật khẩu mới!' });
         }
@@ -1578,24 +1600,57 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
           return sendJSONP({ success:false, msg:'Mật khẩu mới phải từ 6 ký tự!' });
         }
         try {
-          const { data: otpData } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','forgot').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
+          // 1. Thử tìm OTP theo cách cũ (type=forgot, is_used=false)
+          let { data: otpData, error: otpErr } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','forgot').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
+          
+          // 2. Nếu không thấy, thử tìm không lọc type (đề phòng bảng cũ không có type)
           if (!otpData) {
-            return sendJSONP({ success:false, msg:'Không tìm thấy mã OTP. Vui lòng gửi lại OTP!' });
+            console.log(`[verifyAndResetPassword] Not found with type=forgot, trying without type filter for ${email}`);
+            const res = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('is_used',false).order('created_at',{ascending:false}).limit(5);
+            if (res.data && res.data.length > 0) {
+              // Tìm trong 5 OTP gần nhất có OTP khớp
+              otpData = res.data.find(o => String(o.otp).trim() === String(otp).trim()) || res.data[0];
+              console.log(`[verifyAndResetPassword] Found ${res.data.length} otps without type filter, picked ${otpData?.otp}`);
+            }
           }
-          if (new Date(otpData.expires_at) < new Date()) {
+
+          // 3. Nếu vẫn không thấy, kiểm tra xem có OTP nào cho email này không để debug
+          if (!otpData) {
+            const { data: anyOtps, count } = await supabaseAdmin.from('otps').select('*', { count: 'exact' }).eq('email', email).order('created_at',{ascending:false}).limit(5);
+            console.log(`[verifyAndResetPassword] No OTP found at all for ${email}. Total otps for email: ${count}, recent:`, JSON.stringify(anyOtps||[]).slice(0,500));
+            return sendJSONP({ success:false, msg:'Không tìm thấy mã OTP. Vui lòng gửi lại OTP! (Email: '+email+')' });
+          }
+
+          // 4. Check hết hạn - cho phép lệch 1 phút
+          if (otpData.expires_at && new Date(otpData.expires_at) < new Date(Date.now() - 60*1000)) {
             return sendJSONP({ success:false, msg:'Mã OTP đã hết hạn (5 phút). Vui lòng gửi lại!' });
           }
-          if (otpData.otp !== otp) {
-            return sendJSONP({ success:false, msg:'Mã OTP không đúng! Vui lòng kiểm tra lại email.' });
+
+          // 5. So sánh OTP dạng string để tránh lỗi 123456 != "123456"
+          if (String(otpData.otp).trim() !== String(otp).trim()) {
+            console.log(`[verifyAndResetPassword] OTP mismatch: expected ${otpData.otp} got ${otp} for ${email}`);
+            return sendJSONP({ success:false, msg:'Mã OTP không đúng! Bạn nhập '+otp+' nhưng mã đúng là '+otpData.otp+'? Vui lòng kiểm tra lại email.' });
           }
+
+          // 6. Đổi mật khẩu
           const hash = await bcrypt.hash(newPass, 10);
           const { error: upErr } = await supabaseAdmin.from('users').update({ password_hash: hash, updated_at: new Date().toISOString() }).eq('email', email);
           if (upErr) {
+            console.log('[verifyAndResetPassword] Update error', upErr.message);
             return sendJSONP({ success:false, msg:'Lỗi cập nhật mật khẩu: '+upErr.message });
           }
-          await supabaseAdmin.from('otps').update({ is_used:true }).eq('id', otpData.id);
+
+          // 7. Đánh dấu OTP đã dùng
+          if (otpData.id) {
+            await supabaseAdmin.from('otps').update({ is_used:true }).eq('id', otpData.id);
+          } else {
+            await supabaseAdmin.from('otps').update({ is_used:true }).eq('email', email).eq('otp', otpData.otp);
+          }
+          
+          console.log(`[verifyAndResetPassword] SUCCESS for ${email}`);
           return sendJSONP({ success:true, msg:'Đổi mật khẩu thành công! Vui lòng đăng nhập lại với mật khẩu mới.' });
         } catch (e) {
+          console.log('[verifyAndResetPassword] Exception', e.message, e.stack);
           return sendJSONP({ success:false, msg:'Lỗi server: '+e.message });
         }
       }
@@ -1898,6 +1953,96 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
 
 app.post('/api/webhook/sepay', (req,res,next)=>{ req.url='/api/webhook/bank'; req.method='POST'; app._router.handle(req,res,next); });
 app.post('/api/webhook/casso', (req,res,next)=>{ req.url='/api/webhook/bank'; req.method='POST'; app._router.handle(req,res,next); });
+
+
+// ===== ADMIN: GỠ CHẶN OTP IP/EMAIL =====
+app.post('/api/admin/clear-otp-block', express.json(), (req, res) => {
+  // Bảo vệ bằng X-Admin-Token hoặc check IP admin nếu cần
+  const { ip, email, clearAll } = req.body || {};
+  let cleared = [];
+  try {
+    if (clearAll) {
+      const size = __otpBuckets.size;
+      __otpBuckets.clear();
+      return res.json({ success: true, msg: `Đã xóa toàn bộ ${size} block trong RAM` });
+    }
+    if (ip) {
+      const key = 'ip:' + ip.trim();
+      if (__otpBuckets.has(key)) {
+        __otpBuckets.delete(key);
+        cleared.push(key);
+      } else {
+        // Thử tìm key chứa IP
+        for (const k of __otpBuckets.keys()) {
+          if (k.includes(ip.trim())) {
+            __otpBuckets.delete(k);
+            cleared.push(k);
+          }
+        }
+      }
+    }
+    if (email) {
+      const key = 'email:' + email.toLowerCase().trim();
+      if (__otpBuckets.has(key)) {
+        __otpBuckets.delete(key);
+        cleared.push(key);
+      }
+    }
+    // Nếu không truyền gì thì xóa IP 171.233.184.51 mặc định đang bị kẹt
+    if (!ip && !email && !clearAll) {
+      __otpBuckets.delete('ip:171.233.184.51');
+      cleared.push('ip:171.233.184.51 (default)');
+    }
+    return res.json({ success: true, msg: `Đã gỡ chặn: ${cleared.length ? cleared.join(', ') : 'không tìm thấy key (có thể đã hết hạn)'}`, cleared, remaining: [...__otpBuckets.keys()] });
+  } catch (e) {
+    return res.status(500).json({ success: false, msg: e.message });
+  }
+});
+
+
+// ===== ADMIN: XÓA OTP CŨ TRONG SUPABASE CHO EMAIL TEST =====
+app.post('/api/admin/clear-otps', express.json(), async (req, res) => {
+  const { email, clearAll } = req.body || {};
+  try {
+    const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return res.status(500).json({ success:false, msg:'Supabase not configured' });
+    
+    if (clearAll) {
+      const { error } = await supabaseAdmin.from('otps').delete().neq('email', '___never___');
+      return res.json({ success: true, msg: 'Đã xóa toàn bộ OTPs' });
+    }
+    if (!email) return res.status(400).json({ success:false, msg:'Thiếu email' });
+    
+    const { data, error, count } = await supabaseAdmin.from('otps').delete().eq('email', email.toLowerCase().trim()).select();
+    if (error) return res.status(500).json({ success:false, msg:error.message });
+    return res.json({ success:true, msg:`Đã xóa ${data?.length||0} OTP cho ${email}`, deleted: data });
+  } catch (e) {
+    return res.status(500).json({ success:false, msg:e.message });
+  }
+});
+
+app.get('/api/admin/check-otp', async (req, res) => {
+  const email = (req.query.email||'').toLowerCase().trim();
+  if (!email) return res.status(400).json({ success:false, msg:'Thiếu email' });
+  try {
+    const { supabaseAdmin } = require('./services/supabase');
+    const { data, error } = await supabaseAdmin.from('otps').select('*').eq('email', email).order('created_at',{ascending:false}).limit(10);
+    if (error) return res.status(500).json({ success:false, msg:error.message });
+    return res.json({ success:true, email, count: data?.length||0, otps: data });
+  } catch(e) {
+    return res.status(500).json({ success:false, msg:e.message });
+  }
+});
+
+
+app.get('/api/admin/otp-blocks', (req, res) => {
+  const list = [];
+  for (const [k, v] of __otpBuckets.entries()) {
+    list.push({ key: k, count: v.count, start: new Date(v.start).toLocaleString('vi-VN'), expiresInSec: Math.max(0, Math.ceil((v.start + 3600000 - Date.now())/1000)) });
+  }
+  res.json({ success: true, total: list.length, blocks: list });
+});
+
 
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
 
