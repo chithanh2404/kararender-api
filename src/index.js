@@ -1541,6 +1541,48 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
         
         return;
       }
+
+      case 'verifyAndResetPassword':
+      case 'resetPassword':
+      case 'forgotReset': {
+        const email = (params.email||'').toLowerCase().trim();
+        const otp = (params.otp||'').trim();
+        const newPass = (params.newPass || params.newPassword || params.password || '').trim();
+        if (!email || !otp || !newPass) {
+          return sendJSONP({ success:false, msg:'Thiếu thông tin email/OTP/mật khẩu mới!' });
+        }
+        if (newPass.length < 6) {
+          return sendJSONP({ success:false, msg:'Mật khẩu mới phải từ 6 ký tự!' });
+        }
+        try {
+          // Lấy OTP mới nhất chưa dùng loại forgot
+          const { data: otpData, error: otpErr } = await supabaseAdmin.from('otps').select('*').eq('email',email).eq('type','forgot').eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle();
+          if (otpErr || !otpData) {
+            return sendJSONP({ success:false, msg:'Không tìm thấy mã OTP. Vui lòng gửi lại OTP!' });
+          }
+          if (new Date(otpData.expires_at) < new Date()) {
+            return sendJSONP({ success:false, msg:'Mã OTP đã hết hạn (5 phút). Vui lòng gửi lại!' });
+          }
+          if (otpData.otp !== otp) {
+            return sendJSONP({ success:false, msg:'Mã OTP không đúng! Vui lòng kiểm tra lại email.' });
+          }
+          // Hash mật khẩu mới
+          const hash = await bcrypt.hash(newPass, 10);
+          const { error: upErr } = await supabaseAdmin.from('users').update({ password_hash: hash, updated_at: new Date().toISOString() }).eq('email', email);
+          if (upErr) {
+            console.log('[verifyAndResetPassword] Update error', upErr.message);
+            return sendJSONP({ success:false, msg:'Lỗi cập nhật mật khẩu: '+upErr.message });
+          }
+          // Đánh dấu OTP đã dùng
+          await supabaseAdmin.from('otps').update({ is_used:true }).eq('id', otpData.id);
+          console.log(`[verifyAndResetPassword] OK ${email} - password reset`);
+          return sendJSONP({ success:true, msg:'Đổi mật khẩu thành công! Vui lòng đăng nhập lại với mật khẩu mới.' });
+        } catch (e) {
+          console.log('[verifyAndResetPassword] Exception', e.message);
+          return sendJSONP({ success:false, msg:'Lỗi server: '+e.message });
+        }
+      }
+
       case 'verifyOTP': {
         const email=(params.email||'').toLowerCase().trim();
         const otp=(params.otp||'').trim();
