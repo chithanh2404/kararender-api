@@ -8,6 +8,8 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const config = require('./config');
 const vocalRouter = require('./routes/vocal');
+const downloadRoute = require('./routes/download');
+app.use('/api/download', downloadRoute);
 
 
 // ===== ANTI-SPAM RATE LIMIT TỰ CHỨA - KHÔNG CẦN FILE NGOÀI =====
