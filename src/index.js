@@ -9,7 +9,7 @@ const crypto = require('crypto');
 const config = require('./config');
 const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
-app.use('/api/download', downloadRoute);
+
 
 
 // ===== ANTI-SPAM RATE LIMIT TỰ CHỨA - KHÔNG CẦN FILE NGOÀI =====
@@ -80,6 +80,7 @@ app.use((req, res, next) => {
 
 app.use('/api', upgradeRoutes);
 app.use('/api/render', fastVideobgRouter);
+app.use('/api/download', downloadRoute);
 
 // Thêm health check ngay sau mount để test nhanh
 app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip','me'], time: new Date().toISOString() }));
