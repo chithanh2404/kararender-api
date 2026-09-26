@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const config = require('./config');
 const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
+import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
 
 
 
@@ -81,7 +82,7 @@ app.use((req, res, next) => {
 app.use('/api', upgradeRoutes);
 app.use('/api/render', fastVideobgRouter);
 app.use('/api/download', downloadRoute);
-import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
+
 app.use('/api/theme', themeLicenseRoutes);
 
 // Thêm health check ngay sau mount để test nhanh
