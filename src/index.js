@@ -1,6 +1,11 @@
-// SỬA ĐOẠN ĐẦU FILE src/index.js - THAY TOÀN BỘ 15 DÒNG ĐẦU NÀY
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 
-require('dotenv').config();
+// Load dotenv via import for ESM
+import dotenv from 'dotenv';
+dotenv.config();
+
+// Now we can still use require for CommonJS deps
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -9,35 +14,10 @@ const crypto = require('crypto');
 const config = require('./config');
 const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
-import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
-
-
-
-// ===== ANTI-SPAM RATE LIMIT TỰ CHỨA - KHÔNG CẦN FILE NGOÀI =====
-const __otpBuckets = new Map();
-function __checkRateLimit(key, max, windowMs) {
-  const now = Date.now();
-  let entry = __otpBuckets.get(key);
-  if (!entry || now - entry.start > windowMs) {
-    __otpBuckets.set(key, { count: 1, start: now });
-    return { blocked: false };
-  }
-  if (entry.count >= max) {
-    const retry = Math.ceil((entry.start + windowMs - now)/1000);
-    return { blocked: true, retry };
-  }
-  entry.count++;
-  return { blocked: false };
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [k,v] of __otpBuckets) if (now - v.start > 3600000) __otpBuckets.delete(k);
-}, 60000);
-
 const upgradeRoutes = require('./routes/upgrade');
-
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 
+// ESM route - theme license (ESM file)
 
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
   config.ALLOWED_HOSTS = ['kararender.com', 'www.kararender.com', 'localhost', '127.0.0.1'];
