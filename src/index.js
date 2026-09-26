@@ -16,6 +16,7 @@ const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
 const upgradeRoutes = require('./routes/upgrade');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
+import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
 
 // ESM route - theme license (ESM file)
 
