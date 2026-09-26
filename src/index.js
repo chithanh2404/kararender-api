@@ -81,6 +81,8 @@ app.use((req, res, next) => {
 app.use('/api', upgradeRoutes);
 app.use('/api/render', fastVideobgRouter);
 app.use('/api/download', downloadRoute);
+import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
+app.use('/api/theme', themeLicenseRoutes);
 
 // Thêm health check ngay sau mount để test nhanh
 app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip','me'], time: new Date().toISOString() }));
