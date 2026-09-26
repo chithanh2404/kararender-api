@@ -13,7 +13,6 @@ const ALLOWED_DOMAINS = [
 // Các URL gốc - sẽ được mã hóa ở server, chỉ trả về khi domain hợp lệ
 const SECRET_URLS = {
   supabase: 'https://mbmnshwdaxltwfqiwdyx.supabase.co/storage/v1/object/public/kararender-app/script.js',
-  drive_windows: 'https://drive.google.com/file/d/1fEA6848nM38L85o1o90Af9CpKVEaI8Kk/view?usp=sharing',
   api_base: 'https://kararender-api.onrender.com/api'
 };
 
