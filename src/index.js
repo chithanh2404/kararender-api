@@ -22,7 +22,7 @@ import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
 
 if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
   config.ALLOWED_HOSTS = ['kararender.com', 'www.kararender.com', 'localhost', '127.0.0.1'];
-  config.ALLOWED_HOSTS_STRICT = ['https://kararender.com', 'https://www.kararender.com'];
+  config.ALLOWED_HOSTS_STRICT = ['https://kararender.com', 'https://www.kararender.com', '127.0.0.1'];
 }
 
 const app = express();
