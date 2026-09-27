@@ -701,7 +701,7 @@ input{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 
       <pre id="logFonts" style="display:none;margin-top:8px;background:#020617;padding:8px;border-radius:6px;max-height:250px;overflow:auto;font-size:10px"></pre>
     </div>
     <div class="card" style="border-color:#f59e0b;background:rgba(245,158,11,0.08)">
-      <h3 style="color:#fbbf24">💬 Feedback + VIP + Users (Fix không gửi được)</h3>
+      <h3 style="color:#fbbf24">💬 Feedback + VIP + Users</h3>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn btn-amber" onclick="importDrive('users')">Import Users</button>
         <button class="btn" style="background:#f59e0b" onclick="testFeedback()">Test Feedback</button>
@@ -739,7 +739,7 @@ async function api(path, method='GET', body=null){
 }
 async function checkDebug(){
   const box=document.getElementById('debugBox'); box.style.display='block'; box.innerHTML='Checking...';
-  try{ const data=await api('/api/admin/debug'); box.innerHTML='<pre style="white-space:pre-wrap;font-size:11px">'+JSON.stringify(data,null,2)+'</pre>'; 
+  try{ const data=await api('/api/admin/debug'); box.innerHTML='<pre style="white-space:pre-wrap;font-size:11px;overflow: auto">'+JSON.stringify(data,null,2)+'</pre>'; 
     document.getElementById('statSecure').textContent = data.secureModule ? (data.secureModule.exists ? '✅ RAM '+data.secureModule.length : '❌') : '-';
     document.getElementById('statLangs').textContent = data.supabase ? data.supabase.langCount+' langs' : '-';
   }catch(e){ box.innerHTML='Lỗi: '+e.message; }
