@@ -81,10 +81,24 @@ app.get('/api/me', async (req, res) => {
     try { supabaseAdmin = require('./services/supabase').supabaseAdmin; } catch(e) { supabaseAdmin = null; }
     if (!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
     
-    const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).single();
+    const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
     if (error || !user) {
       console.log('[GET /api/me] user not found', email, error?.message);
-      return res.status(404).json({ success:false, message:'User not found: ' + email });
+      return res.status(404).json({ success:false, message:'User not found: ' + email, code: 'USER_DELETED' });
+    }
+    // ===== CHECK BAN / LOCK =====
+    if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
+      console.log('[GET /api/me] user banned/locked', email);
+      return res.status(403).json({ success:false, message:'Tài khoản đã bị khóa', code: 'USER_BANNED' });
+    }
+    if (user.status && ['banned','locked','deleted','disabled','blocked'].includes(String(user.status).toLowerCase())) {
+      return res.status(403).json({ success:false, message:'Tài khoản đã bị ' + user.status, code: 'USER_BANNED' });
+    }
+    if (user.deleted_at) {
+      return res.status(404).json({ success:false, message:'Tài khoản đã bị xóa', code: 'USER_DELETED' });
+    }
+    if (user.banned_until && new Date(user.banned_until) > new Date()) {
+      return res.status(403).json({ success:false, message:'Tài khoản bị khóa đến ' + user.banned_until, code: 'USER_BANNED' });
     }
     
     // Dùng role thật từ DB, không tự đổi is_vip -> ADMIN như bug cũ
@@ -1186,13 +1200,64 @@ app.all('/exec', async (req, res) => {
       }
       case 'verify': {
         const payload = decodeOldToken(params.token||'');
-        if (!payload) return sendJSONP({ success: false, message: 'Token không hợp lệ' });
-        return sendJSONP({ success: true, valid: true, token: params.token, user: { email: payload.email, fullName: payload.fullName||payload.full_name, role: payload.role||'USER', isVip: payload.isVip||payload.is_vip } });
+        if (!payload || !payload.email) return sendJSONP({ success: false, message: 'Token không hợp lệ', code: 'INVALID_TOKEN' });
+        try {
+          const email = (payload.email||'').toLowerCase().trim();
+          const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
+          if (error || !user) {
+            console.log('[verify] user not found - deleted on Supabase', email);
+            return sendJSONP({ success: false, message: 'Tài khoản không tồn tại hoặc đã bị xóa', code: 'USER_DELETED' });
+          }
+          // ===== CHECK LOCK / BAN =====
+          if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
+            console.log('[verify] user banned/locked', email);
+            return sendJSONP({ success: false, message: 'Tài khoản đã bị khóa', code: 'USER_BANNED' });
+          }
+          if (user.status && ['banned','locked','deleted','disabled','blocked'].includes(String(user.status).toLowerCase())) {
+            return sendJSONP({ success: false, message: 'Tài khoản đã bị ' + user.status, code: 'USER_BANNED' });
+          }
+          if (user.deleted_at) {
+            return sendJSONP({ success: false, message: 'Tài khoản đã bị xóa', code: 'USER_DELETED' });
+          }
+          // Nếu user bị ban đến thời gian nào đó
+          if (user.banned_until && new Date(user.banned_until) > new Date()) {
+            return sendJSONP({ success: false, message: 'Tài khoản bị khóa đến ' + user.banned_until, code: 'USER_BANNED' });
+          }
+          // Trả về thông tin tươi từ DB, không tin payload cũ
+          const freshUser = {
+            email: user.email,
+            fullName: user.full_name,
+            full_name: user.full_name,
+            role: user.role || (user.is_vip ? 'VIP' : 'USER'),
+            isVip: !!user.is_vip,
+            is_vip: !!user.is_vip,
+            expired_date: user.expired_date,
+            expiredDate: user.expired_date,
+            vip_status: user.vip_status
+          };
+          return sendJSONP({ success: true, valid: true, token: params.token, user: freshUser });
+        } catch(e) {
+          console.error('[verify] exception', e.message);
+          return sendJSONP({ success: false, message: 'Lỗi xác thực: ' + e.message, code: 'VERIFY_ERROR' });
+        }
       }
       case 'login': {
         const email=(params.email||'').toLowerCase().trim();
-        const { data: user } = await supabaseAdmin.from('users').select('*').eq('email',email).single();
+        const { data: user } = await supabaseAdmin.from('users').select('*').eq('email',email).maybeSingle();
         if(!user) return sendJSONP({ success:false, msg:'Email không tồn tại' });
+        // ===== CHECK XÓA / LOCK TRƯỚC KHI CHECK PASS =====
+        if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
+          return sendJSONP({ success:false, msg:'Tài khoản đã bị khóa, vui lòng liên hệ admin' });
+        }
+        if (user.status && ['banned','locked','deleted','disabled','blocked'].includes(String(user.status).toLowerCase())) {
+          return sendJSONP({ success:false, msg:'Tài khoản đã bị ' + user.status });
+        }
+        if (user.deleted_at) {
+          return sendJSONP({ success:false, msg:'Tài khoản đã bị xóa' });
+        }
+        if (user.banned_until && new Date(user.banned_until) > new Date()) {
+          return sendJSONP({ success:false, msg:'Tài khoản bị khóa đến ' + user.banned_until });
+        }
         const ok=await bcrypt.compare(params.password||'', user.password_hash);
         if(!ok) return sendJSONP({ success:false, msg:'Sai mật khẩu' });
         await supabaseAdmin.from('users').update({ last_login_at: new Date().toISOString() }).eq('id', user.id);
