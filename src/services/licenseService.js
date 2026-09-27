@@ -7,7 +7,8 @@ const ALLOWED_DOMAINS = [
   'kararender.com',
   'www.kararender.com',
   'chithanhmedia.blogspot.com',
-  'www.chithanhmedia.blogspot.com'
+  'www.chithanhmedia.blogspot.com',
+  '127.0.0.1'
 ];
 
 // Các URL gốc - sẽ được mã hóa ở server, chỉ trả về khi domain hợp lệ
