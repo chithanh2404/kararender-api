@@ -1450,7 +1450,10 @@ app.all('/exec', async (req, res) => {
         const createdAt = new Date().toISOString();
         try {
           // Xóa OTP cũ chưa dùng type register
-          await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','register').eq('is_used',false);
+          // FIX AUTO CLEAN: xóa sạch OTP cũ của email này (cả forgot & register) để tránh unique constraint
+          await supabaseAdmin.from('otps').delete().eq('email',email);
+          // dọn luôn OTP hết hạn toàn bảng (tự động)
+          await supabaseAdmin.from('otps').delete().lt('expires_at', new Date().toISOString()).catch(()=>{});
           // Lưu OTP mới với type=register
           await supabaseAdmin.from('otps').insert({ email, otp, type:'register', expires_at: expiresAt, created_at: createdAt, is_used:false });
           console.log(`[sendRegisterOTP] Saved ${otp} for ${email}`);
@@ -1458,7 +1461,7 @@ app.all('/exec', async (req, res) => {
           console.log('sendRegisterOTP save error', e.message);
           // fallback upsert cũ nếu bảng chưa có type
           try {
-            await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register' }, { onConflict:'email' });
+            await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register', is_used:false }, { onConflict:'email' });
           } catch(e2) {}
         }
         
@@ -1480,7 +1483,8 @@ app.all('/exec', async (req, res) => {
         
         return;
       }
-      case 'sendRegisterOTP': {
+      case 'sendRegisterOTP_dup': { // DUPLICATE REMOVED - merged into first case, keeping for safety
+ {
         const email=(params.email||'').toLowerCase().trim();
         const fullName=(params.fullName||'').trim();
         if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'❌ Email không hợp lệ' });
@@ -1492,12 +1496,15 @@ app.all('/exec', async (req, res) => {
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
         const createdAt = new Date().toISOString();
         try {
-          await supabaseAdmin.from('otps').delete().eq('email',email).eq('type','register').eq('is_used',false);
+          // FIX AUTO CLEAN: xóa sạch OTP cũ của email này (cả forgot & register) để tránh unique constraint
+          await supabaseAdmin.from('otps').delete().eq('email',email);
+          // dọn luôn OTP hết hạn toàn bảng (tự động)
+          await supabaseAdmin.from('otps').delete().lt('expires_at', new Date().toISOString()).catch(()=>{});
           await supabaseAdmin.from('otps').insert({ email, otp, type:'register', expires_at: expiresAt, created_at: createdAt, is_used:false });
           console.log(`[sendRegisterOTP] Saved ${otp} for ${email}`);
         } catch (e) { 
           console.log('sendRegisterOTP save error', e.message);
-          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register' }, { onConflict:'email' }); } catch(e2) {}
+          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register', is_used:false }, { onConflict:'email' }); } catch(e2) {}
         }
         const info = getClientInfoFull(req);
         const userInfo = getUserInfoFromRequest(req, params);
@@ -2086,6 +2093,20 @@ app.get('/api/admin/otp-blocks', (req, res) => {
   }
   res.json({ success: true, total: list.length, blocks: list });
 });
+
+
+
+// ===== AUTO CLEANUP OTP HẾT HẠN - chạy mỗi 10 phút =====
+async function autoCleanupExpiredOTPs(){
+  try{
+    const { supabaseAdmin: admin } = require('./services/supabase');
+    if(!admin) return;
+    const { error, count } = await admin.from('otps').delete().lt('expires_at', new Date().toISOString()).select();
+    if(!error && count) console.log(`[OTP Cleanup] Deleted ${count||''} expired OTPs`);
+  }catch(e){ console.log('[OTP Cleanup] error', e.message); }
+}
+setInterval(autoCleanupExpiredOTPs, 10*60*1000); // 10 phút
+autoCleanupExpiredOTPs(); // chạy ngay khi start
 
 
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
