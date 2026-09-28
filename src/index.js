@@ -1450,9 +1450,8 @@ app.all('/exec', async (req, res) => {
         const createdAt = new Date().toISOString();
         try {
           // Xóa OTP cũ chưa dùng type register
-          // FIX AUTO CLEAN: xóa sạch OTP cũ của email này (cả forgot & register) để tránh unique constraint
+          // FIX AUTO CLEAN: xóa sạch OTP cũ của email này (cả forgot & register)
           await supabaseAdmin.from('otps').delete().eq('email',email);
-          // dọn luôn OTP hết hạn toàn bảng (tự động)
           await supabaseAdmin.from('otps').delete().lt('expires_at', new Date().toISOString()).catch(()=>{});
           // Lưu OTP mới với type=register
           await supabaseAdmin.from('otps').insert({ email, otp, type:'register', expires_at: expiresAt, created_at: createdAt, is_used:false });
@@ -1483,40 +1482,7 @@ app.all('/exec', async (req, res) => {
         
         return;
       }
-      case 'sendRegisterOTP_dup': { // DUPLICATE REMOVED - merged into first case, keeping for safety
- {
-        const email=(params.email||'').toLowerCase().trim();
-        const fullName=(params.fullName||'').trim();
-        if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'❌ Email không hợp lệ' });
-        try {
-          const { data: ex } = await supabaseAdmin.from('users').select('id').eq('email',email).maybeSingle();
-          if(ex) return sendJSONP({ success:false, msg:'Email này đã được đăng ký! Vui lòng đăng nhập.' });
-        } catch(e) {}
-        const otp = Math.floor(100000+Math.random()*900000).toString();
-        const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
-        const createdAt = new Date().toISOString();
-        try {
-          // FIX AUTO CLEAN: xóa sạch OTP cũ của email này (cả forgot & register) để tránh unique constraint
-          await supabaseAdmin.from('otps').delete().eq('email',email);
-          // dọn luôn OTP hết hạn toàn bảng (tự động)
-          await supabaseAdmin.from('otps').delete().lt('expires_at', new Date().toISOString()).catch(()=>{});
-          await supabaseAdmin.from('otps').insert({ email, otp, type:'register', expires_at: expiresAt, created_at: createdAt, is_used:false });
-          console.log(`[sendRegisterOTP] Saved ${otp} for ${email}`);
-        } catch (e) { 
-          console.log('sendRegisterOTP save error', e.message);
-          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'register', is_used:false }, { onConflict:'email' }); } catch(e2) {}
-        }
-        const info = getClientInfoFull(req);
-        const userInfo = getUserInfoFromRequest(req, params);
-        sendJSONP({ success:true, msg:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
-        (async () => {
-          try {
-            const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip, 'register');
-            await sendTelegramNotification(`🆕 <b>OTP ĐĂNG KÝ</b>\n👤 <b>Tên:</b> ${fullName || userInfo.fullName} - ${email}\n📧 <b>Email:</b> ${email}\n🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script (Đăng ký)' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}\n🌐 <b>Domain:</b> ${info.domain}\n🔗 <b>Origin:</b> ${info.origin}\n📍 <b>IP:</b> ${info.ip}\n${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}\n🌐 <b>Browser:</b> ${info.browser}\n⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-          } catch (e) { console.log('Background sendRegisterOTP error', e.message); }
-        })();
-        return;
-      }
+            // DUPLICATE sendRegisterOTP removed - auto clean version kept above
       case 'sendOTP': {
         const email=(params.email||'').toLowerCase().trim();
         if (!email || !email.includes('@')) return sendJSONP({ success:false, msg:'❌ Email không hợp lệ' });
@@ -2101,13 +2067,12 @@ async function autoCleanupExpiredOTPs(){
   try{
     const { supabaseAdmin: admin } = require('./services/supabase');
     if(!admin) return;
-    const { error, count } = await admin.from('otps').delete().lt('expires_at', new Date().toISOString()).select();
-    if(!error && count) console.log(`[OTP Cleanup] Deleted ${count||''} expired OTPs`);
+    await admin.from('otps').delete().lt('expires_at', new Date().toISOString());
+    console.log('[OTP Cleanup] auto cleaned expired OTPs');
   }catch(e){ console.log('[OTP Cleanup] error', e.message); }
 }
-setInterval(autoCleanupExpiredOTPs, 10*60*1000); // 10 phút
-autoCleanupExpiredOTPs(); // chạy ngay khi start
-
+setInterval(autoCleanupExpiredOTPs, 10*60*1000);
+autoCleanupExpiredOTPs();
 
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
 
