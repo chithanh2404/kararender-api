@@ -37,10 +37,9 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginOpenerPolicy: false
 }));
-app.use('/api/security', securityRouter);
 
-// FIX CORS - PHẢI ĐẶT TRƯỚC /api/vocal để không bị Failed to fetch
-// Lỗi cũ: app.use('/api/vocal') đặt trước cors() nên preflight OPTIONS bị block
+// FIX CORS - PHẢI ĐẶT TRƯỚC TẤT CẢ /api/* để không bị Failed to fetch
+// Lỗi: nếu mount router trước cors() thì preflight OPTIONS bị block -> CORS error
 const corsOptions = {
   origin: (o, cb) => cb(null, true),
   credentials: true,
@@ -49,6 +48,9 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+// Sau khi cors mới mount các router - QUAN TRỌNG: security phải sau cors
+app.use('/api/security', securityRouter);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
