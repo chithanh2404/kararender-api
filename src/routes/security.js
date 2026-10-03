@@ -91,11 +91,18 @@ router.post('/log', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, X-User-Email, Authorization');
   try {
-    const { event, email, url, domain, fullUrl, origin, userAgent, details, screen, windowSize } = req.body || {};
+    if(!req.body || Object.keys(req.body).length===0){
+      console.warn('[Security] Empty body - check if express.json() is before router. Headers:', req.headers['content-type'], 'Query:', req.query);
+    }
+    const { event, email, fullName, full_name, url, domain, fullUrl, origin, userAgent, details, screen, windowSize } = req.body || {};
     const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
     const headerEmail = (req.headers['x-user-email']||'').toLowerCase().trim();
     const finalEmail = (email||headerEmail||'Chưa đăng nhập').toString().slice(0,200);
-    const eventType = (event||'Unknown').toString().slice(0,100);
+    const finalFullName = (fullName || full_name || 'Khách').toString().slice(0,200);
+    let eventType = (event || details || req.query?.event || 'Unknown').toString().slice(0,100);
+    if(eventType === 'Unknown' && details && details.length>2){
+      eventType = details.slice(0,100);
+    }
     const emailLower = finalEmail.toLowerCase().trim();
 
     // Whitelist DevTools + ADMIN từ backend
@@ -120,13 +127,14 @@ router.post('/log', async (req, res) => {
     const message = `${alertIcon} <b>${isPunishEvent ? 'PUNISHMENT - RELOAD LIÊN TỤC' : 'CẢNH BÁO BẢO MẬT'}</b>
 ⚠️ <b>Sự kiện:</b> ${eventType}${punishNote}
 📧 <b>Email:</b> ${finalEmail}
+👤 <b>Tên:</b> ${finalFullName}
 🌐 <b>Domain:</b> ${domain||fullInfo.domain||'unknown'}
 🔗 <b>Origin:</b> ${origin||fullInfo.origin||'unknown'}
 📄 <b>URL:</b> ${(fullUrl||url||fullInfo.fullUrl||'').slice(0,500)}
 📍 <b>IP:</b> ${fullInfo.ip||clientIp}
 ${fullInfo.deviceIcon} <b>Thiết bị:</b> ${fullInfo.device} - ${fullInfo.os} - ${fullInfo.browser}
 🖥️ <b>UA:</b> ${(userAgent||fullInfo.browserFull||'').slice(0,400)}
-📏 <b>Screen:</b> ${screen||'unknown'} | Window: ${windowSize||'unknown'}
+📏 <b>Màn hình:</b> ${screen||'unknown'} | Window: ${windowSize||'unknown'}
 📝 <b>Chi tiết:</b> ${(details||'').slice(0,500)}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}${isPunishEvent ? '\n🛡️ <b>Bảo vệ:</b> Anti-DevTools + Continuous Reload active' : ''}`;
 
