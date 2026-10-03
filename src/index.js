@@ -17,7 +17,6 @@ const downloadRoute = require('./routes/download');
 const upgradeRoutes = require('./routes/upgrade');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
-const securityRouter = require('./routes/security');
 
 // ESM route - theme license (ESM file)
 
@@ -38,8 +37,8 @@ app.use(helmet({
   crossOriginOpenerPolicy: false
 }));
 
-// FIX CORS - PHẢI ĐẶT TRƯỚC TẤT CẢ /api/* để không bị Failed to fetch
-// Lỗi: nếu mount router trước cors() thì preflight OPTIONS bị block -> CORS error
+// FIX CORS - PHẢI ĐẶT TRƯỚC /api/vocal để không bị Failed to fetch
+// Lỗi cũ: app.use('/api/vocal') đặt trước cors() nên preflight OPTIONS bị block
 const corsOptions = {
   origin: (o, cb) => cb(null, true),
   credentials: true,
@@ -48,9 +47,6 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-
-// Sau khi cors mới mount các router - QUAN TRỌNG: security phải sau cors
-app.use('/api/security', securityRouter);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -71,7 +67,127 @@ app.use('/api/download', downloadRoute);
 app.use('/api/theme', themeLicenseRoutes);
 
 // Thêm health check ngay sau mount để test nhanh
-app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip','me'], time: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip','me','security/log'], time: new Date().toISOString() }));
+
+// ===== SECURITY LOG - F12, Ctrl+U, DevTools Detection + Telegram =====
+// Admin check 100% từ backend, DevTools whitelist riêng
+const DEVTOOLS_EXCEPTION = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com'].map(e=>e.toLowerCase());
+
+async function isAdminFromDB(email){
+  try{
+    if(!email || !email.includes('@')) return false;
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return false;
+    const { data: user } = await supabaseAdmin.from('users').select('role, is_admin, email').eq('email', email.toLowerCase().trim()).maybeSingle();
+    if(!user) return false;
+    const role = (user.role||'').toString().toUpperCase();
+    if(role === 'ADMIN') return true;
+    if(user.is_admin === true) return true;
+    return false;
+  }catch(e){ return false; }
+}
+
+app.options('/api/security/log', cors(corsOptions));
+app.post('/api/security/log', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-User-Email, Authorization');
+  try {
+    // FIX: Kiểm tra body rỗng do thiếu express.json()
+    if(!req.body || Object.keys(req.body).length===0){
+      console.warn('[Security] Empty body received! Check if express.json() is before security route. Query:', req.query, 'Headers CT:', req.headers['content-type']);
+    }
+    const { event, email, fullName, full_name, url, domain, fullUrl, origin, userAgent, details, role, is_admin, isAdmin, screen, windowSize, timestamp } = req.body || {};
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.ip || 'unknown';
+    const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
+    const finalEmail = (email || headerEmail || 'Chưa đăng nhập').toString().slice(0,200);
+    const finalFullName = (fullName || full_name || req.body?.fullName || 'Khách').toString().slice(0,200);
+    let eventType = (event || details || req.query?.event || 'Unknown').toString().slice(0,100);
+    // Nếu event vẫn Unknown nhưng details có giá trị thì dùng details làm event
+    if(eventType === 'Unknown' && details && details.length>2){
+      eventType = details.slice(0,100);
+    }
+    const emailLower = finalEmail.toLowerCase().trim();
+
+    // 1. Kiểm tra DevTools exception list (được phép mở DevTools nhưng không phải admin)
+    // 2. Kiểm tra ADMIN thật sự từ backend (role ADMIN trong DB)
+    let isWhite = false;
+    let reason = '';
+    if(DEVTOOLS_EXCEPTION.includes(emailLower)){
+      isWhite = true;
+      reason = 'DEVTOOLS_EXCEPTION';
+    } else {
+      // Check admin 100% từ DB
+      isWhite = await isAdminFromDB(finalEmail);
+      if(isWhite) reason = 'ADMIN_BACKEND';
+    }
+
+    if (isWhite) {
+      console.log(`[Security] Whitelisted (${reason}) ${finalEmail} triggered ${eventType} - skip telegram`);
+      return res.json({ success: true, whitelisted: true, message: `Whitelisted ${reason} - skip telegram`, reason });
+    }
+
+    // Lấy info đầy đủ
+    let fullInfo;
+    try { fullInfo = getClientInfoFull(req); } catch { fullInfo = { ip: clientIp, device: 'Unknown', os: 'Unknown', browser: 'Unknown', browserFull: userAgent || '' }; }
+
+    const finalDomain = domain || fullInfo.domain || req.headers.origin || 'unknown';
+    const finalOrigin = origin || fullInfo.origin || req.headers.origin || 'unknown';
+    const finalFullUrl = fullUrl || url || fullInfo.fullUrl || req.headers.referer || 'unknown';
+
+    const isPunishEvent = eventType.includes('PUNISH') || eventType.includes('RELOAD');
+    const alertIcon = isPunishEvent ? '💥🔥' : '🚨';
+    const punishNote = isPunishEvent ? '\n🔄 <b>TRẠNG THÁI:</b> Đang reload liên tục chống xem source\n⛔ <b>Hành động:</b> Trang tự động làm mới mỗi 300-400ms' : '';
+    const message = `${alertIcon} <b>${isPunishEvent ? 'PUNISHMENT - RELOAD LIÊN TỤC' : 'CẢNH BÁO BẢO MẬT'} - KaraRender</b>
+⚠️ <b>Sự kiện:</b> ${eventType}${punishNote}
+📧 <b>Email:</b> ${finalEmail}
+👤 <b>Tên:</b> ${finalFullName || (req.body?.fullName || 'Khách')}
+
+🌐 <b>Domain:</b> ${finalDomain}
+🔗 <b>Origin:</b> ${finalOrigin}
+📄 <b>Full URL:</b> ${finalFullUrl.slice(0,500)}
+📍 <b>IP:</b> ${fullInfo.ip || clientIp}
+${fullInfo.deviceIcon || '💻'} <b>Thiết bị:</b> ${fullInfo.device || 'Unknown'} - ${fullInfo.os || ''} - ${fullInfo.browser || ''}
+🖥️ <b>UserAgent:</b> ${(userAgent || fullInfo.browserFull || '').slice(0,400)}
+📏 <b>Màn hình:</b> ${screen || 'unknown'} | Window: ${windowSize || 'unknown'}
+📝 <b>Chi tiết:</b> ${(details || 'Không có').slice(0,500)}
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')} (${timestamp || new Date().toISOString()})
+🔒 <b>Role check:</b> Backend ADMIN only (không hardcode email)${isPunishEvent ? '\n🛡️ <b>Bảo vệ:</b> Anti-DevTools + Continuous Reload' : ''}`;
+
+    console.log(`[Security] ${eventType} - ${finalEmail} - IP ${fullInfo.ip} - ${finalDomain}`);
+
+    // Gửi telegram
+    try { await sendTelegramNotification(message); } catch(e){ console.warn('[Security] Telegram failed', e.message); }
+
+    // Có thể lưu vào Supabase nếu muốn
+    try {
+      const { supabaseAdmin } = require('./services/supabase');
+      if (supabaseAdmin) {
+        await supabaseAdmin.from('security_logs').insert({
+          event: eventType,
+          email: finalEmail,
+          domain: finalDomain,
+          origin: finalOrigin,
+          full_url: finalFullUrl.slice(0,1000),
+          ip: fullInfo.ip || clientIp,
+          user_agent: (userAgent || '').slice(0,1000),
+          details: (details || '').slice(0,1000),
+          device: fullInfo.device,
+          os: fullInfo.os,
+          browser: fullInfo.browser,
+          created_at: new Date().toISOString()
+        }).then(()=>{}).catch(()=>{});
+      }
+    } catch(e){ /* bảng chưa có thì thôi */ }
+
+    return res.json({ success: true, message: 'Logged' });
+  } catch(e){
+    console.error('[Security Log] error', e.message);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+});
+
+// Thêm JSONP handler cho /exec?action=securityLog
+
 
 // ===== FIX: THÊM /api/me ĐỂ CLIENT TỰ REFRESH TOKEN KHÔNG CẦN LOGOUT =====
 app.get('/api/me', async (req, res) => {
@@ -1371,6 +1487,39 @@ app.all('/exec', async (req, res) => {
 🖥️ <b>Browser:</b> ${info.browser.slice(0,300)}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
         return sendJSONP({ status:'success', success:true, message: 'Cảm ơn bạn đã góp ý!' });
+      }
+      case 'securityLog': {
+        try {
+          let payload = {};
+          try { payload = JSON.parse(params.data || '{}'); } catch { payload = params; }
+          const email = (payload.email || params.email || '').toString().slice(0,200);
+          const eventType = (payload.event || params.event || 'Unknown').toString().slice(0,100);
+          const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+          let fullInfo;
+          try { fullInfo = getClientInfoFull(req); } catch { fullInfo = { ip: clientIp, device: 'Unknown', os: 'Unknown', browser: 'Unknown', browserFull: '' }; }
+          const DEVTOOLS_EXCEPTION_JSONP = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com'].map(e=>e.toLowerCase());
+          let isWhite = DEVTOOLS_EXCEPTION_JSONP.includes((email||'').toLowerCase().trim());
+          if(!isWhite) isWhite = await isAdminFromDB(email); // check ADMIN từ DB nếu không nằm trong exception
+          if (isWhite) {
+            console.log(`[Security JSONP] Whitelisted ${email} - ${eventType}`);
+            return sendJSONP({ success:true, whitelisted:true });
+          }
+          const message = `🚨 <b>CẢNH BÁO BẢO MẬT - JSONP</b>
+⚠️ <b>Sự kiện:</b> ${eventType}
+📧 <b>Email:</b> ${email}
+🌐 <b>Domain:</b> ${payload.domain || fullInfo.domain || 'unknown'}
+📄 <b>URL:</b> ${(payload.fullUrl || payload.url || fullInfo.fullUrl || '').slice(0,500)}
+📍 <b>IP:</b> ${fullInfo.ip || clientIp}
+${fullInfo.deviceIcon || ''} <b>Thiết bị:</b> ${fullInfo.device || ''} - ${fullInfo.os || ''} - ${fullInfo.browser || ''}
+🖥️ <b>UA:</b> ${(payload.userAgent || fullInfo.browserFull || '').slice(0,400)}
+📝 <b>Chi tiết:</b> ${(payload.details || '').slice(0,500)}
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`;
+          await sendTelegramNotification(message).catch(()=>{});
+          return sendJSONP({ success:true });
+        } catch(e){
+          console.error('[securityLog JSONP] error', e.message);
+          return sendJSONP({ success:false, error:e.message });
+        }
       }
             case 'requestVip':
       case 'requestUpgradeVip': {
