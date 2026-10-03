@@ -17,6 +17,7 @@ const downloadRoute = require('./routes/download');
 const upgradeRoutes = require('./routes/upgrade');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
+const securityRouter = require('./routes/security');
 
 // ESM route - theme license (ESM file)
 
@@ -36,6 +37,7 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginOpenerPolicy: false
 }));
+app.use('/api/security', securityRouter);
 
 // FIX CORS - PHẢI ĐẶT TRƯỚC /api/vocal để không bị Failed to fetch
 // Lỗi cũ: app.use('/api/vocal') đặt trước cors() nên preflight OPTIONS bị block
