@@ -70,60 +70,23 @@ app.use('/api/theme', themeLicenseRoutes);
 app.get('/api/health', (req, res) => res.json({ ok: true, routes: ['upgrade-plans','admin/upgrade-plans','admin/pending-vip','me','security/log'], time: new Date().toISOString() }));
 
 // ===== SECURITY LOG - F12, Ctrl+U, DevTools Detection + Telegram =====
-// Admin check 100% từ backend, DevTools whitelist riêng
-const DEVTOOLS_EXCEPTION = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com'].map(e=>e.toLowerCase());
+const SECURITY_WHITELIST = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com','admin@kararender.com'];
 
-async function isAdminFromDB(email){
-  try{
-    if(!email || !email.includes('@')) return false;
-    const { supabaseAdmin } = require('./services/supabase');
-    if(!supabaseAdmin) return false;
-    const { data: user } = await supabaseAdmin.from('users').select('role, is_admin, email').eq('email', email.toLowerCase().trim()).maybeSingle();
-    if(!user) return false;
-    const role = (user.role||'').toString().toUpperCase();
-    if(role === 'ADMIN') return true;
-    if(user.is_admin === true) return true;
-    return false;
-  }catch(e){ return false; }
-}
-
-app.options('/api/security/log', cors(corsOptions));
 app.post('/api/security/log', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-User-Email, Authorization');
   try {
-    // FIX: Kiểm tra body rỗng do thiếu express.json()
-    if(!req.body || Object.keys(req.body).length===0){
-      console.warn('[Security] Empty body received! Check if express.json() is before security route. Query:', req.query, 'Headers CT:', req.headers['content-type']);
-    }
-    const { event, email, fullName, full_name, url, domain, fullUrl, origin, userAgent, details, role, is_admin, isAdmin, screen, windowSize, timestamp } = req.body || {};
+    const { event, email, url, domain, fullUrl, origin, userAgent, details, isWhitelisted, screen, windowSize, timestamp } = req.body || {};
     const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.headers['x-real-ip'] || req.ip || 'unknown';
     const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
     const finalEmail = (email || headerEmail || 'Chưa đăng nhập').toString().slice(0,200);
-    const finalFullName = (fullName || full_name || req.body?.fullName || 'Khách').toString().slice(0,200);
-    let eventType = (event || details || req.query?.event || 'Unknown').toString().slice(0,100);
-    // Nếu event vẫn Unknown nhưng details có giá trị thì dùng details làm event
-    if(eventType === 'Unknown' && details && details.length>2){
-      eventType = details.slice(0,100);
-    }
-    const emailLower = finalEmail.toLowerCase().trim();
+    const eventType = (event || 'Unknown').toString().slice(0,100);
 
-    // 1. Kiểm tra DevTools exception list (được phép mở DevTools nhưng không phải admin)
-    // 2. Kiểm tra ADMIN thật sự từ backend (role ADMIN trong DB)
-    let isWhite = false;
-    let reason = '';
-    if(DEVTOOLS_EXCEPTION.includes(emailLower)){
-      isWhite = true;
-      reason = 'DEVTOOLS_EXCEPTION';
-    } else {
-      // Check admin 100% từ DB
-      isWhite = await isAdminFromDB(finalEmail);
-      if(isWhite) reason = 'ADMIN_BACKEND';
-    }
-
+    // Check whitelist - không gửi telegram nếu là admin/dev
+    const isWhite = SECURITY_WHITELIST.includes(finalEmail.toLowerCase()) || isWhitelisted === true;
     if (isWhite) {
-      console.log(`[Security] Whitelisted (${reason}) ${finalEmail} triggered ${eventType} - skip telegram`);
-      return res.json({ success: true, whitelisted: true, message: `Whitelisted ${reason} - skip telegram`, reason });
+      console.log(`[Security] Whitelisted ${finalEmail} triggered ${eventType} - skip telegram`);
+      return res.json({ success: true, whitelisted: true, message: 'Whitelisted - logged only console' });
     }
 
     // Lấy info đầy đủ
@@ -134,13 +97,10 @@ app.post('/api/security/log', async (req, res) => {
     const finalOrigin = origin || fullInfo.origin || req.headers.origin || 'unknown';
     const finalFullUrl = fullUrl || url || fullInfo.fullUrl || req.headers.referer || 'unknown';
 
-    const isPunishEvent = eventType.includes('PUNISH') || eventType.includes('RELOAD');
-    const alertIcon = isPunishEvent ? '💥🔥' : '🚨';
-    const punishNote = isPunishEvent ? '\n🔄 <b>TRẠNG THÁI:</b> Đang reload liên tục chống xem source\n⛔ <b>Hành động:</b> Trang tự động làm mới mỗi 300-400ms' : '';
-    const message = `${alertIcon} <b>${isPunishEvent ? 'PUNISHMENT - RELOAD LIÊN TỤC' : 'CẢNH BÁO BẢO MẬT'} - KaraRender</b>
-⚠️ <b>Sự kiện:</b> ${eventType}${punishNote}
+    const message = `🚨 <b>CẢNH BÁO BẢO MẬT - KaraRender</b>
+⚠️ <b>Sự kiện:</b> ${eventType}
 📧 <b>Email:</b> ${finalEmail}
-👤 <b>Tên:</b> ${finalFullName || (req.body?.fullName || 'Khách')}
+👤 <b>Tên:</b> ${(req.body?.fullName || 'Khách')}
 
 🌐 <b>Domain:</b> ${finalDomain}
 🔗 <b>Origin:</b> ${finalOrigin}
@@ -151,7 +111,7 @@ ${fullInfo.deviceIcon || '💻'} <b>Thiết bị:</b> ${fullInfo.device || 'Unkn
 📏 <b>Màn hình:</b> ${screen || 'unknown'} | Window: ${windowSize || 'unknown'}
 📝 <b>Chi tiết:</b> ${(details || 'Không có').slice(0,500)}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')} (${timestamp || new Date().toISOString()})
-🔒 <b>Role check:</b> Backend ADMIN only (không hardcode email)${isPunishEvent ? '\n🛡️ <b>Bảo vệ:</b> Anti-DevTools + Continuous Reload' : ''}`;
+🔒 <b>Whitelist:</b> ${SECURITY_WHITELIST.join(', ')}`;
 
     console.log(`[Security] ${eventType} - ${finalEmail} - IP ${fullInfo.ip} - ${finalDomain}`);
 
@@ -1497,9 +1457,7 @@ app.all('/exec', async (req, res) => {
           const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
           let fullInfo;
           try { fullInfo = getClientInfoFull(req); } catch { fullInfo = { ip: clientIp, device: 'Unknown', os: 'Unknown', browser: 'Unknown', browserFull: '' }; }
-          const DEVTOOLS_EXCEPTION_JSONP = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com'].map(e=>e.toLowerCase());
-          let isWhite = DEVTOOLS_EXCEPTION_JSONP.includes((email||'').toLowerCase().trim());
-          if(!isWhite) isWhite = await isAdminFromDB(email); // check ADMIN từ DB nếu không nằm trong exception
+          const isWhite = SECURITY_WHITELIST.includes(email.toLowerCase());
           if (isWhite) {
             console.log(`[Security JSONP] Whitelisted ${email} - ${eventType}`);
             return sendJSONP({ success:true, whitelisted:true });
@@ -1843,6 +1801,120 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
         return sendJSONP({ success:true, message:'Client đã tự gỡ module phía client, server giữ RAM 30min' });
       }
       case 'saveUsageStats':
+      case 'updateProfile': {
+        try {
+          const email = (params.email||'').toLowerCase().trim();
+          const oldPass = (params.oldPassword||params.oldPass||'').toString();
+          const newPass = (params.newPassword||params.newPass||'').toString();
+          const fullName = (params.fullName||params.full_name||params.name||'').toString().trim();
+          
+          if(!email || !email.includes('@')){
+            return sendJSONP({ success:false, status:'error', msg:'Thiếu email!' });
+          }
+          if(!oldPass){
+            return sendJSONP({ success:false, status:'error', msg:'Vui lòng nhập mật khẩu cũ!' });
+          }
+          
+          const { data: user, error: findErr } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
+          if(findErr || !user){
+            return sendJSONP({ success:false, status:'error', msg:'Không tìm thấy tài khoản!' });
+          }
+          
+          // Kiểm tra mật khẩu cũ - hỗ trợ cả password_hash và password
+          let isOldPassValid = false;
+          const hashToCheck = user.password_hash || user.password || '';
+          if(hashToCheck){
+            try{
+              isOldPassValid = await bcrypt.compare(oldPass, hashToCheck);
+            }catch(e){
+              // Nếu hash không phải bcrypt (cũ), so sánh trực tiếp
+              isOldPassValid = (oldPass === hashToCheck);
+            }
+          }
+          
+          if(!isOldPassValid){
+            console.log(`[updateProfile] Sai mật khẩu cũ cho ${email}`);
+            return sendJSONP({ success:false, status:'error', msg:'Mật khẩu cũ không đúng! Vui lòng kiểm tra lại.' });
+          }
+          
+          // Chuẩn bị dữ liệu update
+          const updateData = {
+            updated_at: new Date().toISOString()
+          };
+          
+          if(fullName && fullName.length>0){
+            updateData.full_name = fullName;
+            updateData.fullName = fullName; // fallback cho cột cũ
+          }
+          
+          let newToken = null;
+          if(newPass && newPass.length>0){
+            if(newPass.length < 4){
+              return sendJSONP({ success:false, status:'error', msg:'Mật khẩu mới phải ít nhất 4 ký tự!' });
+            }
+            const newHash = await bcrypt.hash(newPass, 10);
+            updateData.password_hash = newHash;
+            updateData.password = newHash; // fallback
+          }
+          
+          // Update vào Supabase
+          const { data: updated, error: updErr } = await supabaseAdmin.from('users').update(updateData).eq('email', email).select().single();
+          if(updErr){
+            console.error('[updateProfile] Update error', updErr);
+            // Thử update chỉ full_name nếu lỗi do cột không tồn tại
+            try{
+              const fallbackData = {};
+              if(fullName) fallbackData.full_name = fullName;
+              if(newPass){
+                const newHash2 = await bcrypt.hash(newPass, 10);
+                fallbackData.password_hash = newHash2;
+              }
+              fallbackData.updated_at = new Date().toISOString();
+              const { data: updated2, error: updErr2 } = await supabaseAdmin.from('users').update(fallbackData).eq('email', email).select().single();
+              if(updErr2){
+                return sendJSONP({ success:false, status:'error', msg:'Lỗi cập nhật: '+updErr2.message });
+              }
+              // Tạo token mới
+              const tokenUser = updated2 || user;
+              newToken = createOldStyleToken(tokenUser);
+              return sendJSONP({ success:true, status:'success', msg:'Cập nhật thành công!', newToken: newToken, token: newToken, user: { email: tokenUser.email, fullName: tokenUser.full_name, full_name: tokenUser.full_name } });
+            }catch(e2){
+              return sendJSONP({ success:false, status:'error', msg:'Lỗi cập nhật: '+e2.message });
+            }
+          }
+          
+          // Tạo token mới với thông tin mới
+          const finalUser = updated || { ...user, ...updateData };
+          try{
+            newToken = createOldStyleToken(finalUser);
+          }catch(e){}
+          
+          // Log telegram
+          try{
+            const info = getClientInfo(req);
+            await sendTelegramNotification(`🔧 <b>Cập nhật tài khoản</b>
+📧 <b>Email:</b> ${email}
+👤 <b>Tên mới:</b> ${fullName||user.full_name||'N/A'}
+🔑 <b>Đổi MK:</b> ${newPass ? 'Có' : 'Không'}
+🌐 <b>Domain:</b> ${info.domain}
+📍 <b>IP:</b> ${info.ip}
+⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+          }catch(e){}
+          
+          return sendJSONP({ 
+            success:true, 
+            status:'success', 
+            msg:'Cập nhật thông tin tài khoản thành công!', 
+            message:'Cập nhật thông tin tài khoản thành công!',
+            newToken: newToken, 
+            token: newToken,
+            user: { email: finalUser.email, fullName: finalUser.full_name || fullName, full_name: finalUser.full_name || fullName }
+          });
+        }catch(e){
+          console.error('[updateProfile] Exception', e);
+          return sendJSONP({ success:false, status:'error', msg:'Lỗi: '+e.message });
+        }
+      }
       case 'logUserAccess': {
         console.log('[logUserAccess] Received request', { 
           email: params.email, 
