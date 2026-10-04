@@ -310,6 +310,25 @@ router.post('/admin/approve-vip', async (req,res)=>{
       await supabaseAdmin.from('vip_requests').update({status:'APPROVED', updated_at:new Date().toISOString()}).eq('email',targetEmail.toLowerCase()).eq('status','PENDING');
     }
     console.log(`[approve-vip] Approved ${targetEmail} for ${monthsToAdd} months`);
+    
+    // ===== THÊM THÔNG BÁO TELEGRAM KHI DUYỆT VIP THÀNH CÔNG =====
+    try{
+      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const expireVN = expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const approveMsg = `✅🎉 <b>DUYỆT VIP THÀNH CÔNG - KARARENDER</b> 🎉✅
+━━━━━━━━━━━━━━━━━━━━━━
+👤 <b>Email:</b> ${targetEmail}
+💳 <b>Gói:</b> ${monthsToAdd} tháng
+📅 <b>Hạn dùng:</b> ${expireVN}
+⏰ <b>Thời gian duyệt:</b> ${timeVN}
+🆔 <b>Request ID:</b> <code>${requestId||'N/A'}</code>
+━━━━━━━━━━━━━━━━━━━━━━
+✨ User đã được kích hoạt VIP thành công!`;
+
+      await sendTelegramDirect(approveMsg);
+      console.log('[approve-vip] Telegram sent for', targetEmail);
+    }catch(e){ console.warn('[approve-vip] telegram error', e.message); }
+    
     res.json({success:true, message:`Đã duyệt VIP ${monthsToAdd} tháng cho ${targetEmail}`, expiredDate:expireDate.toISOString()});
   }catch(e){
     console.error('[approve-vip]', e.message);
