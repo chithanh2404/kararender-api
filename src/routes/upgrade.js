@@ -252,12 +252,7 @@ router.post('/request-vip', async (req,res)=>{
 ━━━━━━━━━━━━━━━━━━━━━━
 ⚡ <b>HÀNH ĐỘNG:</b> Vào Admin Dashboard duyệt ngay!`;
 
-      await sendTelegramDirect(detailedMsg);
-      try{
-        const {sendTelegramNotification, sendTelegram} = require('../services/telegram');
-        const fn = sendTelegramNotification || sendTelegram;
-        if(fn) await fn(detailedMsg);
-      }catch{}
+     await sendTelegramDirect(detailedMsg);
     }catch(e){ console.warn('[telegram detailed]', e.message); }
 
     res.json({success:true, message:'Đã gửi yêu cầu, chờ admin duyệt', requestId:inserted?.id, _debug: insertError ? insertError.message : 'ok'});
