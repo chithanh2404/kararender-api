@@ -2186,6 +2186,45 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
     }
 
     console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
+    
+    // ===== THÊM TELEGRAM KHI AUTO DUYỆT VIP =====
+    try{
+      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const expireVN = expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const autoMsg = `✅🤖 <b>AUTO DUYỆT VIP - KARARENDER</b> 🤖✅
+━━━━━━━━━━━━━━━━━━━━━━
+👤 <b>Email:</b> ${targetUser.email}
+👤 <b>Tên:</b> ${targetUser.full_name||targetUser.email}
+💳 <b>Gói:</b> ${planKey} (${months} tháng)
+💰 <b>Số tiền:</b> ${amount.toLocaleString('vi-VN')}đ
+📝 <b>Nội dung:</b> <code>${content}</code>
+📅 <b>Hạn dùng:</b> ${expireVN}
+⏰ <b>Thời gian:</b> ${timeVN}
+━━━━━━━━━━━━━━━━━━━━━━
+🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
+
+      // gửi trực tiếp
+      try{
+        const token = process.env.TELEGRAM_BOT_TOKEN;
+        const chatId = process.env.TELEGRAM_CHAT_ID;
+        if(token && chatId){
+          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ chat_id: chatId, text: autoMsg, parse_mode:'HTML' })
+          });
+        }
+      }catch(e){ console.warn('[Webhook Telegram Direct] error', e.message); }
+      
+      // gửi qua service nếu có
+      try{
+        const {sendTelegramNotification} = require('./services/telegram');
+        if(sendTelegramNotification) await sendTelegramNotification(autoMsg);
+      }catch(e){}
+      
+      console.log('[Webhook] Telegram auto approve sent');
+    }catch(e){ console.warn('[Webhook Telegram] error', e.message); }
+    
     return res.json({ success:true, autoApproved:true, email: targetUser.email, plan: planKey, expire: expireDate.toISOString() });
   }catch(e){
     console.error('[Webhook Bank] Exception', e);
@@ -2299,88 +2338,32 @@ async function autoCleanupExpiredOTPs(){
 setInterval(autoCleanupExpiredOTPs, 10*60*1000);
 autoCleanupExpiredOTPs();
 
-// ===== AUTO EXPIRE VIP REQUESTS AFTER 10 MINUTES - FRONTEND COUNTDOWN BACKUP =====
-async function autoExpireVipRequests(){
-  try{
-    const { supabaseAdmin } = require('./services/supabase');
-    if(!supabaseAdmin) return;
-    const cutoff = new Date(Date.now() - 10*60*1000).toISOString();
-    const { data: expired, error } = await supabaseAdmin.from('vip_requests').select('id,email,created_at').eq('status','PENDING').lt('created_at', cutoff);
-    if(error){
-      // console.log('[AutoExpire VIP] fetch error', error.message);
-      return;
-    }
-    if(!expired || expired.length===0) return;
-    console.log(`[AutoExpire VIP] Found ${expired.length} expired >10m, auto rejecting...`);
-    for(const req of expired){
-      try{
-        await supabaseAdmin.from('vip_requests').update({
-          status:'REJECTED',
-          reason:'auto_timeout_10m',
-          updated_at:new Date().toISOString()
-        }).eq('id', req.id);
-        // update users table if still pending
-        await supabaseAdmin.from('users').update({
-          vip_status:'REJECTED',
-          updated_at:new Date().toISOString()
-        }).eq('email', req.email).eq('vip_status','PENDING');
-      }catch(e){ console.warn('[AutoExpire VIP] update error', e.message); }
-    }
-  }catch(e){ console.log('[AutoExpire VIP] error', e.message); }
-}
-setInterval(autoExpireVipRequests, 60*1000); // check every 1 minute
-autoExpireVipRequests();
-console.log('[VIP] Auto expire 10m enabled - checking every 60s');
 
-// ===== USER SELF-CANCEL ENDPOINTS - FOR FRONTEND COUNTDOWN TIMEOUT =====
-async function handleCancelVip(req, res){
+
+
+
+// ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED (KHÔNG AUTO CRON) =====
+async function handleCancelVipGoc(req, res){
   try{
     const { email, requestId, reason } = req.body || {};
     const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
     const targetEmail = (email || headerEmail || '').toLowerCase().trim();
     if(!targetEmail) return res.status(400).json({ success:false, message:'Missing email' });
-    
     const { supabaseAdmin } = require('./services/supabase');
     if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
-
-    // Find pending request for this email
-    let query = supabaseAdmin.from('vip_requests').select('id,email').eq('email', targetEmail).eq('status','PENDING');
     if(requestId){
-      // if requestId looks like uuid, try by id, else ignore
-      const isUuid = requestId.length>20 || requestId.includes('-');
-      if(isUuid){
-        const { data: byId } = await supabaseAdmin.from('vip_requests').select('id,email').eq('id', requestId).eq('status','PENDING').single();
-        if(byId){
-          await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'user_timeout_10m', updated_at:new Date().toISOString() }).eq('id', byId.id);
-          await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', byId.email);
-          return res.json({ success:true, message:'Cancelled by timeout', auto:true });
-        }
-      }
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
+    }else{
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
     }
-    // fallback: cancel latest pending for this email
-    const { data: latest, error } = await supabaseAdmin.from('vip_requests').select('id,email').eq('email', targetEmail).eq('status','PENDING').order('created_at',{ascending:false}).limit(1).single();
-    if(error || !latest){
-      // still update users table to REJECTED if pending
-      await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('vip_status','PENDING');
-      return res.json({ success:true, message:'No pending found, marked REJECTED', already:false });
-    }
-    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'user_timeout_10m', updated_at:new Date().toISOString() }).eq('id', latest.id);
     await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
-    console.log(`[Cancel VIP] Auto rejected ${targetEmail} - ${latest.id} reason=${reason}`);
-    return res.json({ success:true, message:'Cancelled', id: latest.id });
-  }catch(e){
-    console.error('[Cancel VIP] error', e.message);
-    return res.status(500).json({ success:false, error:e.message });
-  }
+    return res.json({ success:true });
+  }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
 }
-
-app.post('/api/cancel-vip', handleCancelVip);
-app.post('/api/request-vip/cancel', handleCancelVip);
-app.post('/api/vip/cancel', handleCancelVip);
-app.post('/api/cancel-vip-request', handleCancelVip);
-
-// Also patch admin reject to allow self-reject when auto=true
-app.post('/api/admin/reject-vip/self', handleCancelVip);
+app.post('/api/cancel-vip', handleCancelVipGoc);
+app.post('/api/request-vip/cancel', handleCancelVipGoc);
+app.post('/api/vip/cancel', handleCancelVipGoc);
+app.post('/api/admin/reject-vip/self', handleCancelVipGoc);
 
 
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
