@@ -2299,5 +2299,89 @@ async function autoCleanupExpiredOTPs(){
 setInterval(autoCleanupExpiredOTPs, 10*60*1000);
 autoCleanupExpiredOTPs();
 
+// ===== AUTO EXPIRE VIP REQUESTS AFTER 10 MINUTES - FRONTEND COUNTDOWN BACKUP =====
+async function autoExpireVipRequests(){
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return;
+    const cutoff = new Date(Date.now() - 10*60*1000).toISOString();
+    const { data: expired, error } = await supabaseAdmin.from('vip_requests').select('id,email,created_at').eq('status','PENDING').lt('created_at', cutoff);
+    if(error){
+      // console.log('[AutoExpire VIP] fetch error', error.message);
+      return;
+    }
+    if(!expired || expired.length===0) return;
+    console.log(`[AutoExpire VIP] Found ${expired.length} expired >10m, auto rejecting...`);
+    for(const req of expired){
+      try{
+        await supabaseAdmin.from('vip_requests').update({
+          status:'REJECTED',
+          reason:'auto_timeout_10m',
+          updated_at:new Date().toISOString()
+        }).eq('id', req.id);
+        // update users table if still pending
+        await supabaseAdmin.from('users').update({
+          vip_status:'REJECTED',
+          updated_at:new Date().toISOString()
+        }).eq('email', req.email).eq('vip_status','PENDING');
+      }catch(e){ console.warn('[AutoExpire VIP] update error', e.message); }
+    }
+  }catch(e){ console.log('[AutoExpire VIP] error', e.message); }
+}
+setInterval(autoExpireVipRequests, 60*1000); // check every 1 minute
+autoExpireVipRequests();
+console.log('[VIP] Auto expire 10m enabled - checking every 60s');
+
+// ===== USER SELF-CANCEL ENDPOINTS - FOR FRONTEND COUNTDOWN TIMEOUT =====
+async function handleCancelVip(req, res){
+  try{
+    const { email, requestId, reason } = req.body || {};
+    const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
+    const targetEmail = (email || headerEmail || '').toLowerCase().trim();
+    if(!targetEmail) return res.status(400).json({ success:false, message:'Missing email' });
+    
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
+
+    // Find pending request for this email
+    let query = supabaseAdmin.from('vip_requests').select('id,email').eq('email', targetEmail).eq('status','PENDING');
+    if(requestId){
+      // if requestId looks like uuid, try by id, else ignore
+      const isUuid = requestId.length>20 || requestId.includes('-');
+      if(isUuid){
+        const { data: byId } = await supabaseAdmin.from('vip_requests').select('id,email').eq('id', requestId).eq('status','PENDING').single();
+        if(byId){
+          await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'user_timeout_10m', updated_at:new Date().toISOString() }).eq('id', byId.id);
+          await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', byId.email);
+          return res.json({ success:true, message:'Cancelled by timeout', auto:true });
+        }
+      }
+    }
+    // fallback: cancel latest pending for this email
+    const { data: latest, error } = await supabaseAdmin.from('vip_requests').select('id,email').eq('email', targetEmail).eq('status','PENDING').order('created_at',{ascending:false}).limit(1).single();
+    if(error || !latest){
+      // still update users table to REJECTED if pending
+      await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('vip_status','PENDING');
+      return res.json({ success:true, message:'No pending found, marked REJECTED', already:false });
+    }
+    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'user_timeout_10m', updated_at:new Date().toISOString() }).eq('id', latest.id);
+    await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
+    console.log(`[Cancel VIP] Auto rejected ${targetEmail} - ${latest.id} reason=${reason}`);
+    return res.json({ success:true, message:'Cancelled', id: latest.id });
+  }catch(e){
+    console.error('[Cancel VIP] error', e.message);
+    return res.status(500).json({ success:false, error:e.message });
+  }
+}
+
+app.post('/api/cancel-vip', handleCancelVip);
+app.post('/api/request-vip/cancel', handleCancelVip);
+app.post('/api/vip/cancel', handleCancelVip);
+app.post('/api/cancel-vip-request', handleCancelVip);
+
+// Also patch admin reject to allow self-reject when auto=true
+app.post('/api/admin/reject-vip/self', handleCancelVip);
+
+
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
 
