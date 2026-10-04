@@ -1800,7 +1800,81 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
       case 'clearSecureModuleCache': {
         return sendJSONP({ success:true, message:'Client đã tự gỡ module phía client, server giữ RAM 30min' });
       }
-      case 'saveUsageStats':
+      case 'saveUsageStats': {
+        try {
+          console.log('[saveUsageStats] Received', { hasData: !!params.data, domain: params.domain });
+          let isExportLog = false;
+          let exportDataParsed = null;
+          let exportDataRaw = params.data || '';
+          try {
+            if (exportDataRaw) {
+              let decoded = '';
+              try { decoded = decodeURIComponent(exportDataRaw); } catch { decoded = exportDataRaw; }
+              const parsed = JSON.parse(decoded);
+              if (parsed && parsed.userInfo && parsed.features) {
+                isExportLog = true;
+                exportDataParsed = parsed;
+                console.log('[saveUsageStats Export] Detected export from collectExportData', parsed.userInfo?.email);
+              }
+            }
+          } catch (e) { console.warn('[saveUsageStats] parse error', e.message); }
+
+          try {
+            if(supabaseAdmin){
+              await supabaseAdmin.from('usage_stats').insert({
+                data: params,
+                created_at: new Date().toISOString(),
+                ip: req.ip,
+                domain: params.domain||'',
+                is_export: isExportLog,
+                export_data: exportDataParsed ? JSON.stringify(exportDataParsed) : null
+              });
+            }
+          } catch(e){ console.log('usage_stats error', e.message); }
+
+          if(isExportLog && exportDataParsed){
+            try{
+              const info = getClientInfoFull(req);
+              const userInfo = exportDataParsed.userInfo || {};
+              const features = exportDataParsed.features || {};
+              await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
+👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
+📧 <b>Email:</b> ${userInfo.email || 'unknown'}
+📍 <b>IP (client):</b> ${userInfo.ip || info.ip}
+📍 <b>IP (server):</b> ${info.ip}
+${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${info.os}
+🌐 <b>Browser:</b> ${info.browser}
+🖥️ <b>User-Agent:</b> ${info.browserFull.slice(0,250)}
+
+🎨 <b>Tính năng đã dùng:</b>
+🔤 <b>Font:</b> ${features.fontFamily || 'Default'}
+🎵 <b>Audio:</b> ${features.audioStatus || 'N/A'}
+✨ <b>Wipe:</b> ${features.wipeEffect || 'None'}
+📌 <b>Tiêu đề:</b> ${features.useTitle ? 'Có' : 'Không'}
+⏱️ <b>Đếm ngược:</b> ${features.useCountdown ? 'Có' : 'Không'}
+🖼️ <b>Logo:</b> ${features.useLogo ? 'Có' : 'Không'}
+🎲 <b>Logo 3D:</b> ${features.useLogo3D ? 'Có ('+features.logo3DMode+')' : 'Không'}
+💥 <b>Beat Zoom:</b> ${features.useBeatZoom ? 'Có' : 'Không'}
+🎶 <b>Visualizer:</b> ${features.useVisualizer ? 'Có ('+features.vizType+')' : 'Không'}
+📺 <b>Độ phân giải:</b> ${features.resolution || 'Default'}
+🎞️ <b>Timeline:</b> ${features.useTimeline ? 'Có' : 'Không'}
+🖼️ <b>Số ảnh nền:</b> ${features.bgImagesCount || 0}
+🎥 <b>Video nền:</b> ${features.useVideoBg ? 'Có' : 'Không'}
+🎤 <b>Chế độ:</b> ${features.karaokeMode || 'solo'}
+
+🌐 <b>Domain:</b> ${info.domain}
+🔗 <b>Origin:</b> ${info.origin}
+📄 <b>Full URL:</b> ${info.fullUrl}
+⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+            }catch(e){ console.warn('[saveUsageStats Telegram] error', e.message); }
+          }
+
+          return sendJSONP({ success:true, isExport: isExportLog });
+        } catch(e){
+          console.error('[saveUsageStats] Exception', e);
+          return sendJSONP({ success:false, msg:e.message });
+        }
+      }
       case 'updateProfile': {
         try {
           const email = (params.email||'').toLowerCase().trim();
