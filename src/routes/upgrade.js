@@ -425,4 +425,54 @@ router.post('/trial-consume', async (req,res)=>{
   }
 });
 
+
+// ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED (KHÔNG AUTO CRON) =====
+router.post('/cancel-vip', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { email, requestId, reason } = req.body || {};
+    const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
+    const targetEmail = (email || headerEmail || '').toLowerCase().trim();
+    if(!targetEmail) return res.status(400).json({success:false, message:'Missing email'});
+    
+    if(requestId){
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
+    }else{
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
+    }
+    await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
+    console.log(`[cancel-vip] Frontend timeout REJECTED ${targetEmail} reason=${reason}`);
+    return res.json({ success:true, message:'Rejected after frontend 10m' });
+  }catch(e){ return res.status(500).json({success:false, message:e.message}); }
+});
+
+router.post('/request-vip/cancel', async (req,res)=>{
+  // alias
+  req.url = '/cancel-vip';
+  return router.handle(req,res);
+});
+
+router.post('/vip/cancel', async (req,res)=>{
+  req.url = '/cancel-vip';
+  return router.handle(req,res);
+});
+
+// Cho phép frontend gọi /admin/reject-vip với reason timeout mà không cần check admin
+router.post('/admin/reject-vip/self', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { email, requestId, reason } = req.body || {};
+    const targetEmail = (email || '').toLowerCase().trim();
+    if(!targetEmail) return res.status(400).json({success:false, message:'Missing email'});
+    if(requestId){
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
+    }else{
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
+    }
+    await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
+    return res.json({ success:true });
+  }catch(e){ return res.status(500).json({success:false, message:e.message}); }
+});
+
+
 module.exports=router;
