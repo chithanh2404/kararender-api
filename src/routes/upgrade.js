@@ -139,59 +139,45 @@ router.post('/admin/upgrade-plans', async (req,res)=>{
   }catch(e){ console.error('[admin/upgrade-plans] fatal', e.message); res.status(500).json({success:false, message:e.message}); }
 });
 
-
 router.get('/admin/pending-vip', async (req,res)=>{
   try{
     if(!supabaseAdmin) {
       console.error('[pending-vip] supabaseAdmin NULL');
       return res.status(500).json({success:false, message:'supabaseAdmin NULL', users:[], count:0});
     }
-    // Lấy tất cả PENDING
     const {data, error}=await supabaseAdmin.from('vip_requests').select('*').eq('status','PENDING').order('created_at',{ascending:false}).limit(50);
     if(error){
       console.error('[pending-vip] error', error.message);
       return res.json({success:true, users:[], count:0, message:error.message, _error:true});
     }
-    let list = data || [];
-    
-    // FIX QUAN TRỌNG: Đồng bộ với bảng users - nếu users đã REJECTED thì vip_requests cũng phải REJECTED
-    // Trường hợp frontend timeout đã update users REJECTED nhưng vip_requests vẫn PENDING (do race condition)
-    if(list.length > 0){
-      const emails = [...new Set(list.map(r => r.email.toLowerCase()))];
-      const { data: usersData } = await supabaseAdmin.from('users').select('email,vip_status').in('email', emails);
-      const rejectedEmails = new Set((usersData||[]).filter(u => u.vip_status === 'REJECTED').map(u => u.email.toLowerCase()));
-      
-      if(rejectedEmails.size > 0){
-        // Có những request PENDING nhưng user đã REJECTED -> auto fix
-        const toFix = list.filter(r => rejectedEmails.has(r.email.toLowerCase()));
-        console.log(`[pending-vip] Found ${toFix.length} orphan PENDING but users REJECTED, auto fixing...`, [...rejectedEmails]);
+    let list = data||[];
+    // FIX: Đồng bộ với users - nếu users đã REJECTED thì vip_requests cũng phải REJECTED
+    if(list.length>0){
+      const emails = [...new Set(list.map(r=>r.email.toLowerCase()))];
+      const {data: usersData} = await supabaseAdmin.from('users').select('email,vip_status').in('email', emails);
+      const rejectedEmails = new Set((usersData||[]).filter(u=>u.vip_status==='REJECTED').map(u=>u.email.toLowerCase()));
+      if(rejectedEmails.size>0){
+        const toFix = list.filter(r=>rejectedEmails.has(r.email.toLowerCase()));
+        console.log(`[pending-vip] Auto fixing ${toFix.length} orphan PENDING where users REJECTED`, [...rejectedEmails]);
         for(const r of toFix){
-          await supabaseAdmin.from('vip_requests').update({ 
-            status:'REJECTED', 
-            reason:'auto_sync_users_rejected', 
-            updated_at:new Date().toISOString() 
-          }).eq('id', r.id);
+          await supabaseAdmin.from('vip_requests').update({status:'REJECTED', reason:'auto_sync_users_rejected', updated_at:new Date().toISOString()}).eq('id', r.id);
         }
-        // Loại khỏi list trả về
-        list = list.filter(r => !rejectedEmails.has(r.email.toLowerCase()));
+        list = list.filter(r=>!rejectedEmails.has(r.email.toLowerCase()));
       }
     }
-    
     const mapped=list.map(u=>({
       id:u.id, email:u.email, fullName:u.full_name||u.email,
       requestVipTime:u.created_at, planKey:u.plan_key,
       amount:u.amount, content:u.content, created_at:u.created_at
     }));
-    console.log(`[pending-vip] Found ${mapped.length} pending (after sync fix)`);
+    console.log(`[pending-vip] Found ${mapped.length} pending (after sync)`);
     res.json({success:true, users:mapped, count:mapped.length});
   }catch(e){
     console.error('[pending-vip] fatal', e.message);
     res.status(500).json({success:false, message:e.message, users:[], count:0});
   }
 });
-);
-  }
-});
+
 
 router.post('/request-vip', async (req,res)=>{
   try{
@@ -282,8 +268,7 @@ router.post('/request-vip', async (req,res)=>{
 ━━━━━━━━━━━━━━━━━━━━━━
 ⚡ <b>HÀNH ĐỘNG:</b> Vào Admin Dashboard duyệt ngay!`;
 
-      // FIX: chỉ gửi 1 lần, tránh duplicate - giữ sendTelegramDirect, bỏ sendTelegramNotification thứ 2
-      await sendTelegramDirect(detailedMsg);
+      await sendTelegramDirect(detailedMsg); // FIX: chỉ gửi 1 lần, bỏ duplicate
     }catch(e){ console.warn('[telegram detailed]', e.message); }
 
     res.json({success:true, message:'Đã gửi yêu cầu, chờ admin duyệt', requestId:inserted?.id, _debug: insertError ? insertError.message : 'ok'});
@@ -452,7 +437,7 @@ router.post('/trial-consume', async (req,res)=>{
 });
 
 
-// ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED (KHÔNG AUTO CRON) =====
+// ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED =====
 router.post('/cancel-vip', async (req,res)=>{
   try{
     if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
@@ -460,49 +445,39 @@ router.post('/cancel-vip', async (req,res)=>{
     const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
     const targetEmail = (email || headerEmail || '').toLowerCase().trim();
     if(!targetEmail) return res.status(400).json({success:false, message:'Missing email'});
-    
     if(requestId){
       await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
     }else{
       await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
     }
-    // Đảm bảo update cả 2 bảng đồng bộ
-    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
     await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
-    console.log(`[cancel-vip] Frontend timeout REJECTED ${targetEmail} reason=${reason}`);
-    return res.json({ success:true, message:'Rejected after frontend 10m' });
+    console.log(`[cancel-vip] Frontend timeout REJECTED ${targetEmail}`);
+    return res.json({ success:true });
   }catch(e){ return res.status(500).json({success:false, message:e.message}); }
 });
 
 router.post('/request-vip/cancel', async (req,res)=>{
-  // alias
-  req.url = '/cancel-vip';
-  return router.handle(req,res);
-});
-
-router.post('/vip/cancel', async (req,res)=>{
-  req.url = '/cancel-vip';
-  return router.handle(req,res);
-});
-
-// Cho phép frontend gọi /admin/reject-vip với reason timeout mà không cần check admin
-router.post('/admin/reject-vip/self', async (req,res)=>{
   try{
     if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
     const { email, requestId, reason } = req.body || {};
     const targetEmail = (email || '').toLowerCase().trim();
     if(!targetEmail) return res.status(400).json({success:false, message:'Missing email'});
-    if(requestId){
-      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
-    }else{
-      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
-    }
-    // Đảm bảo update cả 2 bảng đồng bộ
-    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
+    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
     await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
     return res.json({ success:true });
   }catch(e){ return res.status(500).json({success:false, message:e.message}); }
 });
 
+router.post('/vip/cancel', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { email, reason } = req.body || {};
+    const targetEmail = (email || '').toLowerCase().trim();
+    if(!targetEmail) return res.status(400).json({success:false, message:'Missing email'});
+    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
+    await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
+    return res.json({ success:true });
+  }catch(e){ return res.status(500).json({success:false, message:e.message}); }
+});
 
 module.exports=router;
