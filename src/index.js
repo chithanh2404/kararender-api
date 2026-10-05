@@ -2372,38 +2372,7 @@ async function autoCleanupExpiredOTPs(){
 setInterval(autoCleanupExpiredOTPs, 10*60*1000);
 autoCleanupExpiredOTPs();
 
-// ===== AUTO EXPIRE VIP REQUESTS AFTER 10 MINUTES - FRONTEND COUNTDOWN BACKUP =====
-async function autoExpireVipRequests(){
-  try{
-    const { supabaseAdmin } = require('./services/supabase');
-    if(!supabaseAdmin) return;
-    const cutoff = new Date(Date.now() - 10*60*1000).toISOString();
-    const { data: expired, error } = await supabaseAdmin.from('vip_requests').select('id,email,created_at').eq('status','PENDING').lt('created_at', cutoff);
-    if(error){
-      // console.log('[AutoExpire VIP] fetch error', error.message);
-      return;
-    }
-    if(!expired || expired.length===0) return;
-    console.log(`[AutoExpire VIP] Found ${expired.length} expired >10m, auto rejecting...`);
-    for(const req of expired){
-      try{
-        await supabaseAdmin.from('vip_requests').update({
-          status:'REJECTED',
-          reason:'auto_timeout_10m',
-          updated_at:new Date().toISOString()
-        }).eq('id', req.id);
-        // update users table if still pending
-        await supabaseAdmin.from('users').update({
-          vip_status:'REJECTED',
-          updated_at:new Date().toISOString()
-        }).eq('email', req.email).eq('vip_status','PENDING');
-      }catch(e){ console.warn('[AutoExpire VIP] update error', e.message); }
-    }
-  }catch(e){ console.log('[AutoExpire VIP] error', e.message); }
-}
-setInterval(autoExpireVipRequests, 60*1000); // check every 1 minute
-autoExpireVipRequests();
-console.log('[VIP] Auto expire 10m enabled - checking every 60s');
+
 
 // ===== USER SELF-CANCEL ENDPOINTS - FOR FRONTEND COUNTDOWN TIMEOUT =====
 async function handleCancelVip(req, res){
