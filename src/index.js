@@ -540,6 +540,58 @@ function getUserInfoFromRequest(req, params) {
   }
 }
 
+
+async function getVipInfo(email) {
+  try {
+    if (!email) return null;
+    const clean = email.toLowerCase().trim();
+    if (clean === 'chưa đăng nhập' || clean === 'unknown' || clean === 'n/a' || clean === '' || !clean.includes('@')) return null;
+    const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return null;
+    const { data } = await supabaseAdmin.from('users').select('email, full_name, role, is_vip, expired_date, vip_status, request_plan_key, created_at, request_vip_time').eq('email', clean).maybeSingle();
+    return data || null;
+  } catch(e) {
+    console.log('[getVipInfo] error', e.message);
+    return null;
+  }
+}
+
+function formatVipInfo(vipData) {
+  if (!vipData) {
+    return `👑 <b>VIP:</b> ❌ Không có / USER thường
+├ Role: USER
+└ Hết hạn: N/A`;
+  }
+  const isVip = vipData.is_vip;
+  const icon = isVip ? '👑' : '👤';
+  const label = isVip ? 'VIP - ĐÃ KÍCH HOẠT' : 'USER thường';
+  const role = vipData.role || (isVip ? 'VIP' : 'USER');
+  const status = vipData.vip_status || (isVip ? 'APPROVED' : 'NONE');
+  const plan = vipData.request_plan_key || 'N/A';
+  let expiredText = 'N/A';
+  let daysLeft = '';
+  if (vipData.expired_date) {
+    try {
+      const exp = new Date(vipData.expired_date);
+      expiredText = exp.toLocaleString('vi-VN');
+      const diff = exp - new Date();
+      const days = Math.floor(diff / (1000*60*60*24));
+      if (days >= 0) daysLeft = ` (còn ${days} ngày)`;
+      else daysLeft = ` (đã hết hạn ${Math.abs(days)} ngày)`;
+    } catch(e) { expiredText = vipData.expired_date; }
+  } else {
+    expiredText = isVip ? 'Vĩnh viễn / Không giới hạn' : 'N/A';
+  }
+  const created = vipData.created_at ? new Date(vipData.created_at).toLocaleDateString('vi-VN') : 'N/A';
+  return `${icon} <b>VIP:</b> ${isVip ? '✅' : '❌'} ${label}
+├ Role: ${role}
+├ Trạng thái: ${status}
+├ Gói: ${plan}
+├ Hết hạn: ${expiredText}${daysLeft}
+└ Tham gia: ${created}`;
+}
+
+
 async function seedAdmin() {
   try {
     const { supabaseAdmin } = require('./services/supabase');
@@ -1344,6 +1396,8 @@ app.all('/exec', async (req, res) => {
         // Telegram full info như mã nguồn cũ
         const info = getClientInfo(req);
         await sendTelegramNotification(`🔐 <b>Đăng nhập</b>
+${await (async () => { try { const v = await getVipInfo(params.email || userInfo?.email || ''); return formatVipInfo(v); } catch(e){ return '👑 VIP: Lỗi'; } })()}
+${(() => { try { return formatVipInfo(null); } catch(e){ return ''; } })()}
 📧 <b>Email:</b> ${email}
 👤 <b>Tên:</b> ${user.full_name || email}
 👑 <b>VIP:</b> ${user.is_vip ? 'Có' : 'Không'}
@@ -1401,6 +1455,7 @@ app.all('/exec', async (req, res) => {
         }
         const info = getClientInfo(req);
         await sendTelegramNotification(`✅ <b>Đăng ký mới (Đã xác minh OTP)</b>
+${await (async () => { try { const v = await getVipInfo(params.email || ''); return formatVipInfo(v); } catch(e){ return ''; } })()}
 📧 <b>Email:</b> ${email}
 👤 <b>Tên:</b> ${fullName||email}
 🌐 <b>Domain:</b> ${info.domain}
@@ -1437,6 +1492,7 @@ app.all('/exec', async (req, res) => {
         // Telegram full info như mã nguồn cũ
         const info = getClientInfo(req);
         await sendTelegramNotification(`💬 <b>Feedback mới</b>
+${await (async () => { try { const v = await getVipInfo(params.email || ''); return formatVipInfo(v); } catch(e){ return ''; } })()}
 📧 <b>Email:</b> ${email}
 📝 <b>Nội dung:</b> ${message.slice(0,800)}
 ⭐ <b>Rating:</b> ${rating || 'N/A'}
@@ -1531,6 +1587,7 @@ ${fullInfo.deviceIcon || ''} <b>Thiết bị:</b> ${fullInfo.device || ''} - ${f
         try {
           const info = getClientInfo(req);
           await sendTelegramNotification(`👑 <b>YÊU CẦU VIP - ĐÃ GHI DB</b>
+${await (async () => { try { const v = await getVipInfo(params.email || ''); return formatVipInfo(v); } catch(e){ return ''; } })()}
 📧 <b>Email:</b> ${email}
 👤 <b>Tên:</b> ${fullName || 'N/A'}
 💳 <b>Gói:</b> ${planKey}
@@ -1800,81 +1857,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
       case 'clearSecureModuleCache': {
         return sendJSONP({ success:true, message:'Client đã tự gỡ module phía client, server giữ RAM 30min' });
       }
-      case 'saveUsageStats': {
-        try {
-          console.log('[saveUsageStats] Received', { hasData: !!params.data, domain: params.domain });
-          let isExportLog = false;
-          let exportDataParsed = null;
-          let exportDataRaw = params.data || '';
-          try {
-            if (exportDataRaw) {
-              let decoded = '';
-              try { decoded = decodeURIComponent(exportDataRaw); } catch { decoded = exportDataRaw; }
-              const parsed = JSON.parse(decoded);
-              if (parsed && parsed.userInfo && parsed.features) {
-                isExportLog = true;
-                exportDataParsed = parsed;
-                console.log('[saveUsageStats Export] Detected export from collectExportData', parsed.userInfo?.email);
-              }
-            }
-          } catch (e) { console.warn('[saveUsageStats] parse error', e.message); }
-
-          try {
-            if(supabaseAdmin){
-              await supabaseAdmin.from('usage_stats').insert({
-                data: params,
-                created_at: new Date().toISOString(),
-                ip: req.ip,
-                domain: params.domain||'',
-                is_export: isExportLog,
-                export_data: exportDataParsed ? JSON.stringify(exportDataParsed) : null
-              });
-            }
-          } catch(e){ console.log('usage_stats error', e.message); }
-
-          if(isExportLog && exportDataParsed){
-            try{
-              const info = getClientInfoFull(req);
-              const userInfo = exportDataParsed.userInfo || {};
-              const features = exportDataParsed.features || {};
-              await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
-👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
-📧 <b>Email:</b> ${userInfo.email || 'unknown'}
-📍 <b>IP (client):</b> ${userInfo.ip || info.ip}
-📍 <b>IP (server):</b> ${info.ip}
-${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${info.os}
-🌐 <b>Browser:</b> ${info.browser}
-🖥️ <b>User-Agent:</b> ${info.browserFull.slice(0,250)}
-
-🎨 <b>Tính năng đã dùng:</b>
-🔤 <b>Font:</b> ${features.fontFamily || 'Default'}
-🎵 <b>Audio:</b> ${features.audioStatus || 'N/A'}
-✨ <b>Wipe:</b> ${features.wipeEffect || 'None'}
-📌 <b>Tiêu đề:</b> ${features.useTitle ? 'Có' : 'Không'}
-⏱️ <b>Đếm ngược:</b> ${features.useCountdown ? 'Có' : 'Không'}
-🖼️ <b>Logo:</b> ${features.useLogo ? 'Có' : 'Không'}
-🎲 <b>Logo 3D:</b> ${features.useLogo3D ? 'Có ('+features.logo3DMode+')' : 'Không'}
-💥 <b>Beat Zoom:</b> ${features.useBeatZoom ? 'Có' : 'Không'}
-🎶 <b>Visualizer:</b> ${features.useVisualizer ? 'Có ('+features.vizType+')' : 'Không'}
-📺 <b>Độ phân giải:</b> ${features.resolution || 'Default'}
-🎞️ <b>Timeline:</b> ${features.useTimeline ? 'Có' : 'Không'}
-🖼️ <b>Số ảnh nền:</b> ${features.bgImagesCount || 0}
-🎥 <b>Video nền:</b> ${features.useVideoBg ? 'Có' : 'Không'}
-🎤 <b>Chế độ:</b> ${features.karaokeMode || 'solo'}
-
-🌐 <b>Domain:</b> ${info.domain}
-🔗 <b>Origin:</b> ${info.origin}
-📄 <b>Full URL:</b> ${info.fullUrl}
-⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN')}`).catch(()=>{});
-            }catch(e){ console.warn('[saveUsageStats Telegram] error', e.message); }
-          }
-
-          return sendJSONP({ success:true, isExport: isExportLog });
-        } catch(e){
-          console.error('[saveUsageStats] Exception', e);
-          return sendJSONP({ success:false, msg:e.message });
-        }
-      }
+      case 'saveUsageStats':
       case 'updateProfile': {
         try {
           const email = (params.email||'').toLowerCase().trim();
@@ -1967,6 +1950,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
           try{
             const info = getClientInfo(req);
             await sendTelegramNotification(`🔧 <b>Cập nhật tài khoản</b>
+${await (async () => { try { const v = await getVipInfo(params.email || ''); return formatVipInfo(v); } catch(e){ return ''; } })()}
 📧 <b>Email:</b> ${email}
 👤 <b>Tên mới:</b> ${fullName||user.full_name||'N/A'}
 🔑 <b>Đổi MK:</b> ${newPass ? 'Có' : 'Không'}
@@ -2036,9 +2020,17 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
           if (isExportLog && exportDataParsed) {
             const userInfo = exportDataParsed.userInfo || {};
             const features = exportDataParsed.features || {};
+            // LAY THONG TIN VIP TU DB
+            let vipDataExport = null;
+            let vipInfoExport = '';
+            try {
+              vipDataExport = await getVipInfo(userInfo.email || params.email || '');
+              vipInfoExport = formatVipInfo(vipDataExport);
+            } catch(e) { vipInfoExport = '👑 VIP: Lỗi lấy thông tin'; }
             await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
 👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
 📧 <b>Email:</b> ${userInfo.email || 'unknown'}
+${vipInfoExport}
 📍 <b>IP (client):</b> ${userInfo.ip || info.ip}
 📍 <b>IP (server):</b> ${info.ip}
 ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${info.os}
@@ -2070,13 +2062,19 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
 ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:</b> Được phép'}
 ⏰ <b>Thời gian:</b> ${userInfo.timestamp || new Date().toLocaleString('vi-VN')}`).catch(()=>{});
           } else {
-            // FIX: Luôn gửi Telegram cho mọi truy cập, có đầy đủ thông tin user chi tiết
-            // Trước: chỉ gửi khi TELEGRAM_NOTIFY_ALL_ACCESS=true hoặc bị chặn hoặc blogspot
-            // Sau: luôn gửi, kể cả user login thành công từ www.kararender.com
+            // FIX: Luôn gửi Telegram cho mọi truy cập + VIP INFO
             const userInfo = getUserInfoFromRequest(req, params);
             const fullName = userInfo.fullName || params.fullName || params.name || 'Khách';
             const email = userInfo.email || params.email || 'N/A';
             const browserId = userInfo.browserId || info.browserFull || 'N/A';
+            
+            // LAY VIP INFO CHO LOG TRUY CAP
+            let vipDataAccess = null;
+            let vipInfoAccess = '';
+            try {
+              vipDataAccess = await getVipInfo(email);
+              vipInfoAccess = formatVipInfo(vipDataAccess);
+            } catch(e) { vipInfoAccess = '👑 VIP: Lỗi lấy thông tin'; }
             
             const statusText = isBlocked ? '🚫 BLOCKED' : '✅ Allowed';
             const titleText = isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '🔔 <b>THÔNG BÁO TRUY CẬP</b> ' + statusText;
@@ -2086,6 +2084,7 @@ ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:<
 📄 <b>Full URL:</b> ${info.fullUrl}
 👤 <b>Tên:</b> ${fullName}
 📧 <b>Email:</b> ${email}
+${vipInfoAccess}
 ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.device === 'Mobile' ? 'Điện thoại' : info.device === 'Tablet' ? 'Máy tính bảng' : 'Máy tính'}
 🌐 <b>Browser:</b> ${info.browser}
 📍 <b>IP (server):</b> ${info.ip}
@@ -2260,45 +2259,6 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
     }
 
     console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
-    
-    // ===== THÊM TELEGRAM KHI AUTO DUYỆT VIP =====
-    try{
-      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-      const expireVN = expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-      const autoMsg = `✅🤖 <b>AUTO DUYỆT VIP - KARARENDER</b> 🤖✅
-━━━━━━━━━━━━━━━━━━━━━━
-👤 <b>Email:</b> ${targetUser.email}
-👤 <b>Tên:</b> ${targetUser.full_name||targetUser.email}
-💳 <b>Gói:</b> ${planKey} (${months} tháng)
-💰 <b>Số tiền:</b> ${amount.toLocaleString('vi-VN')}đ
-📝 <b>Nội dung:</b> <code>${content}</code>
-📅 <b>Hạn dùng:</b> ${expireVN}
-⏰ <b>Thời gian:</b> ${timeVN}
-━━━━━━━━━━━━━━━━━━━━━━
-🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
-
-      // gửi trực tiếp
-      try{
-        const token = process.env.TELEGRAM_BOT_TOKEN;
-        const chatId = process.env.TELEGRAM_CHAT_ID;
-        if(token && chatId){
-          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ chat_id: chatId, text: autoMsg, parse_mode:'HTML' })
-          });
-        }
-      }catch(e){ console.warn('[Webhook Telegram Direct] error', e.message); }
-      
-      // gửi qua service nếu có
-      try{
-        const {sendTelegramNotification} = require('./services/telegram');
-        if(sendTelegramNotification) await sendTelegramNotification(autoMsg);
-      }catch(e){}
-      
-      console.log('[Webhook] Telegram auto approve sent');
-    }catch(e){ console.warn('[Webhook Telegram] error', e.message); }
-    
     return res.json({ success:true, autoApproved:true, email: targetUser.email, plan: planKey, expire: expireDate.toISOString() });
   }catch(e){
     console.error('[Webhook Bank] Exception', e);
@@ -2412,32 +2372,88 @@ async function autoCleanupExpiredOTPs(){
 setInterval(autoCleanupExpiredOTPs, 10*60*1000);
 autoCleanupExpiredOTPs();
 
+// ===== AUTO EXPIRE VIP REQUESTS AFTER 10 MINUTES - FRONTEND COUNTDOWN BACKUP =====
+async function autoExpireVipRequests(){
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return;
+    const cutoff = new Date(Date.now() - 10*60*1000).toISOString();
+    const { data: expired, error } = await supabaseAdmin.from('vip_requests').select('id,email,created_at').eq('status','PENDING').lt('created_at', cutoff);
+    if(error){
+      // console.log('[AutoExpire VIP] fetch error', error.message);
+      return;
+    }
+    if(!expired || expired.length===0) return;
+    console.log(`[AutoExpire VIP] Found ${expired.length} expired >10m, auto rejecting...`);
+    for(const req of expired){
+      try{
+        await supabaseAdmin.from('vip_requests').update({
+          status:'REJECTED',
+          reason:'auto_timeout_10m',
+          updated_at:new Date().toISOString()
+        }).eq('id', req.id);
+        // update users table if still pending
+        await supabaseAdmin.from('users').update({
+          vip_status:'REJECTED',
+          updated_at:new Date().toISOString()
+        }).eq('email', req.email).eq('vip_status','PENDING');
+      }catch(e){ console.warn('[AutoExpire VIP] update error', e.message); }
+    }
+  }catch(e){ console.log('[AutoExpire VIP] error', e.message); }
+}
+setInterval(autoExpireVipRequests, 60*1000); // check every 1 minute
+autoExpireVipRequests();
+console.log('[VIP] Auto expire 10m enabled - checking every 60s');
 
-
-
-
-// ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED (KHÔNG AUTO CRON) =====
-async function handleCancelVipGoc(req, res){
+// ===== USER SELF-CANCEL ENDPOINTS - FOR FRONTEND COUNTDOWN TIMEOUT =====
+async function handleCancelVip(req, res){
   try{
     const { email, requestId, reason } = req.body || {};
     const headerEmail = (req.headers['x-user-email'] || '').toLowerCase().trim();
     const targetEmail = (email || headerEmail || '').toLowerCase().trim();
     if(!targetEmail) return res.status(400).json({ success:false, message:'Missing email' });
+    
     const { supabaseAdmin } = require('./services/supabase');
     if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
+
+    // Find pending request for this email
+    let query = supabaseAdmin.from('vip_requests').select('id,email').eq('email', targetEmail).eq('status','PENDING');
     if(requestId){
-      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
-    }else{
-      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
+      // if requestId looks like uuid, try by id, else ignore
+      const isUuid = requestId.length>20 || requestId.includes('-');
+      if(isUuid){
+        const { data: byId } = await supabaseAdmin.from('vip_requests').select('id,email').eq('id', requestId).eq('status','PENDING').single();
+        if(byId){
+          await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'user_timeout_10m', updated_at:new Date().toISOString() }).eq('id', byId.id);
+          await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', byId.email);
+          return res.json({ success:true, message:'Cancelled by timeout', auto:true });
+        }
+      }
     }
+    // fallback: cancel latest pending for this email
+    const { data: latest, error } = await supabaseAdmin.from('vip_requests').select('id,email').eq('email', targetEmail).eq('status','PENDING').order('created_at',{ascending:false}).limit(1).single();
+    if(error || !latest){
+      // still update users table to REJECTED if pending
+      await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('vip_status','PENDING');
+      return res.json({ success:true, message:'No pending found, marked REJECTED', already:false });
+    }
+    await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'user_timeout_10m', updated_at:new Date().toISOString() }).eq('id', latest.id);
     await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
-    return res.json({ success:true });
-  }catch(e){ return res.status(500).json({ success:false, error:e.message }); }
+    console.log(`[Cancel VIP] Auto rejected ${targetEmail} - ${latest.id} reason=${reason}`);
+    return res.json({ success:true, message:'Cancelled', id: latest.id });
+  }catch(e){
+    console.error('[Cancel VIP] error', e.message);
+    return res.status(500).json({ success:false, error:e.message });
+  }
 }
-app.post('/api/cancel-vip', handleCancelVipGoc);
-app.post('/api/request-vip/cancel', handleCancelVipGoc);
-app.post('/api/vip/cancel', handleCancelVipGoc);
-app.post('/api/admin/reject-vip/self', handleCancelVipGoc);
+
+app.post('/api/cancel-vip', handleCancelVip);
+app.post('/api/request-vip/cancel', handleCancelVip);
+app.post('/api/vip/cancel', handleCancelVip);
+app.post('/api/cancel-vip-request', handleCancelVip);
+
+// Also patch admin reject to allow self-reject when auto=true
+app.post('/api/admin/reject-vip/self', handleCancelVip);
 
 
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
