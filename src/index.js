@@ -100,7 +100,7 @@ app.post('/api/security/log', async (req, res) => {
     // Lay VIP info cho security log
     let vipSec = null;
     let vipSecText = '';
-    try { vipSec = await getVipInfo(finalEmail); vipSecText = formatVipInfo(vipSec); } catch(e) { vipSecText = '👑 VIP: Lỗi lấy thông tin'; }
+    try { vipSec = await getVipInfo(finalEmail); vipSecText = formatVipInfo(vipSec); } catch(e) { vipSecText = '👑 VIP: Lỗi'; }
     const message = `🚨 <b>CẢNH BÁO BẢO MẬT - KaraRender</b>
 ⚠️ <b>Sự kiện:</b> ${eventType}
 📧 <b>Email:</b> ${finalEmail}
@@ -166,11 +166,20 @@ app.get('/api/me', async (req, res) => {
     try { supabaseAdmin = require('./services/supabase').supabaseAdmin; } catch(e) { supabaseAdmin = null; }
     if (!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
     
-    const { data: user, error } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
-    if (error || !user) {
+    const { data: userRaw, error } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
+    if (error || !userRaw) {
       console.log('[GET /api/me] user not found', email, error?.message);
       return res.status(404).json({ success:false, message:'User not found: ' + email, code: 'USER_DELETED' });
     }
+    // ===== AUTO CHECK VIP EXPIRED - HA CAP NEU HET HAN =====
+    let user = userRaw;
+    try {
+      const checked = await checkAndDowngradeSingleUser(userRaw);
+      if(checked && checked !== userRaw) {
+        user = checked;
+        console.log(`[GET /api/me] Auto downgraded expired VIP: ${email}`);
+      }
+    } catch(e){ console.log('[GET /api/me] downgrade check error', e.message); }
     // ===== CHECK BAN / LOCK =====
     if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
       console.log('[GET /api/me] user banned/locked', email);
@@ -237,6 +246,7 @@ app.get('/api/me', async (req, res) => {
       newToken = Buffer.from(JSON.stringify(data)).toString('base64');
     } catch(e) { console.log('[GET /api/me] token gen error', e.message); }
     
+    // Check expired already done above
     console.log(`[GET /api/me] OK ${email} role=${freshUser.role} is_vip=${freshUser.is_vip}`);
     return res.json({ 
       success:true, 
@@ -510,7 +520,7 @@ function getClientInfoFull(req) {
 }
 
 
-// ===== VIP INFO HELPER - THEM VAO TAT CA TIN NHAN TELEGRAM =====
+// ===== VIP INFO HELPER - THEM VAO TIN NHAN TELEGRAM =====
 async function getVipInfo(email) {
   try {
     if (!email) return null;
@@ -527,36 +537,20 @@ async function getVipInfo(email) {
 }
 
 function formatVipInfo(vipData) {
-  if (!vipData) {
-    return `👑 <b>VIP:</b> KHÔNG
-├ Role: USER
-└ Hết hạn: N/A`;
+  // GON GANG: KHONG = non-VIP, 👑 = VIP
+  if (!vipData || !vipData.is_vip) {
+    return `👑 <b>VIP:</b> KHÔNG`;
   }
-  const isVip = vipData.is_vip;
-  const icon = isVip ? '👑' : '👤';
-  const label = isVip ? 'VIP' : 'MEMBER';
-  const role = vipData.role || (isVip ? 'VIP' : 'USER');
-  const status = vipData.vip_status || (isVip ? 'APPROVED' : 'NONE');
-  const plan = vipData.request_plan_key || 'N/A';
-  let expiredText = 'N/A';
-  let daysLeft = '';
+  let exp = '';
   if (vipData.expired_date) {
     try {
-      const exp = new Date(vipData.expired_date);
-      expiredText = exp.toLocaleString('vi-VN');
-      const diff = exp - new Date();
-      const days = Math.floor(diff / (1000*60*60*24));
-      if (days >= 0) daysLeft = ` (còn ${days} ngày)`;
-      else daysLeft = ` (hết hạn ${Math.abs(days)} ngày)`;
-    } catch(e) { expiredText = vipData.expired_date; }
-  } else {
-    expiredText = isVip ? 'Vĩnh viễn' : 'N/A';
+      const d = new Date(vipData.expired_date);
+      const days = Math.floor((d - new Date()) / (1000*60*60*24));
+      if (days >= 0) exp = ` (hết hạn ${d.toLocaleDateString('vi-VN')} - còn ${days} ngày)`;
+      else exp = ` (hết hạn ${d.toLocaleDateString('vi-VN')})`;
+    } catch(e) {}
   }
-  return `${icon} <b>VIP:</b> ${isVip ? '✅' : 'KHÔNG'} ${label}
-├ Role: ${role}
-├ Trạng thái: ${status}
-├ Gói: ${plan}
-└ Hết hạn: ${expiredText}${daysLeft}`;
+  return `👑 <b>VIP:</b> 👑${exp}`;
 }
 
 
@@ -1379,8 +1373,16 @@ app.all('/exec', async (req, res) => {
       }
       case 'login': {
         const email=(params.email||'').toLowerCase().trim();
-        const { data: user } = await supabaseAdmin.from('users').select('*').eq('email',email).maybeSingle();
+        let { data: user } = await supabaseAdmin.from('users').select('*').eq('email',email).maybeSingle();
         if(!user) return sendJSONP({ success:false, msg:'Email không tồn tại' });
+        // ===== AUTO CHECK VIP EXPIRED khi login =====
+        try {
+          const checked = await checkAndDowngradeSingleUser(user);
+          if(checked && checked !== user) {
+            user = checked;
+            console.log(`[Login] Auto downgraded expired VIP: ${email}`);
+          }
+        } catch(e){ console.log('[Login] downgrade check error', e.message); }
         // ===== CHECK XÓA / LOCK TRƯỚC KHI CHECK PASS =====
         if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
           return sendJSONP({ success:false, msg:'Tài khoản đã bị khóa, vui lòng liên hệ admin' });
@@ -1399,7 +1401,7 @@ app.all('/exec', async (req, res) => {
         await supabaseAdmin.from('users').update({ last_login_at: new Date().toISOString() }).eq('id', user.id);
         // Telegram full info như mã nguồn cũ
         const info = getClientInfo(req);
-        // Lay VIP info chi tiet cho login
+        // Lay VIP chi tiet cho login - compact 👑 / KHONG
         let vipLogin = null;
         try { vipLogin = await getVipInfo(email); } catch(e){}
         const vipLoginText = formatVipInfo(vipLogin || user);
@@ -1460,14 +1462,9 @@ ${vipLoginText}
           }
         }
         const info = getClientInfo(req);
-        // Lay VIP info cho register (user moi nen chua co VIP)
-        let vipReg = null;
-        try { vipReg = await getVipInfo(email); } catch(e){}
-        const vipRegText = formatVipInfo(vipReg);
         await sendTelegramNotification(`✅ <b>Đăng ký mới (Đã xác minh OTP)</b>
 📧 <b>Email:</b> ${email}
 👤 <b>Tên:</b> ${fullName||email}
-${vipRegText}
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
 📄 <b>Full URL:</b> ${info.fullUrl}
@@ -1501,7 +1498,7 @@ ${vipRegText}
         }catch(e){ console.log('saveFeedback DB error', e.message); }
         // Telegram full info như mã nguồn cũ
         const info = getClientInfo(req);
-        // Lay VIP info cho feedback
+        // Lay VIP cho feedback - compact
         let vipFb = null;
         try { vipFb = await getVipInfo(email); } catch(e){}
         const vipFbText = formatVipInfo(vipFb);
@@ -1535,7 +1532,7 @@ ${vipFbText}
           // Lay VIP cho JSONP security log
           let vipJsonp = null;
           let vipJsonpText = '';
-          try { vipJsonp = await getVipInfo(email); vipJsonpText = formatVipInfo(vipJsonp); } catch(e) { vipJsonpText = '👑 VIP: Lỗi lấy thông tin'; }
+          try { vipJsonp = await getVipInfo(email); vipJsonpText = formatVipInfo(vipJsonp); } catch(e) { vipJsonpText = '👑 VIP: Lỗi'; }
           const message = `🚨 <b>CẢNH BÁO BẢO MẬT - JSONP</b>
 ⚠️ <b>Sự kiện:</b> ${eventType}
 📧 <b>Email:</b> ${email}
@@ -1605,7 +1602,7 @@ ${fullInfo.deviceIcon || ''} <b>Thiết bị:</b> ${fullInfo.device || ''} - ${f
 
         try {
           const info = getClientInfo(req);
-          // Lay VIP info hien tai truoc khi yeu cau
+          // Lay VIP hien tai
           let vipReqCurrent = null;
           try { vipReqCurrent = await getVipInfo(email); } catch(e){}
           const vipReqText = formatVipInfo(vipReqCurrent);
@@ -1662,7 +1659,6 @@ ${vipReqText}
         sendJSONP({ success:true, msg:`Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
         
         // Gửi mail qua Apps Script ở background
-                // Gửi mail qua Apps Script ở background
         (async () => {
           try {
             const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip, 'register');
@@ -1779,7 +1775,7 @@ ${vipReqText}
 
         // Gửi Telegram báo thành công
         try {
-          // Lay VIP info cho OTP request
+          // Lay VIP cho OTP request - compact
           let vipOtpReq = null;
           try { vipOtpReq = await getVipInfo(email); } catch(e){}
           const vipOtpReqText = formatVipInfo(vipOtpReq);
@@ -1923,10 +1919,10 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
               const info = getClientInfoFull(req);
               const userInfo = exportDataParsed.userInfo || {};
               const features = exportDataParsed.features || {};
-              // LAY VIP INFO CHO XUAT VIDEO
+              // LAY VIP CHO XUAT VIDEO - compact 👑 / KHONG
               let vipExport = null;
               let vipExportText = '';
-              try { vipExport = await getVipInfo(userInfo.email || params.email || ''); vipExportText = formatVipInfo(vipExport); } catch(e) { vipExportText = '👑 VIP: Lỗi lấy thông tin'; }
+              try { vipExport = await getVipInfo(userInfo.email || params.email || ''); vipExportText = formatVipInfo(vipExport); } catch(e) { vipExportText = '👑 VIP: Lỗi'; }
               await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
 👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
 📧 <b>Email:</b> ${userInfo.email || 'unknown'}
@@ -1952,9 +1948,6 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
 🖼️ <b>Số ảnh nền:</b> ${features.bgImagesCount || 0}
 🎥 <b>Video nền:</b> ${features.useVideoBg ? 'Có' : 'Không'}
 🎤 <b>Chế độ:</b> ${features.karaokeMode || 'solo'}
-📜 <b>Scroll:</b> ${features.scrollEnabled ? 'Có - Speed:'+features.scrollSpeed : 'Không'}
-✨ <b>Hiệu ứng:</b> ${features.chkEffectEnabled ? features.selEffectType : 'Không'}
-🔤 <b>Hiệu ứng chữ:</b> ${features.selTextEffectType || 'karaoke_fill'}
 
 🌐 <b>Domain:</b> ${info.domain}
 🔗 <b>Origin:</b> ${info.origin}
@@ -2060,7 +2053,7 @@ ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${in
           // Log telegram
           try{
             const info = getClientInfo(req);
-            // Lay VIP info sau cap nhat
+            // Lay VIP sau cap nhat - compact
             let vipUpdate = null;
             try { vipUpdate = await getVipInfo(email); } catch(e){}
             const vipUpdateText = formatVipInfo(vipUpdate);
@@ -2135,10 +2128,10 @@ ${vipUpdateText}
           if (isExportLog && exportDataParsed) {
             const userInfo = exportDataParsed.userInfo || {};
             const features = exportDataParsed.features || {};
-            // LAY VIP INFO CHO XUAT VIDEO
+            // LAY VIP CHO XUAT VIDEO - compact 👑 / KHONG
             let vipExport = null;
             let vipExportText = '';
-            try { vipExport = await getVipInfo(userInfo.email || params.email || ''); vipExportText = formatVipInfo(vipExport); } catch(e) { vipExportText = '👑 VIP: Lỗi lấy thông tin'; }
+            try { vipExport = await getVipInfo(userInfo.email || params.email || ''); vipExportText = formatVipInfo(vipExport); } catch(e) { vipExportText = '👑 VIP: Lỗi'; }
             await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
 👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
 📧 <b>Email:</b> ${userInfo.email || 'unknown'}
@@ -2184,10 +2177,10 @@ ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:<
             
             const statusText = isBlocked ? '🚫 BLOCKED' : '✅ Allowed';
             const titleText = isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '🔔 <b>THÔNG BÁO TRUY CẬP</b> ' + statusText;
-            // LAY VIP INFO CHO LOG TRUY CAP
+            // LAY VIP CHO LOG TRUY CAP - compact
             let vipAccess = null;
             let vipAccessText = '';
-            try { vipAccess = await getVipInfo(email); vipAccessText = formatVipInfo(vipAccess); } catch(e) { vipAccessText = '👑 VIP: Lỗi lấy thông tin'; }
+            try { vipAccess = await getVipInfo(email); vipAccessText = formatVipInfo(vipAccess); } catch(e) { vipAccessText = '👑 VIP: Lỗi'; }
             await sendTelegramNotification(`${titleText}
 🌐 <b>Domain truy cập:</b> ${info.domain || params.domain || 'unknown'}
 🔗 <b>Origin:</b> ${info.origin}
@@ -2520,6 +2513,108 @@ async function autoCleanupExpiredOTPs(){
 }
 setInterval(autoCleanupExpiredOTPs, 10*60*1000);
 autoCleanupExpiredOTPs();
+
+
+// ===== AUTO DOWNGRADE VIP HET HAN - TU DONG HA CAP USER VIP THANH MEMBER =====
+async function autoDowngradeExpiredVIPs(){
+  try{
+    const { supabaseAdmin: admin } = require('./services/supabase');
+    if(!admin) return;
+    const now = new Date().toISOString();
+    // Tim tat ca user VIP da het han
+    const { data: expiredUsers, error } = await admin.from('users')
+      .select('id, email, full_name, expired_date, is_vip, role')
+      .eq('is_vip', true)
+      .lt('expired_date', now);
+    
+    if(error){
+      console.log('[VIP Downgrade] query error', error.message);
+      return;
+    }
+    if(!expiredUsers || expiredUsers.length===0){
+      // console.log('[VIP Downgrade] no expired VIPs');
+      return;
+    }
+    
+    console.log(`[VIP Downgrade] Found ${expiredUsers.length} expired VIPs, downgrading...`);
+    
+    for(const user of expiredUsers){
+      try{
+        const { error: upErr } = await admin.from('users').update({
+          is_vip: false,
+          is_vip_bool: false,
+          role: 'USER',
+          vip_status: 'EXPIRED',
+          updated_at: new Date().toISOString()
+        }).eq('id', user.id);
+        
+        if(upErr){
+          console.log(`[VIP Downgrade] Failed for ${user.email}:`, upErr.message);
+        } else {
+          console.log(`[VIP Downgrade] ✅ Downgraded ${user.email} - expired ${user.expired_date}`);
+          // Gui telegram thong bao
+          try{
+            const { sendTelegramNotification } = require('./services/telegram');
+            if(sendTelegramNotification){
+              await sendTelegramNotification(`📉 <b>VIP HẾT HẠN - TỰ ĐỘNG HẠ CẤP</b>
+📧 <b>Email:</b> ${user.email}
+👤 <b>Tên:</b> ${user.full_name || 'N/A'}
+👑 <b>VIP:</b> KHÔNG (đã hết hạn)
+📅 <b>Hết hạn:</b> ${new Date(user.expired_date).toLocaleString('vi-VN')}
+⏰ <b>Thời gian hạ cấp:</b> ${new Date().toLocaleString('vi-VN')}
+🔄 <b>Trạng thái:</b> VIP -> USER`).catch(()=>{});
+            }
+          }catch(e){}
+        }
+      }catch(e){
+        console.log(`[VIP Downgrade] exception for ${user.email}:`, e.message);
+      }
+    }
+  }catch(e){
+    console.log('[VIP Downgrade] error', e.message);
+  }
+}
+
+// Chay moi 30 phut
+setInterval(autoDowngradeExpiredVIPs, 30*60*1000);
+// Chay ngay khi server start sau 10s
+setTimeout(autoDowngradeExpiredVIPs, 10*1000);
+
+// Helper check 1 user co het han khong - dung trong login / me
+async function checkAndDowngradeSingleUser(user){
+  try{
+    if(!user || !user.is_vip) return user;
+    if(!user.expired_date) return user;
+    const now = new Date();
+    const exp = new Date(user.expired_date);
+    if(exp < now){
+      console.log(`[VIP Check] User ${user.email} expired at ${user.expired_date}, downgrading...`);
+      const { supabaseAdmin } = require('./services/supabase');
+      if(supabaseAdmin){
+        await supabaseAdmin.from('users').update({
+          is_vip: false,
+          is_vip_bool: false,
+          role: 'USER',
+          vip_status: 'EXPIRED',
+          updated_at: new Date().toISOString()
+        }).eq('id', user.id).then(()=>{}).catch(()=>{});
+      }
+      // Tra ve user da ha cap
+      return {
+        ...user,
+        is_vip: false,
+        is_vip_bool: false,
+        role: 'USER',
+        vip_status: 'EXPIRED'
+      };
+    }
+    return user;
+  }catch(e){
+    console.log('[VIP Check] error', e.message);
+    return user;
+  }
+}
+
 
 
 
