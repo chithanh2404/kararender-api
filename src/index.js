@@ -534,7 +534,7 @@ function formatVipInfo(vipData) {
   }
   const isVip = vipData.is_vip;
   const icon = isVip ? '👑' : '👤';
-  const label = isVip ? 'VIP - ĐÃ KÍCH HOẠT' : 'USER thường';
+  const label = isVip ? 'VIP' : 'MEMBER';
   const role = vipData.role || (isVip ? 'VIP' : 'USER');
   const status = vipData.vip_status || (isVip ? 'APPROVED' : 'NONE');
   const plan = vipData.request_plan_key || 'N/A';
@@ -552,7 +552,7 @@ function formatVipInfo(vipData) {
   } else {
     expiredText = isVip ? 'Vĩnh viễn' : 'N/A';
   }
-  return `${icon} <b>VIP:</b> ${isVip ? '✅' : '❌'} ${label}
+  return `${icon} <b>VIP:</b> ${isVip ? '✅' : 'KHÔNG'} ${label}
 ├ Role: ${role}
 ├ Trạng thái: ${status}
 ├ Gói: ${plan}
@@ -1666,12 +1666,7 @@ ${vipReqText}
         (async () => {
           try {
             const emailResult = await sendOTPEmailViaAppsScript(email, otp, fullName || userInfo.fullName || '', info.ip, 'register');
-            // Lay VIP info cho OTP dang ky
-            let vipOtpReg = null;
-            let vipOtpRegText = '';
-            try { vipOtpReg = await getVipInfo(email); vipOtpRegText = formatVipInfo(vipOtpReg); } catch(e) { vipOtpRegText = '👑 VIP: Lỗi'; }
-            const vipOtpRegInline = vipOtpRegText.replace(/\n/g, '\\n');
-            await sendTelegramNotification(`🔐 <b>OTP ĐĂNG KÝ</b>\\n👤 <b>Tên:</b> ${fullName || userInfo.fullName} - ${email}\\n📧 <b>Email:</b> ${email}\\n${vipOtpRegInline}\\n🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}\\n🌐 <b>Domain:</b> ${info.domain}\\n🔗 <b>Origin:</b> ${info.origin}\\n📍 <b>IP:</b> ${info.ip}\\n${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}\\n🌐 <b>Browser:</b> ${info.browser}\\n⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
+            await sendTelegramNotification(`🔐 <b>OTP ĐĂNG KÝ</b>\n👤 <b>Tên:</b> ${fullName || userInfo.fullName} - ${email}\n📧 <b>Email:</b> ${email}\n🔢 <b>OTP:</b> ${otp} (5 phút) - ${emailResult.success ? 'Đã gửi mail ✅ via Apps Script' : 'Chưa gửi mail ⚠️: ' + (emailResult.error||'')}\n🌐 <b>Domain:</b> ${info.domain}\n🔗 <b>Origin:</b> ${info.origin}\n📍 <b>IP:</b> ${info.ip}\n${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}\n🌐 <b>Browser:</b> ${info.browser}\n⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`).catch(()=>{});
           } catch (e) {
             console.log('Background sendRegisterOTP email/telegram error', e.message);
           }
