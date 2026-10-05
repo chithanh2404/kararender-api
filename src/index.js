@@ -528,7 +528,7 @@ async function getVipInfo(email) {
 
 function formatVipInfo(vipData) {
   if (!vipData) {
-    return `👑 <b>VIP:</b> ❌ USER thường
+    return `👑 <b>VIP:</b> KHÔNG
 ├ Role: USER
 └ Hết hạn: N/A`;
   }
