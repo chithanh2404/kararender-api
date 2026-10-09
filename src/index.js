@@ -341,53 +341,62 @@ async function sendOTPEmailViaAppsScript(toEmail, otp, userName = '', clientIp =
   try {
     const appsScriptUrl = process.env.APPS_SCRIPT_URL || process.env.APPS_SCRIPT_EMAIL_URL || PRIMARY_APPS_SCRIPT_URL;
     const otpType = type === 'register' ? 'register' : 'forgot';
-    
-    // OPTIMIZED V8: Chỉ thử 1 URL chính, không thử 3 URL nữa để nhanh hơn
     const mainUrl = `${appsScriptUrl}${appsScriptUrl.includes('?') ? '&' : '?'}action=sendOTPEmail&email=${encodeURIComponent(toEmail)}&otp=${encodeURIComponent(otp)}&type=${otpType}&ip=${encodeURIComponent(clientIp || '')}&name=${encodeURIComponent(userName || '')}`;
     
-    console.log(`[Email AppsScript V8] Sending OTP ${otp} to ${toEmail} via ${mainUrl.slice(0,120)}...`);
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000); // Giảm từ 15s xuống 8s
-    
-    try {
-      const res = await fetch(mainUrl, { 
-        method: 'GET', 
-        headers: { 'User-Agent': 'KaraRender-Backend' },
-        redirect: 'follow',
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-      
-      const result = await res.text();
-      console.log(`[Email AppsScript V8] Response (${result.length} chars): ${result.slice(0,400)}`);
-      
-      if (result.includes('"success":false') || result.includes('❌')) {
-        if (result.toLowerCase().includes('quá nhiều') || result.includes('1 giờ') || result.includes('IP')) {
-          return { success: false, error: result.slice(0,500), isRateLimit: true };
+    console.log(`[Email AppsScript V9] Sending OTP ${otp} to ${toEmail}`);
+
+    // FIX: Tăng timeout từ 8s -> 20s, và thử 2 lần
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20000); // 20s
+      try {
+        const res = await fetch(mainUrl, { 
+          method: 'GET', 
+          headers: { 'User-Agent': 'KaraRender-Backend-V9' },
+          redirect: 'follow',
+          signal: controller.signal
+        });
+        clearTimeout(timeout);
+        const result = await res.text();
+        console.log(`[Email AppsScript V9] Attempt ${attempt} Response (${result.length}): ${result.slice(0,500)}`);
+        
+        if (result.includes('"success":false') || (result.includes('❌') && !result.includes('Đã gửi'))) {
+          if (result.toLowerCase().includes('quá nhiều') || result.includes('1 giờ') || result.toLowerCase().includes('ip') || result.toLowerCase().includes('rate limit')) {
+            return { success: false, error: result.slice(0,500), isRateLimit: true };
+          }
+          // Nếu là lỗi khác, vẫn thử lại lần 2
+          if (attempt === 2) return { success: false, error: result.slice(0,500) };
+          continue;
         }
-        return { success: false, error: result.slice(0,500) };
+        
+        // Thành công: chứa các từ khóa này hoặc HTTP 200
+        if (result.includes('Đã gửi') || result.includes('Mã OTP đã được gửi') || result.includes('success') || result.includes('"success":true') || result.includes('cb(') || res.ok) {
+          return { success: true, via: 'appscript-v9', raw: result.slice(0,300), usedOtp: otp };
+        }
+        
+        if (attempt === 2) return { success: false, error: result.slice(0,500) };
+      } catch (fetchErr) {
+        clearTimeout(timeout);
+        console.log(`[Email AppsScript V9] Attempt ${attempt} Fetch error:`, fetchErr.message);
+        if (fetchErr.name === 'AbortError' || fetchErr.message.includes('aborted')) {
+          console.log('[Email AppsScript V9] Timeout aborted, retrying...');
+          if (attempt === 2) {
+            return { success: false, error: `Timeout after 20s x2: ${fetchErr.message}` };
+          }
+          // Đợi 1s rồi retry
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        if (attempt === 2) return { success: false, error: fetchErr.message };
       }
-      
-      if (result.includes('Đã gửi') || result.includes('Mã OTP đã được gửi') || result.includes('success') || result.includes('"success":true') || result.includes('cb(')) {
-        return { success: true, via: 'appscript-v8', raw: result.slice(0,300), usedOtp: otp };
-      }
-      
-      // Nếu không rõ, coi như thành công nếu status 200
-      if (res.ok) {
-        return { success: true, via: 'appscript-v8-fallback', raw: result.slice(0,300), usedOtp: otp };
-      }
-      
-      return { success: false, error: result.slice(0,500) };
-    } catch (fetchErr) {
-      clearTimeout(timeout);
-      console.log('[Email AppsScript V8] Fetch error:', fetchErr.message);
-      return { success: false, error: fetchErr.message };
     }
+    return { success: false, error: 'Unknown error after 2 attempts' };
   } catch (e) {
-    console.error('[Email AppsScript V8] Outer error', e.message);
+    console.error('[Email AppsScript V9] Outer error', e.message);
     return { success: false, error: e.message };
   }
 }
+
 
 
 
@@ -1750,86 +1759,64 @@ ${vipReqText}
           console.log('[sendOTP] Exception check email', checkEx.message);
         }
 
-        // ===== TẠO OTP + LƯU NHANH V8 =====
+        // ===== FIX V3: LƯU OTP TRƯỚC, TRẢ VỀ NGAY, GỬI MAIL BACKGROUND (giống sendRegisterOTP) =====
         const otp = Math.floor(100000+Math.random()*900000).toString();
         const expiresAt = new Date(Date.now()+5*60*1000).toISOString();
+        const createdAt = new Date().toISOString();
         const info = getClientInfoFull(req);
         const userInfo = getUserInfoFromRequest(req, params);
 
-        // Gửi qua Apps Script và CHỜ kết quả để biết có bị chặn IP không
-        let emailResult;
+        // 1. Lưu OTP vào DB TRƯỚC (xóa cũ để tránh unique conflict)
         try {
-          emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip, 'forgot');
-          console.log(`[sendOTP] Apps Script result for ${email}:`, JSON.stringify(emailResult).slice(0,500));
-        } catch (e) {
-          console.log('[sendOTP] Apps Script exception', e.message);
-          emailResult = { success: false, error: e.message };
-        }
-
-        // Nếu Apps Script báo chặn -> trả về lỗi chặn ngay, KHÔNG lưu OTP vào Supabase
-        if (!emailResult || !emailResult.success) {
-          const errStr = (emailResult && (emailResult.error || JSON.stringify(emailResult)) || '').toString();
-          const lower = errStr.toLowerCase();
-          if (lower.includes('quá nhiều') || lower.includes('1 giờ') || lower.includes('ip') || lower.includes('rate limit') || lower.includes('quá số lần')) {
-            return sendJSONP({ success: false, msg: 'Bạn đã gửi yêu cầu quá số lần cho phép, vui lòng đợi 60 phút.', code: 'RATE_LIMIT', detail: errStr.slice(0,300) });
-          }
-          // Lỗi gửi mail khác
-          console.log(`[sendOTP] Email failed for ${email}: ${errStr}`);
-          return sendJSONP({ success: false, msg: 'Không gửi được email OTP, vui lòng thử lại sau: ' + errStr.slice(0,200) });
-        }
-
-        // Email gửi thành công -> mới lưu OTP vào Supabase
-        // FIX: Xóa TẤT CẢ OTP cũ của email này (cả register và forgot) vì bảng có unique constraint trên email
-        try {
-          // Xóa hết để tránh lỗi duplicate key khi bảng unique theo email
-          const delRes = await supabaseAdmin.from('otps').delete().eq('email',email);
-          console.log(`[OTP] Deleted old OTPs for ${email}`, delRes.error ? delRes.error.message : 'ok');
-          
-          const { data: insData, error: insErr } = await supabaseAdmin.from('otps').insert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false }).select();
+          await supabaseAdmin.from('otps').delete().eq('email', email);
+          const { error: insErr } = await supabaseAdmin.from('otps').insert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: createdAt, is_used:false });
           if (insErr) {
-            console.log('[OTP] Insert error, trying upsert:', insErr.message);
-            // Fallback upsert - ghi đè luôn dòng cũ
-            const { error: upErr } = await supabaseAdmin.from('otps').upsert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: new Date().toISOString(), is_used:false }, { onConflict:'email' });
-            if (upErr) {
-              console.log('[OTP] Upsert also failed:', upErr.message);
-              throw upErr;
-            }
+            await supabaseAdmin.from('otps').upsert({ email, otp, type:'forgot', expires_at: expiresAt, created_at: createdAt, is_used:false }, { onConflict:'email' });
           }
-          console.log(`[OTP] Saved ${otp} for ${email} to Supabase type=forgot SUCCESS`);
-        } catch (e) { 
-          console.log('OTP save error FINAL', e.message);
-          // Vẫn thử upsert lần cuối
-          try { 
-            await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: new Date().toISOString(), type:'forgot', is_used:false }, { onConflict:'email' }); 
-            console.log('[OTP] Saved via final upsert');
-          } catch(e2) {
-            console.log('[OTP] Final upsert failed', e2.message);
-            // Trả về lỗi luôn để client biết, thay vì báo thành công giả
-            return sendJSONP({ success: false, msg: 'Lỗi lưu OTP vào DB: ' + e2.message + ' (gốc: ' + e.message + ')' });
-          }
+          console.log(`[OTP V3] Saved ${otp} for ${email} SUCCESS`);
+        } catch (e) {
+          console.log('[OTP V3] Save error', e.message);
+          try { await supabaseAdmin.from('otps').upsert({ email, otp, expires_at: expiresAt, created_at: createdAt, type:'forgot', is_used:false }, { onConflict:'email' }); } catch(e2){}
         }
 
-        // Gửi Telegram báo thành công
-        try {
-          // Lay VIP cho OTP request - compact
-          let vipOtpReq = null;
-          try { vipOtpReq = await getVipInfo(email); } catch(e){}
-          const vipOtpReqText = formatVipInfo(vipOtpReq);
-          await sendTelegramNotification(`🔑 <b>OTP Request - THÀNH CÔNG</b>
+        // 2. Trả về client NGAY để frontend chuyển qua modal nhập OTP
+        sendJSONP({ success: true, msg: `Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
+
+        // 3. Gửi mail + Telegram ở background (không block response)
+        (async () => {
+          let emailResult;
+          try {
+            emailResult = await sendOTPEmailViaAppsScript(email, otp, params.fullName || userInfo.fullName || '', info.ip, 'forgot');
+            console.log(`[sendOTP V3 BG] Apps Script result for ${email}:`, JSON.stringify(emailResult).slice(0,500));
+            if (!emailResult || !emailResult.success) {
+              console.log(`[sendOTP V3 BG] Apps Script failed, trying SMTP fallback...`);
+              const smtpResult = await sendOTPEmail(email, otp, params.fullName || userInfo.fullName || '');
+              console.log(`[sendOTP V3 BG] SMTP result:`, JSON.stringify(smtpResult).slice(0,500));
+              emailResult = smtpResult;
+            }
+          } catch (e) {
+            console.log('[sendOTP V3 BG] exception', e.message);
+            emailResult = { success: false, error: e.message };
+            try { emailResult = await sendOTPEmail(email, otp, params.fullName || userInfo.fullName || ''); } catch(e2){}
+          }
+
+          try {
+            let vipOtpReq = null;
+            try { vipOtpReq = await getVipInfo(email); } catch(e){}
+            const vipOtpReqText = formatVipInfo(vipOtpReq);
+            const mailStatus = emailResult && emailResult.success ? 'Đã gửi mail ✅ via ' + (emailResult.via||'AppsScript/SMTP') : 'Gửi mail lỗi ⚠️: ' + (emailResult?.error||'unknown').slice(0,200);
+            await sendTelegramNotification(`🔑 <b>OTP Request V3 - ${emailResult && emailResult.success ? 'THÀNH CÔNG' : 'CẢNH BÁO'}</b>
 👤 <b>User:</b> ${userInfo.fullName} - ${email}
 📧 <b>Email:</b> ${email}
 ${vipOtpReqText}
-🔢 <b>OTP:</b> ${otp} (5 phút) - Đã gửi mail ✅ via Apps Script
+🔢 <b>OTP:</b> ${otp} (5 phút) - ${mailStatus}
 🌐 <b>Domain:</b> ${info.domain}
-🔗 <b>Origin:</b> ${info.origin}
 📍 <b>IP:</b> ${info.ip}
-${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os}
-🌐 <b>Browser:</b> ${info.browser}
 ⏰ <b>Thời gian:</b> ${new Date().toLocaleString('vi-VN')}`);
-        } catch(e) { console.log('Telegram error', e.message); }
+          } catch(e) { console.log('Telegram V3 error', e.message); }
+        })();
 
-        // Trả về client thành công thật sự
-        return sendJSONP({ success: true, msg: `Mã OTP đã được gửi tới email ${email}. Vui lòng kiểm tra hộp thư (cả spam).` });
+        return;
       }
 
       case 'verifyAndResetPassword':
