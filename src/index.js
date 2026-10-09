@@ -573,7 +573,7 @@ async function getVipInfo(email) {
     if (clean === 'chưa đăng nhập' || clean === 'unknown' || clean === 'n/a' || clean === '' || !clean.includes('@')) return null;
     const { supabaseAdmin } = require('./services/supabase');
     if (!supabaseAdmin) return null;
-    const { data } = await supabaseAdmin.from('users').select('email, full_name, role, is_vip, expired_date, vip_status, request_plan_key, created_at').eq('email', clean).maybeSingle();
+    const { data } = await supabaseAdmin.from('users').select('*').eq('email', clean).maybeSingle();
     return data || null;
   } catch(e) {
     console.log('[getVipInfo] error', e.message);
@@ -582,7 +582,6 @@ async function getVipInfo(email) {
 }
 
 function formatVipInfo(vipData) {
-  // GON GANG: KHONG = non-VIP, 👑 = VIP
   if (!vipData || !vipData.is_vip) {
     return `👑 <b>VIP:</b> KHÔNG`;
   }
@@ -597,6 +596,43 @@ function formatVipInfo(vipData) {
   }
   return `👑 <b>VIP:</b> 👑${exp}`;
 }
+
+// ===== TRIAL INFO HELPER - Chính xác theo schema Supabase hiện tại =====
+// Schema bạn cung cấp: { trial_used: 3, is_vip: true/false, ... }
+// trial_limit mặc định 3 cho FREE, VIP = unlimited
+
+function formatTrialInfo(userData) {
+  try {
+    if (!userData) return '';
+    
+    // Nếu là VIP
+    if (userData.is_vip || userData.is_vip_bool) {
+      const used = parseInt(userData.trial_used) || 0;
+      return `🆓 <b>Trial:</b> VIP không giới hạn (đã dùng ${used} lần free trước khi lên VIP)`;
+    }
+
+    // FREE USER
+    const used = parseInt(userData.trial_used) || 0;
+    const limit = parseInt(userData.trial_limit) || parseInt(userData.free_trial_limit) || 3; // mặc định 3
+    const remaining = Math.max(0, limit - used);
+
+    let icon = '🟢';
+    if (remaining === 0) icon = '🔴 HẾT';
+    else if (remaining === 1) icon = '🟡';
+
+    return `${icon} <b>Trial còn lại:</b> ${remaining}/${limit} (đã dùng ${used}/${limit})`;
+  } catch(e) {
+    return '';
+  }
+}
+
+async function getTrialInfoWithCount(email) {
+  // Đã có đủ data từ getVipInfo(select *), nên hàm này chỉ là fallback
+  // Giữ lại để tương thích code cũ, nhưng sẽ không cần query thêm
+  return '';
+}
+
+
 
 
 function getUserInfoFromRequest(req, params) {
@@ -1943,13 +1979,15 @@ ${vipOtpReqText}
               const userInfo = exportDataParsed.userInfo || {};
               const features = exportDataParsed.features || {};
               // LAY VIP CHO XUAT VIDEO - compact 👑 / KHONG
-              let vipExport = null;
+                let vipExport = null;
               let vipExportText = '';
-              try { vipExport = await getVipInfo(userInfo.email || params.email || ''); vipExportText = formatVipInfo(vipExport); } catch(e) { vipExportText = '👑 VIP: Lỗi'; }
+              let trialExportText = '';
+              try { vipExport = await getVipInfo(userInfo.email || params.email || ''); vipExportText = formatVipInfo(vipExport); trialExportText = formatTrialInfo(vipExport); } catch(e) { vipExportText = '👑 VIP: Lỗi'; }
               await sendTelegramNotification(`🎬 <b>XUẤT VIDEO THÀNH CÔNG</b>
 👤 <b>User:</b> ${userInfo.fullName || 'Unknown'} - ${userInfo.email || params.email || 'unknown'}
 📧 <b>Email:</b> ${userInfo.email || 'unknown'}
 ${vipExportText}
+${trialExportText}
 📍 <b>IP (client):</b> ${userInfo.ip || info.ip}
 📍 <b>IP (server):</b> ${info.ip}
 ${info.deviceIcon} <b>Thiết bị:</b> ${userInfo.device || info.device} - ${info.os}
@@ -2200,10 +2238,11 @@ ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:<
             
             const statusText = isBlocked ? '🚫 BLOCKED' : '✅ Allowed';
             const titleText = isBlocked ? '⛔ <b>BLOCKED - Truy cập bị chặn</b>' : '🔔 <b>THÔNG BÁO TRUY CẬP</b> ' + statusText;
-            // LAY VIP CHO LOG TRUY CAP - compact
+            // LAY VIP + TRIAL CHO LOG TRUY CAP
             let vipAccess = null;
             let vipAccessText = '';
-            try { vipAccess = await getVipInfo(email); vipAccessText = formatVipInfo(vipAccess); } catch(e) { vipAccessText = '👑 VIP: Lỗi'; }
+            let trialAccessText = '';
+            try { vipAccess = await getVipInfo(email); vipAccessText = formatVipInfo(vipAccess); trialAccessText = formatTrialInfo(vipAccess); } catch(e) { vipAccessText = '👑 VIP: Lỗi'; }
             await sendTelegramNotification(`${titleText}
 🌐 <b>Domain truy cập:</b> ${info.domain || params.domain || 'unknown'}
 🔗 <b>Origin:</b> ${info.origin}
@@ -2211,6 +2250,7 @@ ${isBlocked ? '🚫 <b>Trạng thái:</b> BỊ CHẶN' : '✅ <b>Trạng thái:<
 👤 <b>Tên:</b> ${fullName}
 📧 <b>Email:</b> ${email}
 ${vipAccessText}
+${trialAccessText}
 ${info.deviceIcon} <b>Thiết bị:</b> ${info.device} - ${info.os} - ${info.device === 'Mobile' ? 'Điện thoại' : info.device === 'Tablet' ? 'Máy tính bảng' : 'Máy tính'}
 🌐 <b>Browser:</b> ${info.browser}
 📍 <b>IP (server):</b> ${info.ip}
