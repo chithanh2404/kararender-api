@@ -29,6 +29,42 @@ const app = express();
 const PORT = config.PORT;
 app.set('trust proxy', true);
 
+// ===== FIX: Rate Limit Memory cho OTP - Thiếu nên gây lỗi __checkRateLimit is not defined =====
+const __otpBuckets = new Map();
+
+function __checkRateLimit(key, max, windowMs) {
+  const now = Date.now();
+  const entry = __otpBuckets.get(key);
+  
+  if (!entry || (now - entry.start > windowMs)) {
+    // Hết window hoặc chưa có -> tạo mới
+    __otpBuckets.set(key, { count: 1, start: now });
+    return { blocked: false, count: 1 };
+  }
+  
+  entry.count++;
+  __otpBuckets.set(key, entry);
+  
+  if (entry.count > max) {
+    const retryAfter = Math.ceil((entry.start + windowMs - now) / 1000);
+    return { blocked: true, count: entry.count, retryAfter };
+  }
+  
+  return { blocked: false, count: entry.count };
+}
+
+// Auto cleanup bucket cũ mỗi 15 phút để không tràn RAM
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of __otpBuckets.entries()) {
+    if (now - v.start > 3600000) {
+      __otpBuckets.delete(k);
+    }
+  }
+}, 15 * 60 * 1000);
+
+
+
 // FIX: Helmet phải tắt hết cross-origin để không bị Failed to fetch từ Blogger
 app.use(helmet({ 
   crossOriginResourcePolicy: false, 
