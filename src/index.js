@@ -2558,7 +2558,7 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
 
     console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
     
-    // ===== THÊM TELEGRAM KHI AUTO DUYỆT VIP =====
+    // ===== TELEGRAM AUTO DUYỆT VIP - CHỈ GỬI 1 LẦN, KHÔNG DUPLICATE =====
     try{
       const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
       const expireVN = expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
@@ -2574,27 +2574,49 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
 ━━━━━━━━━━━━━━━━━━━━━━
 🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
 
-      // gửi trực tiếp
-      try{
-        const token = process.env.TELEGRAM_BOT_TOKEN;
-        const chatId = process.env.TELEGRAM_CHAT_ID;
-        if(token && chatId){
-          await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      let sent = false;
+      
+      // Thử gửi trực tiếp 1 lần duy nhất (có retry 2 lần nếu fail)
+      for(let attempt=1; attempt<=2 && !sent; attempt++){
+        try{
+          const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+          const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+          if(!token || !chatId){
+            console.warn('[AUTO VIP] Missing TELEGRAM_BOT_TOKEN or CHAT_ID');
+            break;
+          }
+          const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body: JSON.stringify({ chat_id: chatId, text: autoMsg, parse_mode:'HTML' })
           });
+          const data = await resp.json().catch(()=>({}));
+          if(data.ok){
+            console.log(`[AUTO VIP] Telegram sent OK attempt ${attempt} for ${targetUser.email}`);
+            sent = true;
+          }else{
+            console.warn(`[AUTO VIP] Telegram API fail attempt ${attempt}`, JSON.stringify(data).slice(0,500));
+          }
+        }catch(e){
+          console.warn(`[AUTO VIP] Telegram direct error attempt ${attempt}`, e.message);
         }
-      }catch(e){ console.warn('[Webhook Telegram Direct] error', e.message); }
+        if(!sent && attempt<2) await new Promise(r=>setTimeout(r, 800));
+      }
       
-      // gửi qua service nếu có
-      try{
-        const {sendTelegramNotification} = require('./services/telegram');
-        if(sendTelegramNotification) await sendTelegramNotification(autoMsg);
-      }catch(e){}
+      // Nếu direct fail thì mới fallback qua service (chỉ 1 trong 2, không gửi cả 2)
+      if(!sent){
+        try{
+          const {sendTelegramNotification} = require('./services/telegram');
+          if(sendTelegramNotification){
+            console.log('[AUTO VIP] Fallback via sendTelegramNotification service...');
+            await sendTelegramNotification(autoMsg);
+            sent = true;
+          }
+        }catch(e){ console.warn('[AUTO VIP] Service fallback error', e.message); }
+      }
       
-      console.log('[Webhook] Telegram auto approve sent');
-    }catch(e){ console.warn('[Webhook Telegram] error', e.message); }
+      console.log(`[Webhook] AUTO VIP telegram final sent=${sent} for ${targetUser.email}`);
+    }catch(e){ console.warn('[Webhook Telegram] outer error', e.message); }
     
     return res.json({ success:true, autoApproved:true, email: targetUser.email, plan: planKey, expire: expireDate.toISOString() });
   }catch(e){
