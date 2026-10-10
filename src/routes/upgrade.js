@@ -25,27 +25,63 @@ try {
   console.error('[upgrade.js V11] createClient failed', e.message);
 }
 
-// FIX TELEGRAM - gửi trực tiếp, không phụ thuộc services/telegram
+// FIX TELEGRAM - gửi trực tiếp, không phụ thuộc services/telegram - V2 có retry và log rõ
 async function sendTelegramDirect(message){
   try{
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.TELEGRAM_CHAT_ID;
+    const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
     if(!token || !chatId){
-      console.warn('[Telegram Direct] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID');
+      console.warn('[Telegram Direct] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID - token:', !!token, 'chat:', !!chatId);
       return false;
     }
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
-    const res = await fetch(url, {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ chat_id: chatId, text: message, parse_mode:'HTML' })
-    });
-    const data = await res.json().catch(()=>({}));
-    if(data.ok) console.log('[Telegram Direct] Sent OK');
-    else console.warn('[Telegram Direct] API fail', JSON.stringify(data).slice(0,500));
-    return data.ok;
+    for(let attempt=1; attempt<=2; attempt++){
+      try{
+        const res = await fetch(url, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ chat_id: chatId, text: message, parse_mode:'HTML' })
+        });
+        const data = await res.json().catch(()=>({}));
+        if(data.ok){
+          console.log(`[Telegram Direct] Sent OK attempt ${attempt}`);
+          return true;
+        } else {
+          console.warn(`[Telegram Direct] API fail attempt ${attempt}`, JSON.stringify(data).slice(0,800));
+        }
+      }catch(e){
+        console.warn(`[Telegram Direct] fetch error attempt ${attempt}`, e.message);
+      }
+      if(attempt<2) await new Promise(r=>setTimeout(r, 1000));
+    }
+    return false;
   }catch(e){
     console.error('[Telegram Direct] Error', e.message);
+    return false;
+  }
+}
+
+// Helper gửi AUTO DUYỆT VIP - dùng chung
+async function sendAutoVipTelegram({email, fullName, planKey, months, amount, content, expireDate}){
+  try{
+    const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+    const expireVN = expireDate ? expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }) : 'N/A';
+    const msg = `✅🤖 <b>AUTO DUYỆT VIP - KARARENDER</b> 🤖✅
+━━━━━━━━━━━━━━━━━━━━━━
+👤 <b>Email:</b> ${email}
+👤 <b>Tên:</b> ${fullName||email}
+💳 <b>Gói:</b> ${planKey} (${months} tháng)
+💰 <b>Số tiền:</b> ${Number(amount||0).toLocaleString('vi-VN')}đ
+📝 <b>Nội dung:</b> <code>${content||'N/A'}</code>
+📅 <b>Hạn dùng:</b> ${expireVN}
+⏰ <b>Thời gian:</b> ${timeVN}
+━━━━━━━━━━━━━━━━━━━━━━
+🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
+    const ok = await sendTelegramDirect(msg);
+    console.log('[AUTO VIP Telegram] sent:', ok, 'for', email);
+    return ok;
+  }catch(e){
+    console.warn('[AUTO VIP Telegram] error', e.message);
     return false;
   }
 }
@@ -178,6 +214,142 @@ router.get('/admin/pending-vip', async (req,res)=>{
   }
 });
 
+// ===== THỐNG KÊ NẠP VIP - ADMIN DASHBOARD =====
+router.get('/admin/vip-stats', async (req,res)=>{
+  try{
+    if(!supabaseAdmin){
+      return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    }
+    // Lấy tất cả vip_requests APPROVED (đã nạp thành công)
+    const {data: allData, error} = await supabaseAdmin.from('vip_requests').select('email, full_name, amount, plan_key, created_at, updated_at, status').eq('status','APPROVED').order('created_at',{ascending:false}).limit(1000);
+    if(error){
+      console.error('[vip-stats] error', error.message);
+      return res.status(500).json({success:false, message:error.message});
+    }
+    const records = allData||[];
+    
+    // Helper lấy ngày VN YYYY-MM-DD
+    const getVNDateStr = (d)=>{
+      try{
+        return new Date(d).toLocaleDateString('en-CA',{timeZone:'Asia/Ho_Chi_Minh'});
+      }catch{ return new Date(d).toISOString().slice(0,10); }
+    };
+    const getVNMonthStr = (d)=>{
+      try{
+        const dt = new Date(d);
+        const y = dt.toLocaleDateString('en-CA',{timeZone:'Asia/Ho_Chi_Minh', year:'numeric'});
+        const m = dt.toLocaleDateString('en-CA',{timeZone:'Asia/Ho_Chi_Minh', month:'2-digit'});
+        // en-CA returns YYYY-MM-DD, so extract
+        const full = dt.toLocaleDateString('en-CA',{timeZone:'Asia/Ho_Chi_Minh'});
+        return full.slice(0,7); // YYYY-MM
+      }catch{
+        return new Date(d).toISOString().slice(0,7);
+      }
+    };
+    
+    const nowVNStr = new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Ho_Chi_Minh'});
+    const nowMonthStr = nowVNStr.slice(0,7);
+    
+    // Tổng hôm nay
+    let todayTotal = 0, todayCount = 0;
+    // Tổng tháng này
+    let monthTotal = 0, monthCount = 0;
+    // Tổng tất cả
+    let totalAll = 0;
+    
+    // Theo user
+    const userMap = new Map(); // email -> {email, full_name, total, count}
+    
+    // Theo ngày 30 ngày
+    const dailyMap = new Map(); // YYYY-MM-DD -> total
+    // Tạo 30 ngày gần nhất
+    const last30Days = [];
+    for(let i=29; i>=0; i--){
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const vnStr = getVNDateStr(d);
+      last30Days.push(vnStr);
+      dailyMap.set(vnStr, 0);
+    }
+    
+    for(const r of records){
+      const amt = parseInt(r.amount)||0;
+      const dateStr = getVNDateStr(r.created_at);
+      const monthStr = dateStr.slice(0,7);
+      
+      totalAll += amt;
+      
+      // hôm nay
+      if(dateStr === nowVNStr){
+        todayTotal += amt;
+        todayCount++;
+      }
+      // tháng này
+      if(monthStr === nowMonthStr){
+        monthTotal += amt;
+        monthCount++;
+      }
+      // user
+      const key = (r.email||'').toLowerCase();
+      if(key){
+        if(!userMap.has(key)){
+          userMap.set(key, {email: r.email, full_name: r.full_name||r.email, total:0, count:0, last_date: r.created_at});
+        }
+        const u = userMap.get(key);
+        u.total += amt;
+        u.count++;
+        if(new Date(r.created_at) > new Date(u.last_date)) u.last_date = r.created_at;
+      }
+      // daily 30 ngày
+      if(dailyMap.has(dateStr)){
+        dailyMap.set(dateStr, (dailyMap.get(dateStr)||0) + amt);
+      }
+    }
+    
+    // Tính trung bình
+    const avgPerTransaction = records.length ? Math.round(totalAll / records.length) : 0;
+    const avgPerDay = last30Days.length ? Math.round(totalAll / 30) : 0; // trung bình 30 ngày
+    // trung bình theo ngày có giao dịch
+    const daysWithData = [...dailyMap.values()].filter(v=>v>0).length;
+    const avgPerActiveDay = daysWithData ? Math.round(totalAll / daysWithData) : 0;
+    
+    // Top user theo tổng nạp
+    const topUsers = [...userMap.values()].sort((a,b)=>b.total - a.total).slice(0,50);
+    
+    // Biểu đồ 30 ngày
+    const chartData = last30Days.map(date=>{
+      return {date, total: dailyMap.get(date)||0};
+    });
+    
+    // Tổng theo gói
+    const planMap = new Map();
+    for(const r of records){
+      const k = r.plan_key||'unknown';
+      if(!planMap.has(k)) planMap.set(k, {plan_key:k, total:0, count:0});
+      const p = planMap.get(k);
+      p.total += parseInt(r.amount)||0;
+      p.count++;
+    }
+    const byPlan = [...planMap.values()].sort((a,b)=>b.total-a.total);
+    
+    res.json({
+      success:true,
+      today: {total: todayTotal, count: todayCount, date: nowVNStr},
+      month: {total: monthTotal, count: monthCount, month: nowMonthStr},
+      total: {total: totalAll, count: records.length},
+      avg: {perTransaction: avgPerTransaction, perDay: avgPerDay, perActiveDay: avgPerActiveDay, daysWithData},
+      topUsers,
+      chart: chartData,
+      byPlan,
+      last30Days,
+      _count: records.length
+    });
+  }catch(e){
+    console.error('[vip-stats] fatal', e.message, e.stack);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
 
 router.post('/request-vip', async (req,res)=>{
   try{
@@ -266,7 +438,7 @@ router.post('/request-vip', async (req,res)=>{
 ⏰ <b>Thời gian:</b> ${timeVN}
 🆔 <b>Request ID:</b> <code>${inserted?.id||'N/A'}</code>
 ━━━━━━━━━━━━━━━━━━━━━━
-⚡Hệ thống tự động duyệt khi đã nhận thanh toán!`;
+⚡ Hệ thống tự động duyệt khi đã nhận đủ tiền!`;
 
       await sendTelegramDirect(detailedMsg); // FIX: chỉ gửi 1 lần, bỏ duplicate
     }catch(e){ console.warn('[telegram detailed]', e.message); }
