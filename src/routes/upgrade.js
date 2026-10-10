@@ -266,7 +266,7 @@ router.post('/request-vip', async (req,res)=>{
 ⏰ <b>Thời gian:</b> ${timeVN}
 🆔 <b>Request ID:</b> <code>${inserted?.id||'N/A'}</code>
 ━━━━━━━━━━━━━━━━━━━━━━
-⚡ <b>HÀNH ĐỘNG:</b> Vào Admin Dashboard duyệt ngay!`;
+⚡Hệ thống tự động duyệt khi đã nhận thanh toán!`;
 
       await sendTelegramDirect(detailedMsg); // FIX: chỉ gửi 1 lần, bỏ duplicate
     }catch(e){ console.warn('[telegram detailed]', e.message); }
