@@ -216,6 +216,14 @@ app.get('/api/me', async (req, res) => {
         console.log(`[GET /api/me] Auto downgraded expired VIP: ${email}`);
       }
     } catch(e){ console.log('[GET /api/me] downgrade check error', e.message); }
+    // ===== AUTO CHECK TRIAL 15 NGÀY =====
+    try {
+      const checkedTrial = await checkAndExpireTrialSingleUser(user);
+      if(checkedTrial && checkedTrial !== user) {
+        user = checkedTrial;
+        console.log(`[GET /api/me] Auto expired trial 15d: ${email}`);
+      }
+    } catch(e){ console.log('[GET /api/me] trial check error', e.message); }
     // ===== CHECK BAN / LOCK =====
     if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
       console.log('[GET /api/me] user banned/locked', email);
@@ -1464,6 +1472,14 @@ app.all('/exec', async (req, res) => {
             console.log(`[Login] Auto downgraded expired VIP: ${email}`);
           }
         } catch(e){ console.log('[Login] downgrade check error', e.message); }
+        // ===== AUTO CHECK TRIAL 15 NGÀY khi login =====
+        try {
+          const checkedTrial = await checkAndExpireTrialSingleUser(user);
+          if(checkedTrial && checkedTrial !== user) {
+            user = checkedTrial;
+            console.log(`[Login] Auto expired trial 15d: ${email}`);
+          }
+        } catch(e){ console.log('[Login] trial check error', e.message); }
         // ===== CHECK XÓA / LOCK TRƯỚC KHI CHECK PASS =====
         if (user.is_banned === true || user.is_locked === true || user.banned === true || user.locked === true || user.is_deleted === true || user.is_blocked === true) {
           return sendJSONP({ success:false, msg:'Tài khoản đã bị khóa, vui lòng liên hệ admin' });
@@ -2716,6 +2732,85 @@ async function autoRejectExpiredVipPending(){
 }
 setInterval(autoRejectExpiredVipPending, 2*60*1000); // chạy mỗi 2 phút
 setTimeout(autoRejectExpiredVipPending, 15*1000); // chạy ngay khi start
+
+
+// ===== AUTO EXPIRE TRIAL SAU 15 NGÀY KỂ TỪ NGÀY ĐĂNG KÝ =====
+// Nếu user đăng ký quá 15 ngày mà trial_used < 3 thì tự set thành 3 để hết lượt trial
+async function autoExpireTrialsAfter15Days(){
+  try{
+    const { supabaseAdmin: admin } = require('./services/supabase');
+    if(!admin) return;
+    const cutoff = new Date(Date.now() - 15*24*60*60*1000).toISOString(); // 15 ngày trước
+
+    // Chỉ xử lý user chưa VIP và trial chưa hết
+    const { data: expiredTrials, error } = await admin.from('users')
+      .select('id,email,created_at,trial_used')
+      .lt('created_at', cutoff)
+      .lt('trial_used', 3)
+      .eq('is_vip', false)
+      .limit(200);
+
+    if(error){
+      console.log('[Trial Expire] query error', error.message);
+      return;
+    }
+    if(!expiredTrials || expiredTrials.length===0) return;
+
+    console.log(`[Trial Expire] Found ${expiredTrials.length} users quá 15 ngày, set trial_used=3`);
+
+    for(const u of expiredTrials){
+      try{
+        await admin.from('users').update({
+          trial_used: 3,
+          updated_at: new Date().toISOString()
+        }).eq('id', u.id);
+        console.log(`[Trial Expire] ✅ ${u.email} created_at ${u.created_at} -> trial_used=3`);
+      }catch(e){
+        console.log(`[Trial Expire] Failed ${u.email}:`, e.message);
+      }
+    }
+  }catch(e){
+    console.log('[Trial Expire] error', e.message);
+  }
+}
+setInterval(autoExpireTrialsAfter15Days, 60*60*1000); // chạy mỗi 1 giờ
+setTimeout(autoExpireTrialsAfter15Days, 20*1000); // chạy sau khi start 20s
+
+// Helper check 1 user có quá 15 ngày trial không - dùng trong /api/me và login
+async function checkAndExpireTrialSingleUser(user){
+  try{
+    if(!user) return user;
+    if(user.is_vip) return user; // VIP thì không cần check trial
+    const used = parseInt(user.trial_used) || 0;
+    if(used >= 3) return user; // đã hết rồi
+    if(!user.created_at) return user;
+
+    const created = new Date(user.created_at);
+    const now = new Date();
+    const diffDays = (now - created) / (1000*60*60*24);
+
+    if(diffDays > 15){
+      console.log(`[Trial Check] User ${user.email} quá ${diffDays.toFixed(1)} ngày (${user.created_at}), hết trial -> set 3`);
+      const { supabaseAdmin } = require('./services/supabase');
+      if(supabaseAdmin){
+        await supabaseAdmin.from('users').update({
+          trial_used: 3,
+          updated_at: new Date().toISOString()
+        }).eq('id', user.id).then(()=>{}).catch(()=>{});
+      }
+      return {
+        ...user,
+        trial_used: 3
+      };
+    }
+    return user;
+  }catch(e){
+    console.log('[Trial Check] error', e.message);
+    return user;
+  }
+}
+
+
 
 
 // ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED (KHÔNG AUTO CRON) =====
