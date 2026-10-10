@@ -2680,7 +2680,42 @@ async function checkAndDowngradeSingleUser(user){
 
 
 
+// ===== AUTO REJECT VIP PENDING QUÁ 10 PHÚT - FIX LỖI TREO PENDING =====
+async function autoRejectExpiredVipPending(){
+  try{
+    const { supabaseAdmin: admin } = require('./services/supabase');
+    if(!admin) return;
+    const cutoff = new Date(Date.now() - 10*60*1000).toISOString(); // 10 phút
 
+    const { data: stuckUsers, error } = await admin.from('users')
+      .select('id,email,request_vip_time')
+      .eq('vip_status','PENDING')
+      .eq('is_vip', false)
+      .lt('request_vip_time', cutoff)
+      .limit(100);
+
+    if(error || !stuckUsers || stuckUsers.length===0) return;
+
+    console.log(`[VIP AutoReject] Found ${stuckUsers.length} PENDING >10m`);
+
+    for(const u of stuckUsers){
+      await admin.from('users').update({
+        vip_status: 'REJECTED',
+        updated_at: new Date().toISOString()
+      }).eq('id', u.id);
+
+      await admin.from('vip_requests').update({
+        status: 'REJECTED',
+        reason: 'auto_expired_10m_backend',
+        updated_at: new Date().toISOString()
+      }).eq('email', u.email).eq('status','PENDING');
+    }
+  }catch(e){
+    console.log('[VIP AutoReject] error', e.message);
+  }
+}
+setInterval(autoRejectExpiredVipPending, 2*60*1000); // chạy mỗi 2 phút
+setTimeout(autoRejectExpiredVipPending, 15*1000); // chạy ngay khi start
 
 
 // ===== CANCEL VIP - CHỜ FRONTEND 10P MỚI REJECTED (KHÔNG AUTO CRON) =====
