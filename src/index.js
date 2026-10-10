@@ -96,8 +96,47 @@ app.use((req, res, next) => {
   next();
 });
 
+// ===== MIDDLEWARE CHẶN RENDER KHI HẾT TRIAL =====
+async function blockRenderIfTrialExpired(req, res, next){
+  try{
+    const action = req.query.action || req.body?.action || '';
+    const isRenderModule = action === 'getSecureRenderModule' || action === 'kara-render-engine' || action === 'getRenderEngine' || req.path.includes('secure-render') || req.path.includes('fastVideobg') || req.originalUrl.includes('secure-render');
+    // Chỉ check khi là module render, không chặn các action khác như login
+    if(!isRenderModule && !req.path.includes('/render') && !req.originalUrl.includes('/render')){
+      return next();
+    }
+    const emailForTrial = (req.headers['x-user-email'] || req.query.email || req.body?.email || '').toString().toLowerCase().trim();
+    if(!emailForTrial) return next(); // không có email thì cho qua, để trial local xử lý ở FE, hoặc có thể chặn guest nếu muốn
+    const { supabaseAdmin: adminTrial } = require('./services/supabase');
+    if(!adminTrial) return next();
+    const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,trial_used,created_at').eq('email', emailForTrial).maybeSingle();
+    if(!trialUser) return next();
+    let finalUser = trialUser;
+    try{
+      if(typeof checkAndExpireTrialSingleUser === 'function'){
+        const checked = await checkAndExpireTrialSingleUser(trialUser);
+        if(checked) finalUser = checked;
+      }
+    }catch(e){}
+    const isVip = !!(finalUser.is_vip || finalUser.is_vip_bool);
+    if(isVip) return next();
+    const used = parseInt(finalUser.trial_used) || 0;
+    const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+    const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+    const expiredByTime = created && diffDays > 15;
+    if(used >= 3 || expiredByTime){
+      console.log(`[Render Middleware BLOCK] ${emailForTrial} hết trial`);
+      return res.status(403).json({ success:false, blocked:true, code:'TRIAL_EXPIRED', message:'Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full' });
+    }
+    return next();
+  }catch(e){
+    console.log('[Render Middleware] error', e.message);
+    return next();
+  }
+}
+
 app.use('/api', upgradeRoutes);
-app.use('/api/render', fastVideobgRouter);
+app.use('/api/render', blockRenderIfTrialExpired, fastVideobgRouter);
 app.use('/api/download', downloadRoute);
 
 app.use('/api/theme', themeLicenseRoutes);
@@ -1377,6 +1416,51 @@ app.all('/exec', async (req, res) => {
       case 'kara-render-engine':
       case 'getRenderEngine': {
         try{
+          // ===== CHẶN KHI HẾT LƯỢT DÙNG THỬ =====
+          try{
+            const emailForTrial = (params.email || req.headers['x-user-email'] || req.query?.email || '').toString().toLowerCase().trim();
+            if(emailForTrial){
+              const { supabaseAdmin: adminTrial } = require('./services/supabase');
+              if(adminTrial){
+                const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,trial_used,created_at').eq('email', emailForTrial).maybeSingle();
+                if(trialUser){
+                  // Auto expire nếu quá 15 ngày (gọi helper nếu có)
+                  let finalUser = trialUser;
+                  try{
+                    if(typeof checkAndExpireTrialSingleUser === 'function'){
+                      const checked = await checkAndExpireTrialSingleUser(trialUser);
+                      if(checked) finalUser = checked;
+                    } else {
+                      // fallback tính tay
+                      const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+                      const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+                      if(diffDays > 15 && !finalUser.is_vip){
+                        finalUser.trial_used = 3;
+                      }
+                    }
+                  }catch(e){}
+                  
+                  const isVip = !!(finalUser.is_vip || finalUser.is_vip_bool);
+                  if(!isVip){
+                    const used = parseInt(finalUser.trial_used) || 0;
+                    const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+                    const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+                    const expiredByTime = created && diffDays > 15;
+                    if(used >= 3 || expiredByTime){
+                      console.log(`[Secure Render BLOCK] ${emailForTrial} hết trial used=${used} diff=${diffDays.toFixed(1)}d`);
+                      const blockMsg = 'Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full';
+                      if(params.plain === '1' || params.plain === 'true'){
+                        return res.type('text/plain').status(403).send('ERROR_TRIAL_EXPIRED: ' + blockMsg);
+                      }
+                      return sendJSONP({ success:false, blocked:true, code:'TRIAL_EXPIRED', message:blockMsg, error:blockMsg });
+                    }
+                  }
+                }
+              }
+            }
+          }catch(trialErr){
+            console.log('[Secure Render] Trial check error (allow by default)', trialErr.message);
+          }
           const isPlain = params.plain === '1' || params.plain === 'true';
           const jsContent = await getSecureRenderModuleContent_V55();
           if (!jsContent) {
@@ -2299,6 +2383,38 @@ app.get('/api/secure-render', async (req, res) => {
   const guard = checkCorsGuardStrict(req);
   if (guard.blocked && !req.query.tk) {
     return res.type('text/plain').status(403).send('ERROR_DOMAIN_BLOCKED');
+  }
+  // ===== CHẶN KHI HẾT LƯỢT DÙNG THỬ =====
+  try{
+    const emailForTrial = (req.query.email || req.headers['x-user-email'] || '').toString().toLowerCase().trim();
+    if(emailForTrial){
+      const { supabaseAdmin: adminTrial } = require('./services/supabase');
+      if(adminTrial){
+        const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,trial_used,created_at').eq('email', emailForTrial).maybeSingle();
+        if(trialUser){
+          let finalUser = trialUser;
+          try{
+            if(typeof checkAndExpireTrialSingleUser === 'function'){
+              const checked = await checkAndExpireTrialSingleUser(trialUser);
+              if(checked) finalUser = checked;
+            }
+          }catch(e){}
+          const isVip = !!(finalUser.is_vip || finalUser.is_vip_bool);
+          if(!isVip){
+            const used = parseInt(finalUser.trial_used) || 0;
+            const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+            const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+            const expiredByTime = created && diffDays > 15;
+            if(used >= 3 || expiredByTime){
+              console.log(`[Secure API BLOCK] ${emailForTrial} hết trial used=${used}`);
+              return res.type('text/plain').status(403).send('ERROR_TRIAL_EXPIRED: Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full');
+            }
+          }
+        }
+      }
+    }
+  }catch(trialErr){
+    console.log('[Secure API] Trial check error', trialErr.message);
   }
   try {
     const isPlain = req.query.plain === '1' || req.query.plain === 'true';
