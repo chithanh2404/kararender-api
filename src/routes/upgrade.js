@@ -371,6 +371,27 @@ router.post('/request-vip', async (req,res)=>{
       if(user?.full_name) fullName=user.full_name;
     }catch{}
 
+    // CHECK DUPLICATE: Chặn double-click tạo 2 PENDING như peterbui791123@gmail.com
+    try{
+      const tenMinAgo = new Date(Date.now() - 10*60*1000).toISOString();
+      const {data: existingPending} = await supabaseAdmin.from('vip_requests')
+        .select('id, created_at, plan_key, amount')
+        .eq('email', email.toLowerCase())
+        .eq('status','PENDING')
+        .eq('plan_key', planKey)
+        .gte('created_at', tenMinAgo)
+        .order('created_at',{ascending:false})
+        .limit(1)
+        .maybeSingle();
+      
+      if(existingPending){
+        console.log(`[request-vip] Duplicate detected, return existing PENDING ${existingPending.id} for ${email} created ${existingPending.created_at}`);
+        return res.json({success:true, message:'Đã có yêu cầu chờ duyệt, vui lòng quét QR hiện tại', requestId: existingPending.id, _duplicate:true});
+      }
+    }catch(e){
+      console.warn('[request-vip] duplicate check error', e.message);
+    }
+
     console.log('[request-vip] Inserting vip_requests', {email: email.toLowerCase(), plan_key: planKey});
     const {data:inserted, error:insertError}=await supabaseAdmin.from('vip_requests').insert({
       email:email.toLowerCase(),
