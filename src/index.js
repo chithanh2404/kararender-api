@@ -2535,28 +2535,64 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       return res.status(500).json({ success:false, error: upErr.message });
     }
 
-    // FIX 2: QUAN TRỌNG - Update vip_requests thành APPROVED luôn
-    const { error: reqErr } = await supabaseAdmin.from('vip_requests').update({
-      status: 'APPROVED',
-      updated_at: new Date().toISOString()
-    }).eq('email', targetUser.email).eq('status', 'PENDING');
-
-    if(reqErr) {
-      console.warn('[Webhook] Update vip_requests error (không sao, vẫn APPROVED user)', reqErr.message);
-      // Nếu không có record PENDING thì tạo 1 record APPROVED để log
-      await supabaseAdmin.from('vip_requests').upsert({
-        email: targetUser.email,
-        full_name: targetUser.full_name || targetUser.email,
-        plan_key: planKey,
-        amount: amount,
-        content: content,
-        status: 'APPROVED',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }, {onConflict: 'email'});
+    // FIX 2: Update vip_requests - CHỈ DUYỆT 1 PENDING MỚI NHẤT, TRÁNH DUPLICATE như peterbui791123@gmail.com
+    let approvedId = null;
+    try{
+      // Lấy PENDING mới nhất của user này
+      const {data: pendingList} = await supabaseAdmin.from('vip_requests')
+        .select('id, created_at')
+        .eq('email', targetUser.email)
+        .eq('status','PENDING')
+        .order('created_at',{ascending:false})
+        .limit(10);
+      
+      if(pendingList && pendingList.length>0){
+        // Duyệt cái mới nhất
+        const latest = pendingList[0];
+        approvedId = latest.id;
+        const {error: upErr} = await supabaseAdmin.from('vip_requests').update({
+          status:'APPROVED',
+          amount: amount,
+          content: content,
+          updated_at: new Date().toISOString()
+        }).eq('id', latest.id);
+        
+        if(upErr){
+          console.warn('[Webhook] Update latest PENDING error', upErr.message);
+        }else{
+          console.log(`[Webhook] Approved latest PENDING ${latest.id} for ${targetUser.email}`);
+        }
+        
+        // Nếu có nhiều PENDING cũ hơn do double-click, đánh dấu REJECTED duplicate
+        if(pendingList.length>1){
+          const oldIds = pendingList.slice(1).map(r=>r.id);
+          console.log(`[Webhook] Found ${oldIds.length} old PENDING duplicates for ${targetUser.email}, marking REJECTED`, oldIds);
+          await supabaseAdmin.from('vip_requests').update({
+            status:'REJECTED',
+            reason:'duplicate_double_click',
+            updated_at: new Date().toISOString()
+          }).in('id', oldIds);
+        }
+      }else{
+        // Không có PENDING nào (trường hợp hiếm), INSERT mới để giữ lịch sử
+        console.log(`[Webhook] No PENDING found, INSERT new APPROVED for history: ${targetUser.email}`);
+        const {data: inserted} = await supabaseAdmin.from('vip_requests').insert({
+          email: targetUser.email,
+          full_name: targetUser.full_name || targetUser.email,
+          plan_key: planKey,
+          amount: amount,
+          content: content,
+          status: 'APPROVED',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }).select().single();
+        approvedId = inserted?.id;
+      }
+    }catch(e){
+      console.warn('[Webhook] Update PENDING exception', e.message);
     }
 
-    console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
+    console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()} id=${approvedId||'N/A'}`);
     
     // ===== TELEGRAM AUTO DUYỆT VIP - CHỈ GỬI 1 LẦN, KHÔNG DUPLICATE =====
     try{
@@ -2575,46 +2611,27 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
 🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
 
       let sent = false;
-      
-      // Thử gửi trực tiếp 1 lần duy nhất (có retry 2 lần nếu fail)
       for(let attempt=1; attempt<=2 && !sent; attempt++){
         try{
           const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
           const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
-          if(!token || !chatId){
-            console.warn('[AUTO VIP] Missing TELEGRAM_BOT_TOKEN or CHAT_ID');
-            break;
-          }
+          if(!token || !chatId) break;
           const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body: JSON.stringify({ chat_id: chatId, text: autoMsg, parse_mode:'HTML' })
           });
           const data = await resp.json().catch(()=>({}));
-          if(data.ok){
-            console.log(`[AUTO VIP] Telegram sent OK attempt ${attempt} for ${targetUser.email}`);
-            sent = true;
-          }else{
-            console.warn(`[AUTO VIP] Telegram API fail attempt ${attempt}`, JSON.stringify(data).slice(0,500));
-          }
-        }catch(e){
-          console.warn(`[AUTO VIP] Telegram direct error attempt ${attempt}`, e.message);
-        }
+          if(data.ok) sent = true;
+        }catch(e){ console.warn(`[AUTO VIP] attempt ${attempt} error`, e.message); }
         if(!sent && attempt<2) await new Promise(r=>setTimeout(r, 800));
       }
-      
-      // Nếu direct fail thì mới fallback qua service (chỉ 1 trong 2, không gửi cả 2)
       if(!sent){
         try{
           const {sendTelegramNotification} = require('./services/telegram');
-          if(sendTelegramNotification){
-            console.log('[AUTO VIP] Fallback via sendTelegramNotification service...');
-            await sendTelegramNotification(autoMsg);
-            sent = true;
-          }
-        }catch(e){ console.warn('[AUTO VIP] Service fallback error', e.message); }
+          if(sendTelegramNotification){ await sendTelegramNotification(autoMsg); sent = true; }
+        }catch(e){}
       }
-      
       console.log(`[Webhook] AUTO VIP telegram final sent=${sent} for ${targetUser.email}`);
     }catch(e){ console.warn('[Webhook Telegram] outer error', e.message); }
     
