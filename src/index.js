@@ -2869,7 +2869,6 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
           console.log(`[Webhook] Found ${oldIds.length} old PENDING duplicates, marking REJECTED`, oldIds);
           await supabaseAdmin.from('vip_requests').update({
             status:'REJECTED',
-            reason:'duplicate_double_click',
             updated_at: new Date().toISOString()
           }).in('id', oldIds);
         }
@@ -3664,7 +3663,6 @@ async function autoRejectOrphanVipRequests(){
       const ids = bankToReject.map(r=>r.id);
       const { error: updErr } = await admin.from('vip_requests').update({
         status:'REJECTED',
-        reason:'auto_expired_10m_orphan_v2',
         updated_at:new Date().toISOString()
       }).in('id', ids);
       if(updErr) console.log('[VIP Orphan] BANK update error', updErr.message);
@@ -3675,7 +3673,6 @@ async function autoRejectOrphanVipRequests(){
       const ids = longToReject.map(r=>r.id);
       const { error: updErr } = await admin.from('vip_requests').update({
         status:'REJECTED',
-        reason:'auto_expired_30m_orphan_v2',
         updated_at:new Date().toISOString()
       }).in('id', ids);
       if(updErr) console.log('[VIP Orphan] LONG update error', updErr.message);
@@ -3804,9 +3801,9 @@ async function handleCancelVipGoc(req, res){
     const { supabaseAdmin } = require('./services/supabase');
     if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
     if(requestId){
-      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('id', requestId);
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', updated_at:new Date().toISOString() }).eq('id', requestId);
     }else{
-      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', reason: reason || 'frontend_timeout_10m', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
+      await supabaseAdmin.from('vip_requests').update({ status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail).eq('status','PENDING');
     }
     await supabaseAdmin.from('users').update({ vip_status:'REJECTED', updated_at:new Date().toISOString() }).eq('email', targetEmail);
     return res.json({ success:true });
@@ -3822,10 +3819,16 @@ app.post('/api/admin/reject-vip/self', handleCancelVipGoc);
 // ===== MANUAL CLEANUP ENDPOINT - GỌI TRỰC TIẾP ĐỂ TEST =====
 app.get('/api/admin/cleanup-pending', async (req,res)=>{
   try{
-    const email = (req.headers['x-user-email'] || req.query.email || '').toLowerCase();
-    const isAdmin = ['chithanh2404@gmail.com','admin@kararender.com','thanhprowadia6@gmail.com'].includes(email);
+    const rawEmail = (req.headers['x-user-email'] || req.query.email || req.query['email'] || '').toString();
+    const email = rawEmail.toLowerCase().trim();
+    console.log(`[Manual Cleanup] Request - raw: '${rawEmail}' -> email: '${email}' query:`, req.query, 'headers x-user-email:', req.headers['x-user-email']);
+    const adminList = ['chithanh2404@gmail.com','admin@kararender.com','thanhprowadia6@gmail.com','loinhacsong.pro@gmail.com'];
+    const isAdmin = adminList.includes(email);
+    if(!email){
+      return res.status(403).json({success:false, message:'Thiếu email - thêm ?email=thanhprowadia6@gmail.com vào URL', hint:'VD: /api/admin/cleanup-pending?email=thanhprowadia6@gmail.com', receivedQuery:req.query});
+    }
     if(!isAdmin){
-      return res.status(403).json({success:false, message:'Chỉ admin mới được dọn'});
+      return res.status(403).json({success:false, message:'Chỉ admin mới được dọn', receivedEmail: email, adminList});
     }
     console.log(`[Manual Cleanup] Triggered by ${email}`);
     await autoRejectExpiredVipPending();
