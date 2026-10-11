@@ -2905,6 +2905,318 @@ app.post('/api/webhook/sepay', (req,res,next)=>{ req.url='/api/webhook/bank'; re
 app.post('/api/webhook/casso', (req,res,next)=>{ req.url='/api/webhook/bank'; req.method='POST'; app._router.handle(req,res,next); });
 
 
+// ===== LEMON SQUEEZY - CỔNG THANH TOÁN QUỐC TẾ - AUTO DUYỆT VIP =====
+const crypto = require('crypto');
+
+function getLemonVariantId(planKey){
+  const key = planKey ? planKey.toLowerCase() : '1m';
+  const defaultMap = {
+    '1m': '2234458',
+    '3m': '2234498',
+    '6m': '2234508',
+    '12m': '2234510',
+    '24m': '2234517',
+    '1y': '2234510',
+    '2y': '2234517'
+  };
+  const envMap = {
+    '1m': process.env.LEMON_VARIANT_1M || defaultMap['1m'],
+    '3m': process.env.LEMON_VARIANT_3M || defaultMap['3m'],
+    '6m': process.env.LEMON_VARIANT_6M || defaultMap['6m'],
+    '12m': process.env.LEMON_VARIANT_12M || defaultMap['12m'],
+    '24m': process.env.LEMON_VARIANT_24M || defaultMap['24m'],
+    '1y': process.env.LEMON_VARIANT_12M || process.env.LEMON_VARIANT_1Y || defaultMap['12m'],
+    '2y': process.env.LEMON_VARIANT_24M || defaultMap['24m'],
+    'vip1m': process.env.LEMON_VARIANT_1M || defaultMap['1m'],
+    'vip3m': process.env.LEMON_VARIANT_3M || defaultMap['3m'],
+    'vip6m': process.env.LEMON_VARIANT_6M || defaultMap['6m'],
+    'vip12m': process.env.LEMON_VARIANT_12M || defaultMap['12m'],
+    'vip24m': process.env.LEMON_VARIANT_24M || defaultMap['24m'],
+    'lifetime': process.env.LEMON_VARIANT_LIFETIME || defaultMap['24m']
+  };
+  return envMap[key] || process.env.LEMON_VARIANT_DEFAULT || defaultMap['1m'] || null;
+}
+
+function getLemonUsdPrice(planKey, vndPrice){
+  const key = planKey ? planKey.toUpperCase() : '1M';
+  const envPriceMap = {
+    '1M': process.env.LEMON_PRICE_1M,
+    '3M': process.env.LEMON_PRICE_3M,
+    '6M': process.env.LEMON_PRICE_6M,
+    '12M': process.env.LEMON_PRICE_12M,
+    '24M': process.env.LEMON_PRICE_24M,
+    '1Y': process.env.LEMON_PRICE_12M,
+    '2Y': process.env.LEMON_PRICE_24M
+  };
+  const defaultVndMap = {
+    '1M': 99000,
+    '3M': 199000,
+    '6M': 399000,
+    '12M': 599000,
+    '24M': 999000,
+    '1Y': 599000,
+    '2Y': 999000
+  };
+  let usd = envPriceMap[key];
+  if(usd) return parseFloat(usd);
+  const vnd = vndPrice || defaultVndMap[key] || 99000;
+  if(vnd >= 10000) return vnd;
+  const usdConverted = (vnd / 26000);
+  return Math.max(3.99, Math.round(usdConverted * 100) / 100);
+}
+
+app.post('/api/payment/lemonsqueezy/create', express.json(), async (req, res) => {
+  try{
+    const { email, planKey } = req.body || {};
+    if(!email || !planKey){
+      return res.status(400).json({success:false, message:'Thiếu email hoặc planKey'});
+    }
+    const apiKey = (process.env.LEMONSQUEEZY_API_KEY || '').trim();
+    const storeId = (process.env.LEMONSQUEEZY_STORE_ID || '495257').trim();
+    if(!apiKey){
+      return res.status(500).json({success:false, message:'Chưa cấu hình LEMONSQUEEZY_API_KEY trong ENV'});
+    }
+    let supabaseAdmin;
+    try{ supabaseAdmin = require('./services/supabase').supabaseAdmin; }catch(e){ supabaseAdmin = null; }
+    let planPriceVnd = 99000;
+    let planLabel = planKey;
+    let months = 1;
+    try{
+      if(supabaseAdmin){
+        const {data: planData} = await supabaseAdmin.from('upgrade_plans').select('*').eq('key', planKey.toLowerCase()).single();
+        if(planData){
+          planPriceVnd = planData.price || 99000;
+          planLabel = planData.label || planKey;
+          months = planData.months || 1;
+        }
+      }
+    }catch(e){}
+    const variantId = getLemonVariantId(planKey);
+    if(!variantId){
+      return res.status(400).json({success:false, message:`Chưa cấu hình Variant ID cho gói ${planKey}`});
+    }
+    const displayPrice = getLemonUsdPrice(planKey, planPriceVnd);
+    const checkoutPayload = {
+      data: {
+        type: "checkouts",
+        attributes: {
+          checkout_data: {
+            email: email.toLowerCase(),
+            custom: {
+              email: email.toLowerCase(),
+              plan_key: planKey.toLowerCase(),
+              plan_label: planLabel,
+              months: String(months),
+              amount_vnd: String(planPriceVnd)
+            }
+          },
+          product_options: {
+            redirect_url: `${process.env.FRONTEND_URL || 'https://kararender.com'}/vip-success?email=${encodeURIComponent(email)}&plan=${planKey}`,
+            receipt_button_text: "Quay lại KaraRender",
+            receipt_link_url: `${process.env.FRONTEND_URL || 'https://kararender.com'}/`,
+            receipt_thank_you_note: `Cảm ơn bạn đã mua ${planLabel} - KaraRender sẽ tự động kích hoạt VIP trong 30s!`
+          }
+        },
+        relationships: {
+          store: { data: { type: "stores", id: String(storeId) } },
+          variant: { data: { type: "variants", id: String(variantId) } }
+        }
+      }
+    };
+    console.log('[Lemon Create] Payload:', JSON.stringify(checkoutPayload).slice(0,1000));
+    const lemonRes = await fetch('https://api.lemonsqueezy.com/v1/checkouts', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Accept': 'application/vnd.api+json',
+        'Content-Type': 'application/vnd.api+json'
+      },
+      body: JSON.stringify(checkoutPayload)
+    });
+    const lemonData = await lemonRes.json().catch(()=>({}));
+    console.log('[Lemon Create] Response:', JSON.stringify(lemonData).slice(0,2000));
+    if(!lemonRes.ok){
+      console.error('[Lemon Create] Error', lemonData);
+      return res.status(400).json({success:false, message: lemonData.errors ? JSON.stringify(lemonData.errors) : 'Lemon API error', detail: lemonData});
+    }
+    const checkoutUrl = lemonData.data?.attributes?.url;
+    const checkoutId = lemonData.data?.id;
+    if(supabaseAdmin){
+      try{
+        const {data: existing} = await supabaseAdmin.from('vip_requests')
+          .select('id').eq('email', email.toLowerCase()).eq('status','PENDING').eq('plan_key', planKey.toLowerCase())
+          .gte('created_at', new Date(Date.now() - 10*60*1000).toISOString())
+          .limit(1).maybeSingle();
+        if(!existing){
+          await supabaseAdmin.from('vip_requests').insert({
+            email: email.toLowerCase(),
+            full_name: email.toLowerCase(),
+            plan_key: planKey.toLowerCase(),
+            amount: planPriceVnd,
+            content: `lemon ${email.replace(/[@.]/g,'')} ${planKey} $${displayPrice} checkout:${checkoutId}`,
+            status: 'PENDING',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          });
+        }
+      }catch(e){ console.warn('[Lemon Create] save pending error', e.message); }
+    }
+    return res.json({
+      success:true,
+      checkoutUrl,
+      checkoutId,
+      displayPrice,
+      vndPrice: planPriceVnd,
+      message: `Đã tạo link thanh toán Lemon Squeezy ${displayPrice} cho gói ${planLabel}`
+    });
+  }catch(e){
+    console.error('[Lemon Create] Exception', e);
+    return res.status(500).json({success:false, message:e.message});
+  }
+});
+
+app.get('/api/payment/lemonsqueezy/config', async (req,res)=>{
+  try{
+    const hasKey = !!(process.env.LEMONSQUEEZY_API_KEY && (process.env.LEMONSQUEEZY_STORE_ID || '495257'));
+    const variants = {
+      '1m': process.env.LEMON_VARIANT_1M || '2234458',
+      '3m': process.env.LEMON_VARIANT_3M || '2234498',
+      '6m': process.env.LEMON_VARIANT_6M || '2234508',
+      '12m': process.env.LEMON_VARIANT_12M || '2234510',
+      '24m': process.env.LEMON_VARIANT_24M || '2234517',
+      'default': '2234458'
+    };
+    return res.json({success:true, configured:hasKey, variants, storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257', prices: { '1m': 99000, '3m': 199000, '6m': 399000, '12m': 599000, '24m': 999000 }});
+  }catch(e){
+    return res.json({success:false, message:e.message});
+  }
+});
+
+app.post('/api/webhook/lemonsqueezy', express.raw({type: 'application/json'}), async (req, res) => {
+  try{
+    const rawBody = req.body;
+    const bodyString = rawBody ? rawBody.toString('utf8') : '';
+    console.log('[Lemon Webhook] Raw:', bodyString.slice(0,2000));
+    const secret = (process.env.LEMONSQUEEZY_WEBHOOK_SECRET || '').trim();
+    const signature = req.headers['x-signature'] || '';
+    if(secret){
+      try{
+        const hmac = crypto.createHmac('sha256', secret).update(bodyString).digest('hex');
+        if(hmac !== signature){
+          console.warn('[Lemon Webhook] Invalid signature', {expected: hmac, got: signature});
+        } else {
+          console.log('[Lemon Webhook] Signature verified OK');
+        }
+      }catch(e){ console.warn('[Lemon Webhook] Signature verify error', e.message); }
+    }
+    let body;
+    try{ body = JSON.parse(bodyString); }catch(e){ body = {}; }
+    const eventName = body.meta?.event_name || body.meta?.eventName || '';
+    console.log('[Lemon Webhook] Event:', eventName);
+    if(eventName !== 'order_created' && !bodyString.includes('order_created')){
+      console.log('[Lemon Webhook] Ignored event:', eventName);
+      return res.json({success:true, ignored:true, event: eventName});
+    }
+    const order = body.data || {};
+    const attrs = order.attributes || {};
+    const customData = attrs.custom_data || body.meta?.custom_data || {};
+    let email = (customData.email || attrs.user_email || '').toLowerCase().trim();
+    let planKey = (customData.plan_key || '1m').toLowerCase().trim();
+    let months = parseInt(customData.months) || 1;
+    if(!email) email = (attrs.user_email || '').toLowerCase().trim();
+    if(!planKey || planKey === '1m'){
+      const productName = (attrs.product_name || attrs.first_order_item?.product_name || '').toLowerCase();
+      if(productName.includes('3')) planKey = '3m';
+      else if(productName.includes('6')) planKey = '6m';
+      else if(productName.includes('12') || productName.includes('1y') || productName.includes('year')) planKey = '12m';
+      else if(productName.includes('24') || productName.includes('2y')) planKey = '24m';
+    }
+    if(!email){
+      console.warn('[Lemon Webhook] No email found');
+      return res.json({success:false, message:'No email in webhook'});
+    }
+    console.log(`[Lemon Webhook] Parsed email: ${email} planKey: ${planKey} months: ${months} orderId: ${order.id}`);
+    let supabaseAdmin;
+    try{ supabaseAdmin = require('./services/supabase').supabaseAdmin; }catch(e){ supabaseAdmin = null; }
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'Supabase not configured'});
+    const {data: targetUser} = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
+    if(!targetUser){
+      console.warn('[Lemon Webhook] User not found', email);
+      return res.json({success:false, message:'User not found: '+email});
+    }
+    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '24m':24, '1y':12, '2y':24, 'lifetime':1200 };
+    const monthsToAdd = monthsMap[planKey] || months || 1;
+    const now = new Date();
+    let expireDate = new Date();
+    if(targetUser.expired_date && new Date(targetUser.expired_date) > now){
+      expireDate = new Date(targetUser.expired_date);
+    }
+    expireDate.setMonth(expireDate.getMonth() + monthsToAdd);
+    if(planKey === 'lifetime') expireDate = new Date('2099-12-31');
+    const {error: upErr} = await supabaseAdmin.from('users').update({
+      is_vip: true,
+      is_vip_bool: true,
+      role: 'VIP',
+      vip_status: 'APPROVED',
+      expired_date: expireDate.toISOString(),
+      request_plan_key: planKey,
+      request_amount: attrs.total || 0,
+      request_content: `lemon ${email} ${planKey} order:${order.id} $${attrs.total || ''}`,
+      request_vip_time: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq('id', targetUser.id);
+    if(upErr){
+      console.error('[Lemon Webhook] Update user error', upErr.message);
+      return res.status(500).json({success:false, error: upErr.message});
+    }
+    try{
+      const {data: pendingList} = await supabaseAdmin.from('vip_requests').select('id').eq('email', email).eq('status','PENDING').order('created_at',{ascending:false}).limit(5);
+      if(pendingList && pendingList.length>0){
+        await supabaseAdmin.from('vip_requests').update({
+          status:'APPROVED',
+          amount: attrs.total || 0,
+          content: `lemon ${planKey} order:${order.id} $${attrs.total || ''} ${attrs.product_name || ''}`,
+          updated_at: new Date().toISOString()
+        }).eq('id', pendingList[0].id);
+      }else{
+        await supabaseAdmin.from('vip_requests').insert({
+          email: email,
+          full_name: targetUser.full_name || email,
+          plan_key: planKey,
+          amount: attrs.total || 0,
+          content: `lemon auto ${planKey} order:${order.id}`,
+          status:'APPROVED',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+      }
+    }catch(e){ console.warn('[Lemon Webhook] vip_requests update error', e.message); }
+    console.log(`[Lemon Webhook] AUTO APPROVED ${email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
+    try{
+      const timeVN = new Date().toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
+      const expireVN = expireDate.toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
+      const msg = `✅💳 <b>AUTO DUYỆT VIP - LEMON SQUEEZY</b> 💳✅\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${email}\n💳 <b>Gói:</b> ${planKey} (${monthsToAdd} tháng)\n💰 <b>Số tiền:</b> $${attrs.total || 'N/A'}\n🆔 <b>Order:</b> ${order.id}\n📅 <b>Hạn dùng:</b> ${expireVN}\n⏰ <b>Thời gian:</b> ${timeVN}\n━━━━━━━━━━━━━━━━━━━━━━\n🤖 Auto duyệt qua Lemon Squeezy webhook!`;
+      const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+      if(token && chatId){
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({chat_id: chatId, text: msg, parse_mode:'HTML'})
+        });
+      }
+    }catch(e){ console.warn('[Lemon Webhook] Telegram error', e.message); }
+    return res.json({success:true, autoApproved:true, email, plan: planKey, expire: expireDate.toISOString()});
+  }catch(e){
+    console.error('[Lemon Webhook] Exception', e);
+    return res.status(500).json({success:false, error:e.message});
+  }
+});
+
+app.post('/api/webhook/lemon', (req,res,next)=>{ req.url='/api/webhook/lemonsqueezy'; req.method='POST'; app._router.handle(req,res,next); });
+
+
+
 // ===== ADMIN: GỠ CHẶN OTP IP/EMAIL =====
 app.post('/api/admin/clear-otp-block', express.json(), (req, res) => {
   // Bảo vệ bằng X-Admin-Token hoặc check IP admin nếu cần
