@@ -2851,25 +2851,44 @@ async function checkAndDowngradeSingleUser(user){
 
 
 
-// ===== AUTO REJECT VIP PENDING QUÁ 10 PHÚT - FIX LỖI TREO PENDING =====
+// ===== AUTO REJECT VIP PENDING QUÁ 10 PHÚT (BANK) / 30 PHÚT (USDT) - FIX LỖI TREO PENDING =====
 async function autoRejectExpiredVipPending(){
   try{
     const { supabaseAdmin: admin } = require('./services/supabase');
     if(!admin) return;
-    const cutoff = new Date(Date.now() - 10*60*1000).toISOString(); // 10 phút
+    const cutoffBank = new Date(Date.now() - 10*60*1000).toISOString(); // 10 phút cho BANK
+    const cutoffUsdt = new Date(Date.now() - 30*60*1000).toISOString(); // 30 phút cho USDT BEP20
 
     const { data: stuckUsers, error } = await admin.from('users')
       .select('id,email,request_vip_time')
       .eq('vip_status','PENDING')
       .eq('is_vip', false)
-      .lt('request_vip_time', cutoff)
+      .lt('request_vip_time', cutoffBank)
       .limit(100);
 
     if(error || !stuckUsers || stuckUsers.length===0) return;
 
-    console.log(`[VIP AutoReject] Found ${stuckUsers.length} PENDING >10m`);
+    console.log(`[VIP AutoReject] Found ${stuckUsers.length} PENDING >10m (check USDT 30m)`);
 
     for(const u of stuckUsers){
+      try{
+        // Kiểm tra nếu user có PENDING USDT trong 30p gần nhất thì bỏ qua, cho thêm thời gian quét BSCScan
+        const { data: recentUsdt } = await admin.from('vip_requests')
+          .select('id,content,created_at')
+          .eq('email', u.email)
+          .eq('status','PENDING')
+          .ilike('content','%usdt%')
+          .gte('created_at', cutoffUsdt)
+          .limit(1);
+        
+        if(recentUsdt && recentUsdt.length>0){
+          console.log(`[VIP AutoReject] Skip ${u.email} - có USDT PENDING trong 30p, cho thêm thời gian quét BSCScan`);
+          continue;
+        }
+      }catch(e){
+        console.warn('[VIP AutoReject] check USDT error', e.message);
+      }
+
       await admin.from('users').update({
         vip_status: 'REJECTED',
         updated_at: new Date().toISOString()
