@@ -3601,56 +3601,93 @@ async function autoRejectExpiredVipPending(){
   }
 }
 
-// ===== FIX MỚI: DỌN TRỰC TIẾP vip_requests BỊ TREO DÙ users ĐÃ REJECTED =====
+// ===== FIX MỚI: DỌN TRỰC TIẾP vip_requests BỊ TREO DÙ users ĐÃ REJECTED - VERSION 2 ROBUST =====
 async function autoRejectOrphanVipRequests(){
   try{
     const { supabaseAdmin: admin } = require('./services/supabase');
-    if(!admin) return;
-    const cutoffBank = new Date(Date.now() - 10*60*1000).toISOString();
-    const cutoffLong = new Date(Date.now() - 30*60*1000).toISOString();
+    if(!admin){
+      console.log('[VIP Orphan] supabaseAdmin NULL - skip');
+      return;
+    }
+    const cutoffBank = new Date(Date.now() - 10*60*1000);
+    const cutoffLong = new Date(Date.now() - 30*60*1000);
+    const cutoffBankIso = cutoffBank.toISOString();
+    const cutoffLongIso = cutoffLong.toISOString();
 
-    // 1. Dọn BANK PENDING quá 10 phút (không chứa usdt, lemon)
-    const { data: bankStuck } = await admin.from('vip_requests')
+    console.log(`[VIP Orphan] Starting scan - cutoff BANK: ${cutoffBankIso}, LONG: ${cutoffLongIso}`);
+
+    // Lấy tất cả PENDING quá 10 phút (limit 200) - không dùng ilike phức tạp, lọc bằng JS cho chắc
+    const { data: allPending, error } = await admin.from('vip_requests')
       .select('id,email,content,created_at')
       .eq('status','PENDING')
-      .lt('created_at', cutoffBank)
-      .not('content','ilike','%usdt%')
-      .not('content','ilike','%lemon%')
-      .limit(100);
+      .lt('created_at', cutoffBankIso)
+      .order('created_at', {ascending:true})
+      .limit(200);
 
-    if(bankStuck && bankStuck.length>0){
-      console.log(`[VIP AutoReject Orphan] Found ${bankStuck.length} BANK PENDING >10m`);
-      const ids = bankStuck.map(r=>r.id);
-      await admin.from('vip_requests').update({
-        status:'REJECTED',
-        reason:'auto_expired_10m_orphan',
-        updated_at:new Date().toISOString()
-      }).in('id', ids);
+    if(error){
+      console.log('[VIP Orphan] query error', error.message);
+      return;
+    }
+    if(!allPending || allPending.length===0){
+      console.log('[VIP Orphan] No PENDING >10m found');
+      return;
     }
 
-    // 2. Dọn USDT + LEMON PENDING quá 30 phút
-    const { data: longStuck } = await admin.from('vip_requests')
-      .select('id,email,content,created_at')
-      .eq('status','PENDING')
-      .lt('created_at', cutoffLong)
-      .or('content.ilike.%usdt%,content.ilike.%lemon%')
-      .limit(100);
+    console.log(`[VIP Orphan] Found ${allPending.length} PENDING >10m total`);
 
-    if(longStuck && longStuck.length>0){
-      console.log(`[VIP AutoReject Orphan] Found ${longStuck.length} USDT/LEMON PENDING >30m`);
-      const ids = longStuck.map(r=>r.id);
-      await admin.from('vip_requests').update({
-        status:'REJECTED',
-        reason:'auto_expired_30m_orphan',
-        updated_at:new Date().toISOString()
-      }).in('id', ids);
+    const bankToReject = [];
+    const longToReject = [];
+
+    for(const r of allPending){
+      const contentLower = (r.content || '').toLowerCase();
+      const created = new Date(r.created_at);
+      const isUsdt = contentLower.includes('usdt');
+      const isLemon = contentLower.includes('lemon');
+      const isLong = isUsdt || isLemon;
+
+      if(isLong){
+        // USDT/LEMON cần quá 30p mới dọn
+        if(created < cutoffLong){
+          longToReject.push(r);
+        } else {
+          console.log(`[VIP Orphan] Skip long ${r.id} (${r.email}) - mới ${Math.round((Date.now()-created)/60000)}p, cần 30p`);
+        }
+      }else{
+        // BANK quá 10p dọn luôn
+        bankToReject.push(r);
+      }
     }
 
-    // 3. Đồng bộ users: nếu user không còn PENDING nào mà vip_status vẫn PENDING và quá 10p thì REJECTED
-    if((bankStuck && bankStuck.length>0) || (longStuck && longStuck.length>0)){
-      const emails = [...(bankStuck||[]), ...(longStuck||[])].map(r=>r.email).filter(Boolean);
-      const uniqueEmails = [...new Set(emails.map(e=>e.toLowerCase()))];
-      for(const email of uniqueEmails.slice(0,20)){
+    console.log(`[VIP Orphan] To reject - BANK: ${bankToReject.length}, USDT/LEMON: ${longToReject.length}`);
+
+    if(bankToReject.length>0){
+      const ids = bankToReject.map(r=>r.id);
+      const { error: updErr } = await admin.from('vip_requests').update({
+        status:'REJECTED',
+        reason:'auto_expired_10m_orphan_v2',
+        updated_at:new Date().toISOString()
+      }).in('id', ids);
+      if(updErr) console.log('[VIP Orphan] BANK update error', updErr.message);
+      else console.log(`[VIP Orphan] ✅ Rejected ${ids.length} BANK PENDING`);
+    }
+
+    if(longToReject.length>0){
+      const ids = longToReject.map(r=>r.id);
+      const { error: updErr } = await admin.from('vip_requests').update({
+        status:'REJECTED',
+        reason:'auto_expired_30m_orphan_v2',
+        updated_at:new Date().toISOString()
+      }).in('id', ids);
+      if(updErr) console.log('[VIP Orphan] LONG update error', updErr.message);
+      else console.log(`[VIP Orphan] ✅ Rejected ${ids.length} USDT/LEMON PENDING`);
+    }
+
+    // Đồng bộ users
+    const allToSync = [...bankToReject, ...longToReject];
+    if(allToSync.length>0){
+      const emails = [...new Set(allToSync.map(r=>(r.email||'').toLowerCase()).filter(Boolean))];
+      console.log(`[VIP Orphan] Syncing ${emails.length} emails to REJECTED if no PENDING left`);
+      for(const email of emails.slice(0,30)){
         try{
           const { data: remaining } = await admin.from('vip_requests')
             .select('id')
@@ -3662,13 +3699,14 @@ async function autoRejectOrphanVipRequests(){
               vip_status:'REJECTED',
               updated_at:new Date().toISOString()
             }).eq('email', email).eq('vip_status','PENDING');
+            console.log(`[VIP Orphan] Synced user ${email} -> REJECTED`);
           }
         }catch(e){}
       }
     }
 
   }catch(e){
-    console.log('[VIP AutoReject Orphan] error', e.message);
+    console.log('[VIP AutoReject Orphan] error', e.message, e.stack);
   }
 }
 setInterval(autoRejectExpiredVipPending, 2*60*1000); // chạy mỗi 2 phút
@@ -3778,6 +3816,49 @@ app.post('/api/cancel-vip', handleCancelVipGoc);
 app.post('/api/request-vip/cancel', handleCancelVipGoc);
 app.post('/api/vip/cancel', handleCancelVipGoc);
 app.post('/api/admin/reject-vip/self', handleCancelVipGoc);
+
+
+
+// ===== MANUAL CLEANUP ENDPOINT - GỌI TRỰC TIẾP ĐỂ TEST =====
+app.get('/api/admin/cleanup-pending', async (req,res)=>{
+  try{
+    const email = (req.headers['x-user-email'] || req.query.email || '').toLowerCase();
+    const isAdmin = ['chithanh2404@gmail.com','admin@kararender.com','thanhprowadia6@gmail.com'].includes(email);
+    if(!isAdmin){
+      return res.status(403).json({success:false, message:'Chỉ admin mới được dọn'});
+    }
+    console.log(`[Manual Cleanup] Triggered by ${email}`);
+    await autoRejectExpiredVipPending();
+    await autoRejectOrphanVipRequests();
+    
+    // Trả về số còn lại
+    const { supabaseAdmin } = require('./services/supabase');
+    const { data: remaining } = await supabaseAdmin.from('vip_requests').select('id,email,content,created_at').eq('status','PENDING').order('created_at',{ascending:true}).limit(100);
+    
+    return res.json({
+      success:true, 
+      message:`Đã chạy dọn dẹp - còn ${remaining?.length||0} PENDING`,
+      remaining: remaining || [],
+      timestamp: new Date().toISOString()
+    });
+  }catch(e){
+    console.error('[Manual Cleanup] error', e);
+    return res.status(500).json({success:false, message:e.message});
+  }
+});
+
+app.get('/api/admin/pending-status', async (req,res)=>{
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.json({success:false, message:'No admin'});
+    const cutoff10 = new Date(Date.now() - 10*60*1000).toISOString();
+    const cutoff30 = new Date(Date.now() - 30*60*1000).toISOString();
+    const { data: all } = await supabaseAdmin.from('vip_requests').select('id,email,content,created_at,status').eq('status','PENDING').order('created_at',{ascending:true}).limit(200);
+    const bankStuck = (all||[]).filter(r=> new Date(r.created_at) < new Date(cutoff10) && !(r.content||'').toLowerCase().includes('usdt') && !(r.content||'').toLowerCase().includes('lemon'));
+    const longStuck = (all||[]).filter(r=> new Date(r.created_at) < new Date(cutoff30) && ((r.content||'').toLowerCase().includes('usdt') || (r.content||'').toLowerCase().includes('lemon')));
+    return res.json({success:true, total: all?.length||0, bankStuck: bankStuck.length, longStuck: longStuck.length, bankStuckList: bankStuck, longStuckList: longStuck, all});
+  }catch(e){ return res.status(500).json({success:false, message:e.message}); }
+});
 
 
 app.listen(PORT,()=>console.log(`🚀 KaraRender v5.5 FULL (Feedback + Telegram Full Info + Dropbox + Client tự gỡ) listening on ${PORT}`));
