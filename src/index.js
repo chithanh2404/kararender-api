@@ -3555,7 +3555,7 @@ async function autoRejectExpiredVipPending(){
     const { supabaseAdmin: admin } = require('./services/supabase');
     if(!admin) return;
     const cutoffBank = new Date(Date.now() - 10*60*1000).toISOString(); // 10 phút cho BANK
-    const cutoffUsdt = new Date(Date.now() - 30*60*1000).toISOString(); // 30 phút cho USDT BEP20
+    const cutoffUsdt = new Date(Date.now() - 30*60*1000).toISOString(); // 30 phút cho USDT/Lemon
 
     const { data: stuckUsers, error } = await admin.from('users')
       .select('id,email,request_vip_time')
@@ -3564,46 +3564,117 @@ async function autoRejectExpiredVipPending(){
       .lt('request_vip_time', cutoffBank)
       .limit(100);
 
-    if(error || !stuckUsers || stuckUsers.length===0) return;
-
-    console.log(`[VIP AutoReject] Found ${stuckUsers.length} PENDING >10m (check USDT 30m)`);
-
-    for(const u of stuckUsers){
-      try{
-        // Kiểm tra nếu user có PENDING USDT trong 30p gần nhất thì bỏ qua, cho thêm thời gian quét BSCScan
-        const { data: recentUsdt } = await admin.from('vip_requests')
-          .select('id,content,created_at')
-          .eq('email', u.email)
-          .eq('status','PENDING')
-          .ilike('content','%usdt%')
-          .gte('created_at', cutoffUsdt)
-          .limit(1);
-        
-        if(recentUsdt && recentUsdt.length>0){
-          console.log(`[VIP AutoReject] Skip ${u.email} - có USDT PENDING trong 30p, cho thêm thời gian quét BSCScan`);
-          continue;
+    if(stuckUsers && stuckUsers.length>0){
+      console.log(`[VIP AutoReject] Found ${stuckUsers.length} PENDING users >10m (check USDT/Lemon 30m)`);
+      for(const u of stuckUsers){
+        try{
+          const { data: recentLong } = await admin.from('vip_requests')
+            .select('id,content,created_at')
+            .eq('email', u.email)
+            .eq('status','PENDING')
+            .or('content.ilike.%usdt%,content.ilike.%lemon%')
+            .gte('created_at', cutoffUsdt)
+            .limit(1);
+          
+          if(recentLong && recentLong.length>0){
+            console.log(`[VIP AutoReject] Skip ${u.email} - có USDT/Lemon PENDING trong 30p`);
+            continue;
+          }
+        }catch(e){
+          console.warn('[VIP AutoReject] check USDT/Lemon error', e.message);
         }
-      }catch(e){
-        console.warn('[VIP AutoReject] check USDT error', e.message);
+
+        await admin.from('users').update({
+          vip_status: 'REJECTED',
+          updated_at: new Date().toISOString()
+        }).eq('id', u.id);
+
+        await admin.from('vip_requests').update({
+          status: 'REJECTED',
+          reason: 'auto_expired_10m_backend',
+          updated_at: new Date().toISOString()
+        }).eq('email', u.email).eq('status','PENDING');
       }
-
-      await admin.from('users').update({
-        vip_status: 'REJECTED',
-        updated_at: new Date().toISOString()
-      }).eq('id', u.id);
-
-      await admin.from('vip_requests').update({
-        status: 'REJECTED',
-        reason: 'auto_expired_10m_backend',
-        updated_at: new Date().toISOString()
-      }).eq('email', u.email).eq('status','PENDING');
     }
   }catch(e){
     console.log('[VIP AutoReject] error', e.message);
   }
 }
+
+// ===== FIX MỚI: DỌN TRỰC TIẾP vip_requests BỊ TREO DÙ users ĐÃ REJECTED =====
+async function autoRejectOrphanVipRequests(){
+  try{
+    const { supabaseAdmin: admin } = require('./services/supabase');
+    if(!admin) return;
+    const cutoffBank = new Date(Date.now() - 10*60*1000).toISOString();
+    const cutoffLong = new Date(Date.now() - 30*60*1000).toISOString();
+
+    // 1. Dọn BANK PENDING quá 10 phút (không chứa usdt, lemon)
+    const { data: bankStuck } = await admin.from('vip_requests')
+      .select('id,email,content,created_at')
+      .eq('status','PENDING')
+      .lt('created_at', cutoffBank)
+      .not('content','ilike','%usdt%')
+      .not('content','ilike','%lemon%')
+      .limit(100);
+
+    if(bankStuck && bankStuck.length>0){
+      console.log(`[VIP AutoReject Orphan] Found ${bankStuck.length} BANK PENDING >10m`);
+      const ids = bankStuck.map(r=>r.id);
+      await admin.from('vip_requests').update({
+        status:'REJECTED',
+        reason:'auto_expired_10m_orphan',
+        updated_at:new Date().toISOString()
+      }).in('id', ids);
+    }
+
+    // 2. Dọn USDT + LEMON PENDING quá 30 phút
+    const { data: longStuck } = await admin.from('vip_requests')
+      .select('id,email,content,created_at')
+      .eq('status','PENDING')
+      .lt('created_at', cutoffLong)
+      .or('content.ilike.%usdt%,content.ilike.%lemon%')
+      .limit(100);
+
+    if(longStuck && longStuck.length>0){
+      console.log(`[VIP AutoReject Orphan] Found ${longStuck.length} USDT/LEMON PENDING >30m`);
+      const ids = longStuck.map(r=>r.id);
+      await admin.from('vip_requests').update({
+        status:'REJECTED',
+        reason:'auto_expired_30m_orphan',
+        updated_at:new Date().toISOString()
+      }).in('id', ids);
+    }
+
+    // 3. Đồng bộ users: nếu user không còn PENDING nào mà vip_status vẫn PENDING và quá 10p thì REJECTED
+    if((bankStuck && bankStuck.length>0) || (longStuck && longStuck.length>0)){
+      const emails = [...(bankStuck||[]), ...(longStuck||[])].map(r=>r.email).filter(Boolean);
+      const uniqueEmails = [...new Set(emails.map(e=>e.toLowerCase()))];
+      for(const email of uniqueEmails.slice(0,20)){
+        try{
+          const { data: remaining } = await admin.from('vip_requests')
+            .select('id')
+            .eq('email', email)
+            .eq('status','PENDING')
+            .limit(1);
+          if(!remaining || remaining.length===0){
+            await admin.from('users').update({
+              vip_status:'REJECTED',
+              updated_at:new Date().toISOString()
+            }).eq('email', email).eq('vip_status','PENDING');
+          }
+        }catch(e){}
+      }
+    }
+
+  }catch(e){
+    console.log('[VIP AutoReject Orphan] error', e.message);
+  }
+}
 setInterval(autoRejectExpiredVipPending, 2*60*1000); // chạy mỗi 2 phút
 setTimeout(autoRejectExpiredVipPending, 15*1000); // chạy ngay khi start
+setInterval(autoRejectOrphanVipRequests, 2*60*1000); // dọn orphan PENDING mỗi 2 phút
+setTimeout(autoRejectOrphanVipRequests, 20*1000); // chạy ngay sau 20s
 
 
 // ===== AUTO EXPIRE TRIAL SAU 15 NGÀY KỂ TỪ NGÀY ĐĂNG KÝ =====
