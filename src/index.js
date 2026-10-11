@@ -1566,6 +1566,7 @@ app.all('/exec', async (req, res) => {
                         return res.type('text/plain').status(403).send('ERROR_TRIAL_EXPIRED: ' + blockMsg);
                       }
                       return sendJSONP({ success:false, blocked:true, code:'TRIAL_EXPIRED', message:blockMsg, error:blockMsg });
+                      }
                     }
                   }
                 }
