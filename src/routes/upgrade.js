@@ -603,7 +603,9 @@ router.post('/admin/payment-config', async (req, res) => {
 });
 
 
-// ===== USDT WALLETS - QUẢN TRỊ ADMIN =====
+// ====== USDT WALLET ROTATION FIX - COPY VÀO routes/upgrade.js ======
+// Thay thế toàn bộ đoạn từ const USDT_NETWORKS đến hết router.post('/payment/usdt/create'...)
+
 const USDT_NETWORKS = {
   'TRC20': { name: 'TRON (TRC20)', symbol: 'TRC20', chain: 'tron', explorer: 'https://tronscan.org/#/address/' },
   'ERC20': { name: 'Ethereum (ERC20)', symbol: 'ERC20', chain: 'eth', explorer: 'https://etherscan.io/address/' },
@@ -616,137 +618,204 @@ const USDT_NETWORKS = {
 const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || '7CIT8VTPA3VFB1KYEPK3FQDTA8NBK71YGT';
 const USDT_BEP20_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 
-let usdtPriceCache = { price: 0, time: 0 };
-async function getUsdtVndPrice(){
+// ====== CONFIG XOAY VÒNG ======
+const WALLET_BUSY_MINUTES = 30; // ví bận trong 30 phút
+const WALLET_LOCK_MS = 8000; // lock tạm 8s chống race condition khi 2 người cùng request
+
+// In-memory lock để chống 2 request cùng lúc lấy cùng 1 ví
+const walletLocks = new Map(); // walletId -> expire timestamp
+function isWalletLocked(walletId){
+  const exp = walletLocks.get(walletId);
+  if(!exp) return false;
+  if(Date.now() > exp){ walletLocks.delete(walletId); return false; }
+  return true;
+}
+function lockWallet(walletId){
+  walletLocks.set(walletId, Date.now() + WALLET_LOCK_MS);
+}
+function unlockWallet(walletId){
+  walletLocks.delete(walletId);
+}
+// dọn lock hết hạn mỗi phút
+setInterval(()=>{
   const now = Date.now();
-  if(usdtPriceCache.price && (now - usdtPriceCache.time < 60000)){
-    return usdtPriceCache.price;
+  for(const [id, exp] of walletLocks.entries()){
+    if(now > exp) walletLocks.delete(id);
   }
-  try{
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd', { signal: AbortSignal.timeout(5000) });
-    const data = await res.json();
-    if(data?.tether?.vnd){
-      usdtPriceCache = { price: parseFloat(data.tether.vnd), time: now };
-      console.log('[USDT Price] CoinGecko:', usdtPriceCache.price);
-      return usdtPriceCache.price;
+}, 60*1000);
+
+// ====== CORE: Lấy danh sách ví rảnh ======
+async function getWalletRotationStatus(){
+  if(!supabaseAdmin) return { all: [], free: [], busy: [], busyDetails: [] };
+  
+  // 1. Lấy tất cả ví active
+  const { data: allWallets, error: wErr } = await supabaseAdmin
+    .from('usdt_wallets')
+    .select('*')
+    .eq('is_active', true)
+    .order('created_at', { ascending: true });
+  
+  if(wErr || !allWallets || allWallets.length===0){
+    console.warn('[USDT Rotation] No active wallets', wErr?.message);
+    return { all: [], free: [], busy: [], busyDetails: [] };
+  }
+
+  // 2. Lấy các request PENDING trong 30 phút qua có chứa USDT
+  const cutoff = new Date(Date.now() - WALLET_BUSY_MINUTES*60*1000).toISOString();
+  const { data: pendings, error: pErr } = await supabaseAdmin
+    .from('vip_requests')
+    .select('id, email, content, created_at, plan_key')
+    .eq('status','PENDING')
+    .gte('created_at', cutoff)
+    .ilike('content','%usdt%')
+    .order('created_at', { ascending: true });
+
+  if(pErr){
+    console.warn('[USDT Rotation] query pending error', pErr.message);
+    // nếu lỗi query thì coi như tất cả rảnh để không block user
+    return { all: allWallets, free: allWallets, busy: [], busyDetails: [], pendings: [] };
+  }
+
+  // 3. Xác định ví nào đang bận
+  // Content hiện tại lưu dạng: "usdt email plan network usdtAmount ... | wallet:0xABC... | walletId:xxx | ..."
+  // Ta sẽ parse linh hoạt: chứa address, hoặc slice 10 ký tự đầu, hoặc walletId
+  const busyMap = new Map(); // walletId -> { pending, busyUntil }
+
+  for(const wallet of allWallets){
+    const addrLower = (wallet.address||'').toLowerCase();
+    const addrShort = addrLower.slice(0, 10); // vì code cũ lưu slice(0,10)
+    const addrShort2 = addrLower.slice(-8);
+    const idLower = String(wallet.id).toLowerCase();
+    
+    for(const p of (pendings||[])){
+      const contentLower = (p.content||'').toLowerCase();
+      // Check nhiều pattern để tương thích code cũ và mới
+      const isMatch = 
+        contentLower.includes(addrLower) ||
+        (addrShort && contentLower.includes(addrShort)) ||
+        contentLower.includes(`wallet:${addrShort}`) ||
+        contentLower.includes(`walletid:${idLower}`) ||
+        contentLower.includes(`wallet_id:${idLower}`) ||
+        contentLower.includes(`wallet ${idLower}`) ||
+        contentLower.includes(idLower) && contentLower.includes('wallet');
+      
+      if(isMatch){
+        const created = new Date(p.created_at);
+        const busyUntil = new Date(created.getTime() + WALLET_BUSY_MINUTES*60*1000);
+        // Nếu đã có trong busyMap thì giữ cái mới nhất
+        if(!busyMap.has(wallet.id) || new Date(busyMap.get(wallet.id).pending.created_at) < created){
+          busyMap.set(wallet.id, { wallet, pending: p, busyUntil });
+        }
+        break; // ví này đã bận, không cần check pending khác
+      }
     }
-  }catch(e){ console.warn('[USDT Price] CoinGecko fail', e.message); }
+  }
+
+  // 4. Lọc ví rảnh: không bận + không bị lock tạm
+  const busyList = Array.from(busyMap.values());
+  const busyIds = new Set(busyMap.keys());
+  const freeWallets = allWallets.filter(w => !busyIds.has(w.id) && !isWalletLocked(w.id));
+  const lockedWallets = allWallets.filter(w => isWalletLocked(w.id) && !busyIds.has(w.id));
+
+  // 5. Sắp xếp free wallets theo round-robin: ví nào lâu không dùng nhất lên đầu
+  // Lấy last_used từ lịch sử vip_requests (kể cả APPROVED) để fairness
   try{
-    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=USDTVND', { signal: AbortSignal.timeout(5000) });
-    const data = await res.json();
-    if(data?.price){
-      usdtPriceCache = { price: parseFloat(data.price), time: now };
-      console.log('[USDT Price] Binance:', usdtPriceCache.price);
-      return usdtPriceCache.price;
+    // Query last used cho từng ví free
+    const lastUsedMap = new Map();
+    for(const w of freeWallets){
+      const { data: last } = await supabaseAdmin
+        .from('vip_requests')
+        .select('created_at')
+        .ilike('content', `%${w.address.slice(0,10)}%`)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      lastUsedMap.set(w.id, last ? new Date(last.created_at).getTime() : 0); // 0 = chưa từng dùng -> ưu tiên
     }
-  }catch(e){ console.warn('[USDT Price] Binance fail', e.message); }
-  const fallback = parseFloat(process.env.VND_TO_USDT_RATE || '26200');
-  usdtPriceCache = { price: fallback, time: now };
-  console.log('[USDT Price] Fallback:', fallback);
-  return fallback;
+    freeWallets.sort((a,b)=> (lastUsedMap.get(a.id)||0) - (lastUsedMap.get(b.id)||0));
+  }catch(e){
+    console.warn('[USDT Rotation] sort error', e.message);
+  }
+
+  return {
+    all: allWallets,
+    free: freeWallets,
+    busy: allWallets.filter(w=>busyIds.has(w.id)),
+    busyDetails: busyList,
+    locked: lockedWallets,
+    pendings: pendings||[]
+  };
 }
 
-async function getUsdtPriceUsd(){
-  try{
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd', { signal: AbortSignal.timeout(5000) });
-    const data = await res.json();
-    if(data?.tether?.usd) return data.tether.usd;
-  }catch{}
-  return 1;
-}
-
+// ====== API: Public list wallets kèm trạng thái bận/rảnh ======
 router.get('/payment/usdt-wallets', async (req,res)=>{
   try{
     if(!supabaseAdmin){
-      return res.json({success:true, wallets:[], _mock:true});
+      return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
     }
-    const {data, error} = await supabaseAdmin.from('usdt_wallets').select('*').eq('is_active',true).order('created_at',{ascending:true});
-    if(error){
-      console.warn('[usdt-wallets public] error', error.message);
-      return res.json({success:true, wallets:[], _error:error.message});
-    }
-    res.json({success:true, wallets: data||[], networks: USDT_NETWORKS});
+    const rotation = await getWalletRotationStatus();
+    
+    // Trả về thêm is_busy, busy_until để frontend hiển thị nếu cần
+    const walletsWithStatus = rotation.all.map(w=>{
+      const busyInfo = rotation.busyDetails.find(b=>b.wallet.id===w.id);
+      return {
+        ...w,
+        is_busy: !!busyInfo || isWalletLocked(w.id),
+        busy_until: busyInfo ? busyInfo.busyUntil.toISOString() : (isWalletLocked(w.id) ? new Date(Date.now()+WALLET_LOCK_MS).toISOString() : null),
+        busy_by: busyInfo ? busyInfo.pending.email : null,
+        is_locked: isWalletLocked(w.id)
+      };
+    });
+
+    // Chỉ trả ví rảnh cho public? Hiện tại trả hết để debug, frontend sẽ tự chọn rảnh
+    // Nếu muốn chỉ trả ví rảnh: wallets: walletsWithStatus.filter(w=>!w.is_busy)
+    res.json({
+      success:true, 
+      wallets: walletsWithStatus.filter(w=>!w.is_busy || true), // giữ tất cả, frontend lọc
+      freeWallets: walletsWithStatus.filter(w=>!w.is_busy),
+      busyWallets: walletsWithStatus.filter(w=>w.is_busy),
+      networks: USDT_NETWORKS,
+      _rotation: {
+        total: rotation.all.length,
+        free: rotation.free.length,
+        busy: rotation.busy.length,
+        busyMinutes: WALLET_BUSY_MINUTES
+      }
+    });
   }catch(e){
-    res.status(500).json({success:false, message:e.message, wallets:[]});
+    console.error('[usdt-wallets public] error', e.message);
+    res.status(500).json({success:false, message:e.message});
   }
 });
 
 router.get('/admin/usdt-wallets', async (req,res)=>{
   try{
     if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
-    const {data, error} = await supabaseAdmin.from('usdt_wallets').select('*').order('created_at',{ascending:false});
+    const rotation = await getWalletRotationStatus();
+    const { data, error } = await supabaseAdmin.from('usdt_wallets').select('*').order('created_at',{ascending:false});
     if(error){
       console.warn('[admin/usdt-wallets] error', error.message);
       return res.json({success:true, wallets:[], _needCreateTable:true, message:'Bảng usdt_wallets chưa tồn tại, cần tạo trong Supabase', networks: USDT_NETWORKS});
     }
-    res.json({success:true, wallets: data||[], networks: USDT_NETWORKS});
+    // gắn thêm trạng thái busy cho admin
+    const enriched = (data||[]).map(w=>{
+      const busyInfo = rotation.busyDetails.find(b=>b.wallet.id===w.id);
+      return {
+        ...w,
+        is_busy: !!busyInfo,
+        busy_until: busyInfo?.busyUntil?.toISOString() || null,
+        busy_by: busyInfo?.pending?.email || null,
+        pending_id: busyInfo?.pending?.id || null,
+        is_locked: isWalletLocked(w.id)
+      };
+    });
+    res.json({success:true, wallets: enriched, networks: USDT_NETWORKS, _rotation: { total: rotation.all.length, free: rotation.free.length, busy: rotation.busy.length }});
   }catch(e){
     res.status(500).json({success:false, message:e.message});
   }
 });
 
-router.post('/admin/usdt-wallets', async (req,res)=>{
-  try{
-    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
-    const { id, network, address, label, is_active } = req.body;
-    if(!network || !address){
-      return res.status(400).json({success:false, message:'Thiếu network hoặc address'});
-    }
-    if(!USDT_NETWORKS[network]){
-      return res.status(400).json({success:false, message:'Network không hợp lệ. Chọn: '+Object.keys(USDT_NETWORKS).join(', ')});
-    }
-    const addr = address.trim();
-    if(addr.length < 20){
-      return res.status(400).json({success:false, message:'Địa chỉ ví quá ngắn'});
-    }
-    let payload = {
-      network: network.toUpperCase(),
-      address: addr,
-      label: (label||`${network} Wallet`).trim(),
-      is_active: is_active !== false,
-      updated_at: new Date().toISOString()
-    };
-    if(id){
-      const {data, error} = await supabaseAdmin.from('usdt_wallets').update(payload).eq('id', id).select().single();
-      if(error) throw error;
-      console.log(`[usdt-wallets] Updated ${id} ${network} ${addr}`);
-      return res.json({success:true, wallet: data});
-    }else{
-      payload.created_at = new Date().toISOString();
-      const {data, error} = await supabaseAdmin.from('usdt_wallets').insert(payload).select().single();
-      if(error) throw error;
-      console.log(`[usdt-wallets] Created ${network} ${addr}`);
-      return res.json({success:true, wallet: data});
-    }
-  }catch(e){
-    console.error('[admin/usdt-wallets] save error', e.message);
-    res.status(500).json({success:false, message:e.message});
-  }
-});
-
-router.delete('/admin/usdt-wallets/:id', async (req,res)=>{
-  try{
-    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
-    const {id} = req.params;
-    const {error} = await supabaseAdmin.from('usdt_wallets').delete().eq('id', id);
-    if(error) throw error;
-    console.log(`[usdt-wallets] Deleted ${id}`);
-    res.json({success:true});
-  }catch(e){
-    res.status(500).json({success:false, message:e.message});
-  }
-});
-
-router.get('/payment/usdt/price', async (req,res)=>{
-  try{
-    const vndPrice = await getUsdtVndPrice();
-    const usdPrice = await getUsdtPriceUsd();
-    res.json({success:true, vnd: vndPrice, usd: usdPrice, timestamp: new Date().toISOString(), source: 'coingecko/binance'});
-  }catch(e){
-    res.status(500).json({success:false, message:e.message, vnd: 26200, usd: 1});
-  }
-});
-
+// ====== API: CREATE USDT PAYMENT VỚI XOAY VÒNG ======
 router.post('/payment/usdt/create', async (req,res)=>{
   try{
     if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
@@ -754,41 +823,12 @@ router.post('/payment/usdt/create', async (req,res)=>{
     if(!email || !planKey) return res.status(400).json({success:false, message:'Thiếu email hoặc planKey'});
     
     const plansRes = await getPlans(false);
-    const plan = plansRes.plans.find(p=>p.key===planKey)||{price:0, label:planKey, months:1};
+    const plan = plansRes.plans.find(p=>p.key===planKey)||{price:0, label:planKey, months:1, key:planKey};
     
-    let wallet = null;
-    if(walletId){
-      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('id', walletId).single();
-      wallet = data;
-    }else if(network){
-      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network', network).eq('is_active', true).limit(1).maybeSingle();
-      wallet = data;
-    }else{
-      const {data: bep20} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).order('created_at',{ascending:true}).limit(1).maybeSingle();
-      if(bep20) wallet = bep20;
-      else {
-        const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('is_active', true).order('created_at',{ascending:true}).limit(1).maybeSingle();
-        wallet = data;
-      }
-    }
-    
-    if(!wallet){
-      return res.status(400).json({success:false, message:'Chưa cấu hình ví USDT nào. Admin cần thêm ví BEP20 trong Dashboard tab USDT.'});
-    }
-    
-    const vndPrice = await getUsdtVndPrice();
-    const usdPrice = await getUsdtPriceUsd();
-    const usdtAmount = parseFloat((plan.price / vndPrice).toFixed(4));
-    
-    let fullName = email;
-    try{
-      const {data:user} = await supabaseAdmin.from('users').select('full_name').eq('email', email.toLowerCase()).single();
-      if(user?.full_name) fullName = user.full_name;
-    }catch{}
-    
+    // 1. Check duplicate cho chính email này trong 10 phút qua -> trả lại ví cũ nếu còn pending
     try{
       const tenMinAgo = new Date(Date.now() - 10*60*1000).toISOString();
-      const {data: existingPending} = await supabaseAdmin.from('vip_requests')
+      const { data: existingPending } = await supabaseAdmin.from('vip_requests')
         .select('id, created_at, plan_key, amount, content')
         .eq('email', email.toLowerCase())
         .eq('status','PENDING')
@@ -800,43 +840,172 @@ router.post('/payment/usdt/create', async (req,res)=>{
         .maybeSingle();
       
       if(existingPending){
-        console.log(`[usdt/create] Duplicate detected, return existing ${existingPending.id}`);
-        return res.json({
-          success:true,
-          requestId: existingPending.id,
-          _duplicate:true,
-          wallet: {
-            id: wallet.id,
-            network: wallet.network,
-            address: wallet.address,
-            label: wallet.label,
-            explorer: USDT_NETWORKS[wallet.network]?.explorer + wallet.address
-          },
-          plan: { key: plan.key, label: plan.label, months: plan.months, priceVND: plan.price, priceUSDT: usdtAmount },
-          amount: { vnd: plan.price, usdt: usdtAmount, vndPerUsdt: vndPrice, usdPerUsdt: usdPrice },
-          content: existingPending.content
-        });
+        // Parse lại wallet từ content để trả đúng ví đang pending
+        let existingWallet = null;
+        const contentLower = (existingPending.content||'').toLowerCase();
+        const rotationForDup = await getWalletRotationStatus();
+        for(const w of rotationForDup.all){
+          if(contentLower.includes(w.address.toLowerCase()) || contentLower.includes(w.address.slice(0,10).toLowerCase())){
+            existingWallet = w;
+            break;
+          }
+        }
+        // Nếu không parse được thì lấy ví đầu tiên active (fallback)
+        if(!existingWallet){
+          const { data: fallback } = await supabaseAdmin.from('usdt_wallets').select('*').eq('is_active', true).order('created_at',{ascending:true}).limit(1).maybeSingle();
+          existingWallet = fallback;
+        }
+
+        if(existingWallet){
+          const vndPriceDup = await getUsdtVndPrice();
+          const usdPriceDup = await getUsdtPriceUsd();
+          const usdtAmountDup = parseFloat((plan.price / vndPriceDup).toFixed(4));
+          console.log(`[usdt/create] Duplicate detected for ${email}, return existing ${existingPending.id} wallet ${existingWallet.address.slice(0,10)}...`);
+          return res.json({
+            success:true,
+            requestId: existingPending.id,
+            _duplicate:true,
+            _rotation: { reason: 'existing_pending_within_10m' },
+            wallet: {
+              id: existingWallet.id,
+              network: existingWallet.network,
+              address: existingWallet.address,
+              label: existingWallet.label,
+              explorer: USDT_NETWORKS[existingWallet.network]?.explorer + existingWallet.address
+            },
+            plan: { key: plan.key, label: plan.label, months: plan.months, priceVND: plan.price, priceUSDT: usdtAmountDup },
+            amount: { vnd: plan.price, usdt: usdtAmountDup, vndPerUsdt: vndPriceDup, usdPerUsdt: usdPriceDup },
+            content: existingPending.content
+          });
+        }
       }
     }catch(e){ console.warn('[usdt/create] duplicate check error', e.message); }
+
+    // 2. Lấy trạng thái xoay vòng ví
+    const rotation = await getWalletRotationStatus();
+
+    if(!rotation.all || rotation.all.length===0){
+      return res.status(400).json({success:false, message:'Chưa cấu hình ví USDT nào. Admin cần thêm ví BEP20 trong Dashboard tab USDT.'});
+    }
+
+    // 3. Chọn ví
+    let wallet = null;
     
-    const content = `usdt ${email} ${planKey} ${wallet.network} ${usdtAmount}USDT rate:${vndPrice}`;
-    const {data: reqData, error: reqErr} = await supabaseAdmin.from('vip_requests').insert({
-      email: email.toLowerCase(),
-      full_name: fullName,
-      plan_key: planKey,
-      amount: plan.price,
-      content: content + ` | wallet:${wallet.address.slice(0,10)}... | tx:pending | expected:${usdtAmount}USDT`,
-      status: 'PENDING'
-    }).select().single();
-    
-    if(reqErr){
-      console.error('[usdt/create] insert error', reqErr.message);
-      return res.status(500).json({success:false, message:reqErr.message});
+    // Nếu client cố tình gửi walletId -> kiểm tra xem ví đó có đang bận không
+    if(walletId){
+      const requested = rotation.all.find(w=>String(w.id)===String(walletId));
+      if(requested){
+        const isBusy = rotation.busy.some(b=>b.id===requested.id) || isWalletLocked(requested.id);
+        if(isBusy){
+          // Nếu ví yêu cầu đang bận, tự động chuyển sang ví rảnh (theo yêu cầu xoay vòng)
+          console.log(`[usdt/create] Requested wallet ${walletId} is busy, auto rotate to free wallet`);
+          if(rotation.free.length>0){
+            wallet = rotation.free[0];
+          }else{
+            const nextFreeIn = rotation.busyDetails.length>0 ? Math.min(...rotation.busyDetails.map(b=> b.busyUntil.getTime() - Date.now())) : 0;
+            return res.status(409).json({
+              success:false, 
+              message:`Ví ${requested.label||requested.address.slice(0,10)}... đang bận. Tất cả ${rotation.all.length} ví đều bận. Vui lòng thử lại sau ${Math.ceil(nextFreeIn/60000)} phút.`,
+              code:'ALL_WALLETS_BUSY',
+              busyDetails: rotation.busyDetails.map(b=>({ walletId: b.wallet.id, address: b.wallet.address, busyUntil: b.busyUntil, email: b.pending.email })),
+              nextAvailableInMs: nextFreeIn
+            });
+          }
+        }else{
+          wallet = requested;
+        }
+      }
     }
     
+    // Nếu chưa có ví (không gửi walletId hoặc ví yêu cầu bận) -> lấy ví rảnh theo xoay vòng
+    if(!wallet){
+      if(network){
+        // Lọc theo network yêu cầu
+        const freeByNetwork = rotation.free.filter(w=>w.network===network);
+        if(freeByNetwork.length>0){
+          wallet = freeByNetwork[0];
+        }else{
+          // Nếu không còn ví rảnh cho network đó, thử network khác hoặc báo bận
+          const busyByNetwork = rotation.busy.filter(w=>w.network===network);
+          if(busyByNetwork.length>0 && rotation.free.length===0){
+            const nextFreeIn = rotation.busyDetails.filter(b=>b.wallet.network===network).reduce((min,b)=> Math.min(min, b.busyUntil.getTime()-Date.now()), Infinity);
+            return res.status(409).json({
+              success:false,
+              message:`Tất cả ví ${network} đang bận (${busyByNetwork.length} ví). Vui lòng thử lại sau ${Math.ceil(nextFreeIn/60000)} phút hoặc chọn mạng khác.`,
+              code:'NETWORK_WALLETS_BUSY',
+              network,
+              freeWallets: rotation.free
+            });
+          }
+          wallet = rotation.free[0] || null;
+        }
+      }else{
+        // Mặc định ưu tiên BEP20 rảnh
+        const freeBep20 = rotation.free.filter(w=>w.network==='BEP20');
+        wallet = (freeBep20.length>0 ? freeBep20[0] : rotation.free[0]) || null;
+      }
+    }
+
+    // 4. Nếu không còn ví rảnh nào
+    if(!wallet){
+      const nextFreeIn = rotation.busyDetails.length>0 ? Math.min(...rotation.busyDetails.map(b=> b.busyUntil.getTime() - Date.now())) : WALLET_BUSY_MINUTES*60*1000;
+      return res.status(409).json({
+        success:false,
+        message:`Tất cả ${rotation.all.length} ví USDT đang bận. Ví 1 sẽ rảnh sau ${Math.ceil(nextFreeIn/60000)} phút. Vui lòng thử lại sau.`,
+        code:'ALL_WALLETS_BUSY',
+        totalWallets: rotation.all.length,
+        busyCount: rotation.busy.length,
+        freeCount: 0,
+        nextAvailableInMs: nextFreeIn,
+        busyDetails: rotation.busyDetails.map(b=>({
+          walletId: b.wallet.id,
+          label: b.wallet.label,
+          address: b.wallet.address.slice(0,10)+'...',
+          network: b.wallet.network,
+          busyUntil: b.busyUntil,
+          email: b.pending.email,
+          pendingId: b.pending.id
+        }))
+      });
+    }
+
+    // 5. Lock ví tạm thời chống race condition
+    lockWallet(wallet.id);
+
+    // 6. Tính giá
+    const vndPrice = await getUsdtVndPrice();
+    const usdPrice = await getUsdtPriceUsd();
+    const usdtAmount = parseFloat((plan.price / vndPrice).toFixed(4));
+    
+    let fullName = email;
     try{
-      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-      const msg = `💸 <b>YÊU CẦU USDT - KARARENDER</b> 💸
+      const {data:user} = await supabaseAdmin.from('users').select('full_name').eq('email', email.toLowerCase()).single();
+      if(user?.full_name) fullName = user.full_name;
+    }catch{}
+
+    // 7. Tạo content mới có đủ thông tin để rotation parse được (quan trọng!)
+    const content = `usdt ${email} ${planKey} ${wallet.network} ${usdtAmount}USDT rate:${vndPrice} walletId:${wallet.id} wallet:${wallet.address} wallet_label:${wallet.label||''}`;
+
+    try{
+      const {data: reqData, error: reqErr} = await supabaseAdmin.from('vip_requests').insert({
+        email: email.toLowerCase(),
+        full_name: fullName,
+        plan_key: planKey,
+        amount: plan.price,
+        content: content + ` | tx:pending | expected:${usdtAmount}USDT | rotation:free=${rotation.free.length},busy=${rotation.busy.length}`,
+        status: 'PENDING'
+      }).select().single();
+      
+      if(reqErr){
+        unlockWallet(wallet.id);
+        console.error('[usdt/create] insert error', reqErr.message);
+        return res.status(500).json({success:false, message:reqErr.message});
+      }
+
+      // Gửi Telegram
+      try{
+        const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+        const msg = `💸 <b>YÊU CẦU USDT - XOAY VÒNG VÍ</b> 💸
 ━━━━━━━━━━━━━━
 👤 <b>Email:</b> ${email}
 👤 <b>Tên:</b> ${fullName}
@@ -845,46 +1014,65 @@ router.post('/payment/usdt/create', async (req,res)=>{
 💵 <b>USDT:</b> ${usdtAmount} USDT (BEP20)
 💱 <b>Tỷ giá:</b> ${vndPrice.toLocaleString('vi-VN')} VND/USDT
 🌐 <b>Mạng:</b> ${wallet.network}
-👛 <b>Ví:</b> <code>${wallet.address}</code>
+👛 <b>Ví được chọn (xoay vòng):</b> <code>${wallet.address}</code>
+🏷️ <b>Nhãn:</b> ${wallet.label||'N/A'} (ID: ${wallet.id})
+📊 <b>Trạng thái xoay:</b> ${rotation.free.length+1} ví tổng, ${rotation.busy.length} đang bận, ${rotation.free.length} rảnh trước khi chọn
 📝 <b>Nội dung:</b> <code>${content}</code>
 ⏰ <b>Thời gian:</b> ${timeVN}
 🆔 <b>Request ID:</b> <code>${reqData?.id||'N/A'}</code>
+⏳ <b>Ví bận trong:</b> ${WALLET_BUSY_MINUTES} phút
 ━━━━━━━━━━━━━━
 ⚠️ User sẽ chuyển USDT BEP20 và hệ thống tự quét BSCScan`;
-      await sendTelegramDirect(msg);
-    }catch(e){ console.warn('[usdt/create] telegram error', e.message); }
-    
-    res.json({
-      success:true,
-      requestId: reqData?.id,
-      wallet: {
-        id: wallet.id,
-        network: wallet.network,
-        address: wallet.address,
-        label: wallet.label,
-        explorer: USDT_NETWORKS[wallet.network]?.explorer + wallet.address
-      },
-      plan: {
-        key: plan.key,
-        label: plan.label,
-        months: plan.months,
-        priceVND: plan.price,
-        priceUSDT: usdtAmount
-      },
-      amount: {
-        vnd: plan.price,
-        usdt: usdtAmount,
-        vndPerUsdt: vndPrice,
-        usdPerUsdt: usdPrice
-      },
-      content: content
-    });
+        await sendTelegramDirect(msg);
+      }catch(e){ console.warn('[usdt/create] telegram error', e.message); }
+      
+      // Giữ lock thêm 5s để chắc chắn request đã commit
+      setTimeout(()=>unlockWallet(wallet.id), 5000);
+
+      res.json({
+        success:true,
+        requestId: reqData?.id,
+        wallet: {
+          id: wallet.id,
+          network: wallet.network,
+          address: wallet.address,
+          label: wallet.label,
+          explorer: USDT_NETWORKS[wallet.network]?.explorer + wallet.address
+        },
+        plan: {
+          key: plan.key,
+          label: plan.label,
+          months: plan.months,
+          priceVND: plan.price,
+          priceUSDT: usdtAmount
+        },
+        amount: {
+          vnd: plan.price,
+          usdt: usdtAmount,
+          vndPerUsdt: vndPrice,
+          usdPerUsdt: usdPrice
+        },
+        content: content,
+        _rotation: {
+          total: rotation.all.length,
+          freeBefore: rotation.free.length,
+          busyBefore: rotation.busy.length,
+          selectedWalletId: wallet.id,
+          busyMinutes: WALLET_BUSY_MINUTES
+        }
+      });
+
+    }catch(insertErr){
+      unlockWallet(wallet.id);
+      throw insertErr;
+    }
     
   }catch(e){
     console.error('[usdt/create] fatal', e.message, e.stack);
     res.status(500).json({success:false, message:e.message});
   }
 });
+
 
 async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=null){
   const apiKey = BSCSCAN_API_KEY;
