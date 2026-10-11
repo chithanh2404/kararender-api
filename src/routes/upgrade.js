@@ -603,6 +603,569 @@ router.post('/admin/payment-config', async (req, res) => {
 });
 
 
+// ===== USDT WALLETS - QUẢN TRỊ ADMIN =====
+const USDT_NETWORKS = {
+  'TRC20': { name: 'TRON (TRC20)', symbol: 'TRC20', chain: 'tron', explorer: 'https://tronscan.org/#/address/' },
+  'ERC20': { name: 'Ethereum (ERC20)', symbol: 'ERC20', chain: 'eth', explorer: 'https://etherscan.io/address/' },
+  'BEP20': { name: 'BSC (BEP20)', symbol: 'BEP20', chain: 'bsc', explorer: 'https://bscscan.com/address/' },
+  'POLYGON': { name: 'Polygon', symbol: 'POLYGON', chain: 'polygon', explorer: 'https://polygonscan.com/address/' },
+  'ARBITRUM': { name: 'Arbitrum', symbol: 'ARBITRUM', chain: 'arbitrum', explorer: 'https://arbiscan.io/address/' },
+  'SOL': { name: 'Solana', symbol: 'SOL', chain: 'sol', explorer: 'https://solscan.io/account/' }
+};
+
+const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || '7CIT8VTPA3VFB1KYEPK3FQDTA8NBK71YGT';
+const USDT_BEP20_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
+
+let usdtPriceCache = { price: 0, time: 0 };
+async function getUsdtVndPrice(){
+  const now = Date.now();
+  if(usdtPriceCache.price && (now - usdtPriceCache.time < 60000)){
+    return usdtPriceCache.price;
+  }
+  try{
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd', { signal: AbortSignal.timeout(5000) });
+    const data = await res.json();
+    if(data?.tether?.vnd){
+      usdtPriceCache = { price: parseFloat(data.tether.vnd), time: now };
+      console.log('[USDT Price] CoinGecko:', usdtPriceCache.price);
+      return usdtPriceCache.price;
+    }
+  }catch(e){ console.warn('[USDT Price] CoinGecko fail', e.message); }
+  try{
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=USDTVND', { signal: AbortSignal.timeout(5000) });
+    const data = await res.json();
+    if(data?.price){
+      usdtPriceCache = { price: parseFloat(data.price), time: now };
+      console.log('[USDT Price] Binance:', usdtPriceCache.price);
+      return usdtPriceCache.price;
+    }
+  }catch(e){ console.warn('[USDT Price] Binance fail', e.message); }
+  const fallback = parseFloat(process.env.VND_TO_USDT_RATE || '26200');
+  usdtPriceCache = { price: fallback, time: now };
+  console.log('[USDT Price] Fallback:', fallback);
+  return fallback;
+}
+
+async function getUsdtPriceUsd(){
+  try{
+    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd', { signal: AbortSignal.timeout(5000) });
+    const data = await res.json();
+    if(data?.tether?.usd) return data.tether.usd;
+  }catch{}
+  return 1;
+}
+
+router.get('/payment/usdt-wallets', async (req,res)=>{
+  try{
+    if(!supabaseAdmin){
+      return res.json({success:true, wallets:[], _mock:true});
+    }
+    const {data, error} = await supabaseAdmin.from('usdt_wallets').select('*').eq('is_active',true).order('created_at',{ascending:true});
+    if(error){
+      console.warn('[usdt-wallets public] error', error.message);
+      return res.json({success:true, wallets:[], _error:error.message});
+    }
+    res.json({success:true, wallets: data||[], networks: USDT_NETWORKS});
+  }catch(e){
+    res.status(500).json({success:false, message:e.message, wallets:[]});
+  }
+});
+
+router.get('/admin/usdt-wallets', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const {data, error} = await supabaseAdmin.from('usdt_wallets').select('*').order('created_at',{ascending:false});
+    if(error){
+      console.warn('[admin/usdt-wallets] error', error.message);
+      return res.json({success:true, wallets:[], _needCreateTable:true, message:'Bảng usdt_wallets chưa tồn tại, cần tạo trong Supabase', networks: USDT_NETWORKS});
+    }
+    res.json({success:true, wallets: data||[], networks: USDT_NETWORKS});
+  }catch(e){
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+router.post('/admin/usdt-wallets', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { id, network, address, label, is_active } = req.body;
+    if(!network || !address){
+      return res.status(400).json({success:false, message:'Thiếu network hoặc address'});
+    }
+    if(!USDT_NETWORKS[network]){
+      return res.status(400).json({success:false, message:'Network không hợp lệ. Chọn: '+Object.keys(USDT_NETWORKS).join(', ')});
+    }
+    const addr = address.trim();
+    if(addr.length < 20){
+      return res.status(400).json({success:false, message:'Địa chỉ ví quá ngắn'});
+    }
+    let payload = {
+      network: network.toUpperCase(),
+      address: addr,
+      label: (label||`${network} Wallet`).trim(),
+      is_active: is_active !== false,
+      updated_at: new Date().toISOString()
+    };
+    if(id){
+      const {data, error} = await supabaseAdmin.from('usdt_wallets').update(payload).eq('id', id).select().single();
+      if(error) throw error;
+      console.log(`[usdt-wallets] Updated ${id} ${network} ${addr}`);
+      return res.json({success:true, wallet: data});
+    }else{
+      payload.created_at = new Date().toISOString();
+      const {data, error} = await supabaseAdmin.from('usdt_wallets').insert(payload).select().single();
+      if(error) throw error;
+      console.log(`[usdt-wallets] Created ${network} ${addr}`);
+      return res.json({success:true, wallet: data});
+    }
+  }catch(e){
+    console.error('[admin/usdt-wallets] save error', e.message);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+router.delete('/admin/usdt-wallets/:id', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const {id} = req.params;
+    const {error} = await supabaseAdmin.from('usdt_wallets').delete().eq('id', id);
+    if(error) throw error;
+    console.log(`[usdt-wallets] Deleted ${id}`);
+    res.json({success:true});
+  }catch(e){
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+router.get('/payment/usdt/price', async (req,res)=>{
+  try{
+    const vndPrice = await getUsdtVndPrice();
+    const usdPrice = await getUsdtPriceUsd();
+    res.json({success:true, vnd: vndPrice, usd: usdPrice, timestamp: new Date().toISOString(), source: 'coingecko/binance'});
+  }catch(e){
+    res.status(500).json({success:false, message:e.message, vnd: 26200, usd: 1});
+  }
+});
+
+router.post('/payment/usdt/create', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { email, planKey, network, walletId } = req.body;
+    if(!email || !planKey) return res.status(400).json({success:false, message:'Thiếu email hoặc planKey'});
+    
+    const plansRes = await getPlans(false);
+    const plan = plansRes.plans.find(p=>p.key===planKey)||{price:0, label:planKey, months:1};
+    
+    let wallet = null;
+    if(walletId){
+      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('id', walletId).single();
+      wallet = data;
+    }else if(network){
+      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network', network).eq('is_active', true).limit(1).maybeSingle();
+      wallet = data;
+    }else{
+      const {data: bep20} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).order('created_at',{ascending:true}).limit(1).maybeSingle();
+      if(bep20) wallet = bep20;
+      else {
+        const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('is_active', true).order('created_at',{ascending:true}).limit(1).maybeSingle();
+        wallet = data;
+      }
+    }
+    
+    if(!wallet){
+      return res.status(400).json({success:false, message:'Chưa cấu hình ví USDT nào. Admin cần thêm ví BEP20 trong Dashboard tab USDT.'});
+    }
+    
+    const vndPrice = await getUsdtVndPrice();
+    const usdPrice = await getUsdtPriceUsd();
+    const usdtAmount = parseFloat((plan.price / vndPrice).toFixed(4));
+    
+    let fullName = email;
+    try{
+      const {data:user} = await supabaseAdmin.from('users').select('full_name').eq('email', email.toLowerCase()).single();
+      if(user?.full_name) fullName = user.full_name;
+    }catch{}
+    
+    try{
+      const tenMinAgo = new Date(Date.now() - 10*60*1000).toISOString();
+      const {data: existingPending} = await supabaseAdmin.from('vip_requests')
+        .select('id, created_at, plan_key, amount, content')
+        .eq('email', email.toLowerCase())
+        .eq('status','PENDING')
+        .eq('plan_key', planKey)
+        .ilike('content','%usdt%')
+        .gte('created_at', tenMinAgo)
+        .order('created_at',{ascending:false})
+        .limit(1)
+        .maybeSingle();
+      
+      if(existingPending){
+        console.log(`[usdt/create] Duplicate detected, return existing ${existingPending.id}`);
+        return res.json({
+          success:true,
+          requestId: existingPending.id,
+          _duplicate:true,
+          wallet: {
+            id: wallet.id,
+            network: wallet.network,
+            address: wallet.address,
+            label: wallet.label,
+            explorer: USDT_NETWORKS[wallet.network]?.explorer + wallet.address
+          },
+          plan: { key: plan.key, label: plan.label, months: plan.months, priceVND: plan.price, priceUSDT: usdtAmount },
+          amount: { vnd: plan.price, usdt: usdtAmount, vndPerUsdt: vndPrice, usdPerUsdt: usdPrice },
+          content: existingPending.content
+        });
+      }
+    }catch(e){ console.warn('[usdt/create] duplicate check error', e.message); }
+    
+    const content = `usdt ${email} ${planKey} ${wallet.network} ${usdtAmount}USDT rate:${vndPrice}`;
+    const {data: reqData, error: reqErr} = await supabaseAdmin.from('vip_requests').insert({
+      email: email.toLowerCase(),
+      full_name: fullName,
+      plan_key: planKey,
+      amount: plan.price,
+      content: content + ` | wallet:${wallet.address.slice(0,10)}... | tx:pending | expected:${usdtAmount}USDT`,
+      status: 'PENDING'
+    }).select().single();
+    
+    if(reqErr){
+      console.error('[usdt/create] insert error', reqErr.message);
+      return res.status(500).json({success:false, message:reqErr.message});
+    }
+    
+    try{
+      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const msg = `💸 <b>YÊU CẦU USDT - KARARENDER</b> 💸
+━━━━━━━━━━━━━━
+👤 <b>Email:</b> ${email}
+👤 <b>Tên:</b> ${fullName}
+💳 <b>Gói:</b> ${planKey} (${plan.months} tháng)
+💰 <b>VND:</b> ${plan.price.toLocaleString('vi-VN')}đ
+💵 <b>USDT:</b> ${usdtAmount} USDT (BEP20)
+💱 <b>Tỷ giá:</b> ${vndPrice.toLocaleString('vi-VN')} VND/USDT
+🌐 <b>Mạng:</b> ${wallet.network}
+👛 <b>Ví:</b> <code>${wallet.address}</code>
+📝 <b>Nội dung:</b> <code>${content}</code>
+⏰ <b>Thời gian:</b> ${timeVN}
+🆔 <b>Request ID:</b> <code>${reqData?.id||'N/A'}</code>
+━━━━━━━━━━━━━━
+⚠️ User sẽ chuyển USDT BEP20 và hệ thống tự quét BSCScan`;
+      await sendTelegramDirect(msg);
+    }catch(e){ console.warn('[usdt/create] telegram error', e.message); }
+    
+    res.json({
+      success:true,
+      requestId: reqData?.id,
+      wallet: {
+        id: wallet.id,
+        network: wallet.network,
+        address: wallet.address,
+        label: wallet.label,
+        explorer: USDT_NETWORKS[wallet.network]?.explorer + wallet.address
+      },
+      plan: {
+        key: plan.key,
+        label: plan.label,
+        months: plan.months,
+        priceVND: plan.price,
+        priceUSDT: usdtAmount
+      },
+      amount: {
+        vnd: plan.price,
+        usdt: usdtAmount,
+        vndPerUsdt: vndPrice,
+        usdPerUsdt: usdPrice
+      },
+      content: content
+    });
+    
+  }catch(e){
+    console.error('[usdt/create] fatal', e.message, e.stack);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=null){
+  const apiKey = BSCSCAN_API_KEY;
+  const contract = USDT_BEP20_CONTRACT;
+  try{
+    const url = `https://api.bscscan.com/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc&apikey=${apiKey}`;
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const data = await res.json();
+    
+    if(data.status !== '1' || !data.result || !Array.isArray(data.result)){
+      console.warn('[BSCScan] API error', data.message, JSON.stringify(data).slice(0,500));
+      return { found:false, error: data.message || 'BSCScan API error', raw: data };
+    }
+    
+    if(txHashFilter){
+      const tx = data.result.find(t=> t.hash?.toLowerCase() === txHashFilter.toLowerCase());
+      if(!tx){
+        return { found:false, reason:'TxHash không tìm thấy trong 20 giao dịch gần nhất của ví này' };
+      }
+      if(tx.to?.toLowerCase() !== walletAddress.toLowerCase()){
+        return { found:false, reason:`Tx này không gửi đến ví ${walletAddress}, mà đến ${tx.to}` };
+      }
+      const value = parseFloat(tx.value) / 1e18;
+      const minRequired = expectedUsdt * 0.97;
+      if(value < minRequired){
+        return { found:false, reason:`Số tiền không đủ. Nhận ${value} USDT, yêu cầu tối thiểu ${minRequired} USDT (expected ${expectedUsdt})`, tx, value };
+      }
+      return { found:true, tx, value, from: tx.from, to: tx.to };
+    }
+    
+    const fifteenMinAgo = Math.floor(Date.now()/1000) - 15*60;
+    const candidates = data.result.filter(t=>{
+      const toMatch = t.to?.toLowerCase() === walletAddress.toLowerCase();
+      const timeMatch = parseInt(t.timeStamp) >= fifteenMinAgo;
+      const value = parseFloat(t.value) / 1e18;
+      const amountMatch = value >= expectedUsdt * 0.97;
+      return toMatch && timeMatch && amountMatch;
+    });
+    
+    if(candidates.length>0){
+      const tx = candidates[0];
+      const value = parseFloat(tx.value) / 1e18;
+      return { found:true, tx, value, from: tx.from, to: tx.to, autoDetected:true };
+    }
+    
+    return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: data.result.length };
+    
+  }catch(e){
+    console.error('[BSCScan] fetch error', e.message);
+    return { found:false, error: e.message };
+  }
+}
+
+router.post('/payment/usdt/verify', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { email, requestId, txHash, walletId } = req.body;
+    
+    let targetReq = null;
+    if(requestId){
+      const {data} = await supabaseAdmin.from('vip_requests').select('*').eq('id', requestId).single();
+      targetReq = data;
+    }else if(email){
+      const {data} = await supabaseAdmin.from('vip_requests').select('*').eq('email', email.toLowerCase()).eq('status','PENDING').ilike('content','%usdt%').order('created_at',{ascending:false}).limit(1).maybeSingle();
+      targetReq = data;
+    }
+    
+    if(!targetReq){
+      return res.status(400).json({success:false, message:'Không tìm thấy yêu cầu USDT PENDING'});
+    }
+    
+    if(txHash){
+      const cleanHash = txHash.trim();
+      const {data: existingTx} = await supabaseAdmin.from('vip_requests').select('id').ilike('content', `%${cleanHash}%`).eq('status','APPROVED').limit(1);
+      if(existingTx && existingTx.length>0){
+        return res.status(400).json({success:false, message:'TxHash này đã được sử dụng trước đó!'});
+      }
+    }
+    
+    let wallet = null;
+    if(walletId){
+      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('id', walletId).maybeSingle();
+      wallet = data;
+    }
+    if(!wallet){
+      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).limit(1).maybeSingle();
+      if(data) wallet = data;
+      else {
+        const {data: anyWallet} = await supabaseAdmin.from('usdt_wallets').select('*').eq('is_active', true).limit(1).maybeSingle();
+        wallet = anyWallet;
+      }
+    }
+    
+    if(!wallet){
+      return res.status(400).json({success:false, message:'Không tìm thấy ví USDT BEP20'});
+    }
+    
+    let expectedUsdt = 0;
+    try{
+      const match = targetReq.content?.match(/([0-9.]+)USDT/);
+      if(match) expectedUsdt = parseFloat(match[1]);
+    }catch{}
+    if(!expectedUsdt){
+      const plansRes = await getPlans(true);
+      const plan = plansRes.plans.find(p=>p.key===targetReq.plan_key);
+      const vndPrice = await getUsdtVndPrice();
+      expectedUsdt = parseFloat(((plan?.price||targetReq.amount||0) / vndPrice).toFixed(4));
+    }
+    
+    const cleanHash = txHash ? txHash.trim() : null;
+    const scanResult = await scanBscForUsdtPayment(wallet.address, expectedUsdt, cleanHash);
+    
+    if(!scanResult.found){
+      if(cleanHash){
+        await supabaseAdmin.from('vip_requests').update({
+          content: `${targetReq.content} | tx:${cleanHash} | scan_fail:${scanResult.reason||scanResult.error} | wallet:${wallet.address}`,
+          updated_at: new Date().toISOString()
+        }).eq('id', targetReq.id);
+      }
+      return res.json({
+        success:false,
+        verified:false,
+        message: scanResult.reason || scanResult.error || 'Chưa tìm thấy giao dịch khớp trên BSCScan',
+        scanResult,
+        expected: expectedUsdt,
+        wallet: wallet.address
+      });
+    }
+    
+    const tx = scanResult.tx;
+    const received = scanResult.value;
+    const fromAddr = scanResult.from;
+    const finalTxHash = tx.hash;
+    
+    const {data: dupCheck} = await supabaseAdmin.from('vip_requests').select('id').ilike('content', `%${finalTxHash}%`).eq('status','APPROVED').limit(1);
+    if(dupCheck && dupCheck.length>0){
+      return res.status(400).json({success:false, message:'Giao dịch này đã được dùng để duyệt VIP trước đó!'});
+    }
+    
+    const plansRes = await getPlans(true);
+    const plan = plansRes.plans.find(p=>p.key===targetReq.plan_key);
+    const months = plan?.months || 1;
+    const expireDate = new Date();
+    expireDate.setMonth(expireDate.getMonth() + months);
+    
+    await supabaseAdmin.from('users').update({
+      is_vip:true, vip_status:'APPROVED',
+      expired_date: expireDate.toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq('email', targetReq.email.toLowerCase());
+    
+    await supabaseAdmin.from('vip_requests').update({
+      status:'APPROVED',
+      content: `${targetReq.content} | tx:${finalTxHash} | verified:${received}USDT BEP20 | from:${fromAddr} | auto:BSCScan`,
+      updated_at: new Date().toISOString()
+    }).eq('id', targetReq.id);
+    
+    try{
+      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const msg = `✅🌍 <b>AUTO DUYỆT VIP - USDT BEP20 (BSCScan)</b> 🌍✅
+━━━━━━━━━━━━━━
+👤 <b>Email:</b> ${targetReq.email}
+💳 <b>Gói:</b> ${targetReq.plan_key} (${months} tháng)
+💵 <b>USDT:</b> ${received} USDT (BEP20)
+💰 <b>Expected:</b> ${expectedUsdt} USDT
+🔗 <b>TxHash:</b> <code>${finalTxHash}</code>
+👛 <b>Từ:</b> <code>${fromAddr?.slice(0,10)}...${fromAddr?.slice(-6)}</code>
+👛 <b>Đến:</b> <code>${wallet.address.slice(0,10)}...${wallet.address.slice(-6)}</code>
+📅 <b>Hạn:</b> ${expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}
+⏰ <b>Thời gian:</b> ${timeVN}
+🔍 <b>Scan:</b> ${scanResult.autoDetected ? 'Auto phát hiện 15p' : 'Verify TxHash'}
+━━━━━━━━━━━━━━
+🤖 Auto duyệt qua BSCScan!`;
+      await sendTelegramDirect(msg);
+    }catch(e){}
+    
+    return res.json({
+      success:true,
+      verified:true,
+      autoApproved:true,
+      message:`Đã xác minh và auto duyệt VIP ${months} tháng! Nhận ${received} USDT`,
+      tx: { hash: finalTxHash, from: fromAddr, to: wallet.address, value: received },
+      expireDate: expireDate.toISOString(),
+      expected: expectedUsdt,
+      received
+    });
+    
+  }catch(e){
+    console.error('[usdt/verify] fatal', e.message, e.stack);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+router.post('/payment/usdt/scan', async (req,res)=>{
+  try{
+    const { email, requestId, walletId } = req.body;
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    
+    let targetReq = null;
+    if(requestId){
+      const {data} = await supabaseAdmin.from('vip_requests').select('*').eq('id', requestId).single();
+      targetReq = data;
+    }else if(email){
+      const {data} = await supabaseAdmin.from('vip_requests').select('*').eq('email', email.toLowerCase()).eq('status','PENDING').ilike('content','%usdt%').order('created_at',{ascending:false}).limit(1).maybeSingle();
+      targetReq = data;
+    }
+    if(!targetReq) return res.json({success:false, found:false, message:'Không có PENDING USDT'});
+    
+    let wallet = null;
+    if(walletId){
+      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('id', walletId).maybeSingle();
+      wallet = data;
+    }
+    if(!wallet){
+      const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).limit(1).maybeSingle();
+      wallet = data;
+    }
+    if(!wallet) return res.json({success:false, message:'Chưa có ví BEP20'});
+    
+    let expectedUsdt = 0;
+    try{
+      const m = targetReq.content?.match(/([0-9.]+)USDT/);
+      if(m) expectedUsdt = parseFloat(m[1]);
+    }catch{}
+    if(!expectedUsdt){
+      const plansRes = await getPlans(true);
+      const plan = plansRes.plans.find(p=>p.key===targetReq.plan_key);
+      const vndPrice = await getUsdtVndPrice();
+      expectedUsdt = parseFloat(((plan?.price||targetReq.amount||0) / vndPrice).toFixed(4));
+    }
+    
+    const scanResult = await scanBscForUsdtPayment(wallet.address, expectedUsdt, null);
+    if(!scanResult.found){
+      return res.json({success:true, found:false, message: scanResult.reason, expected: expectedUsdt});
+    }
+    
+    const tx = scanResult.tx;
+    const received = scanResult.value;
+    const fromAddr = scanResult.from;
+    const finalTxHash = tx.hash;
+    
+    const {data: dupCheck} = await supabaseAdmin.from('vip_requests').select('id').ilike('content', `%${finalTxHash}%`).eq('status','APPROVED').limit(1);
+    if(dupCheck && dupCheck.length>0){
+      return res.json({success:false, message:'Giao dịch này đã được dùng trước đó'});
+    }
+    
+    const plansRes = await getPlans(true);
+    const plan = plansRes.plans.find(p=>p.key===targetReq.plan_key);
+    const months = plan?.months || 1;
+    const expireDate = new Date();
+    expireDate.setMonth(expireDate.getMonth() + months);
+    
+    await supabaseAdmin.from('users').update({
+      is_vip:true, vip_status:'APPROVED',
+      expired_date: expireDate.toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq('email', targetReq.email.toLowerCase());
+    
+    await supabaseAdmin.from('vip_requests').update({
+      status:'APPROVED',
+      content: `${targetReq.content} | tx:${finalTxHash} | autoScan:${received}USDT | from:${fromAddr}`,
+      updated_at: new Date().toISOString()
+    }).eq('id', targetReq.id);
+    
+    try{
+      const msg = `✅🌍 <b>AUTO DUYỆT VIP - USDT AUTO SCAN</b> 🌍✅
+👤 ${targetReq.email} - ${targetReq.plan_key} (${months} tháng)
+💵 ${received} USDT BEP20
+🔗 ${finalTxHash}`;
+      await sendTelegramDirect(msg);
+    }catch{}
+    
+    return res.json({success:true, found:true, autoApproved:true, tx: {hash: finalTxHash, value: received, from: fromAddr}, expireDate: expireDate.toISOString()});
+    
+  }catch(e){
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+
+
 // ===== TRIAL 3 LẦN - LOGIC CHUẨN V13b =====
 const TRIAL_LIMIT = 3;
 
