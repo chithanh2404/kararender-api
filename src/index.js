@@ -88,7 +88,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Sau khi cors mới mount vocalRouter
-app.use('/api/vocal', vocalRouter);
+app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
 
 // FIX: Thêm middleware log + đảm bảo /api/health luôn trả về
 app.use((req, res, next) => {
@@ -96,44 +96,119 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== MIDDLEWARE CHẶN RENDER KHI HẾT TRIAL =====
+// ===== MIDDLEWARE CHẶN RENDER KHI HẾT TRIAL - ENHANCED V3 (FIX VIP APPROVED) =====
+// Chặn không cho load module render nếu user đã hết lượt dùng thử (trial_used >=3) mà chưa lên VIP
+// VIP với is_vip=true, is_vip_bool=true, role=VIP, vip_status=APPROVED/ACTIVE, expired_date future -> luôn cho qua
 async function blockRenderIfTrialExpired(req, res, next){
   try{
-    const action = req.query.action || req.body?.action || '';
-    const isRenderModule = action === 'getSecureRenderModule' || action === 'kara-render-engine' || action === 'getRenderEngine' || req.path.includes('secure-render') || req.path.includes('fastVideobg') || req.originalUrl.includes('secure-render');
-    // Chỉ check khi là module render, không chặn các action khác như login
-    if(!isRenderModule && !req.path.includes('/render') && !req.originalUrl.includes('/render')){
+    const action = (req.query.action || req.body?.action || '').toString();
+    const url = (req.originalUrl || req.url || '').toLowerCase();
+    const path = (req.path || '').toLowerCase();
+    
+    const renderKeywords = [
+      'getsecurerendermodule', 'kara-render-engine', 'getrenderengine', 
+      'secure-render', 'fastvideobg', 'render', 'renderengine', 
+      'getvideobg', 'fast-video', 'vocal'
+    ];
+    const isRenderAction = renderKeywords.some(k => action.toLowerCase().includes(k) || url.includes(k) || path.includes(k));
+    const isRenderPath = path.includes('/render') || url.includes('/render') || path.includes('vocal') || url.includes('vocal');
+    
+    if(!isRenderAction && !isRenderPath){
       return next();
     }
-    const emailForTrial = (req.headers['x-user-email'] || req.query.email || req.body?.email || '').toString().toLowerCase().trim();
-    if(!emailForTrial) return next(); // không có email thì cho qua, để trial local xử lý ở FE, hoặc có thể chặn guest nếu muốn
+    
+    if(url.includes('/health') || action.includes('health') || action.includes('config')){
+      return next();
+    }
+    
+    const emailForTrial = (req.headers['x-user-email'] || req.query.email || req.body?.email || req.body?.userEmail || '').toString().toLowerCase().trim();
+    if(!emailForTrial){
+      return next();
+    }
+    
+    const ADMIN_WHITELIST = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com','admin@kararender.com'];
+    if(ADMIN_WHITELIST.includes(emailForTrial)){
+      return next();
+    }
+    
     const { supabaseAdmin: adminTrial } = require('./services/supabase');
     if(!adminTrial) return next();
-    const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,trial_used,created_at').eq('email', emailForTrial).maybeSingle();
+    
+    const { data: trialUser, error } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,role,trial_used,created_at,vip_status,expired_date').eq('email', emailForTrial).maybeSingle();
+    if(error){
+      console.warn('[Render Block] query error', error.message);
+      return next();
+    }
     if(!trialUser) return next();
+    
     let finalUser = trialUser;
+    
+    // Auto expire trial nếu quá 15 ngày và chưa VIP
     try{
-      if(typeof checkAndExpireTrialSingleUser === 'function'){
-        const checked = await checkAndExpireTrialSingleUser(trialUser);
-        if(checked) finalUser = checked;
+      const created = trialUser.created_at ? new Date(trialUser.created_at) : null;
+      const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+      const isVipEarly = !!(trialUser.is_vip || trialUser.is_vip_bool);
+      if(created && diffDays > 15 && !isVipEarly){
+        const used = parseInt(trialUser.trial_used) || 0;
+        if(used < 3){
+          console.log(`[Render Block] Auto expire trial 15d for ${emailForTrial} - ${diffDays.toFixed(1)} days`);
+          await adminTrial.from('users').update({
+            trial_used: 3,
+            updated_at: new Date().toISOString()
+          }).eq('id', trialUser.id).then(()=>{}).catch(()=>{});
+          finalUser = { ...trialUser, trial_used: 3 };
+        }
       }
     }catch(e){}
-    const isVip = !!(finalUser.is_vip || finalUser.is_vip_bool);
-    if(isVip) return next();
+    
+    // Check VIP - FIX cho case nhungtlagi62@gmail.com: is_vip=true, is_vip_bool=true, role=VIP, vip_status=APPROVED, expired_date=2026-11-09, trial_used=4
+    // VIP phải luôn được qua dù trial_used=4
+    const now = new Date();
+    const expiredDate = finalUser.expired_date ? new Date(finalUser.expired_date) : null;
+    const isVipByExpiredDate = expiredDate && expiredDate > now;
+    const vipStatusUpper = String(finalUser.vip_status || '').toUpperCase();
+    const isVipByStatus = ['ACTIVE','APPROVED','APPROVED_VIP','VIP','PAID','SUCCESS'].includes(vipStatusUpper);
+    const isVipByRole = finalUser.role && String(finalUser.role).toUpperCase() === 'VIP';
+    const isVipByFlag = !!(finalUser.is_vip || finalUser.is_vip_bool);
+    
+    const isVip = isVipByFlag || isVipByRole || isVipByStatus || isVipByExpiredDate;
+    
+    if(isVip){
+      console.log(`[Render Middleware ALLOW VIP] ${emailForTrial} - is_vip:${finalUser.is_vip} is_vip_bool:${finalUser.is_vip_bool} role:${finalUser.role} vip_status:${finalUser.vip_status} expired:${finalUser.expired_date} trial_used:${finalUser.trial_used} -> ALLOW`);
+      return next();
+    }
+    
     const used = parseInt(finalUser.trial_used) || 0;
     const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
     const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
     const expiredByTime = created && diffDays > 15;
-    if(used >= 3 || expiredByTime){
-      console.log(`[Render Middleware BLOCK] ${emailForTrial} hết trial`);
-      return res.status(403).json({ success:false, blocked:true, code:'TRIAL_EXPIRED', message:'Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full' });
+    const expiredByUsage = used >= 3;
+    
+    if(expiredByUsage || expiredByTime){
+      const reason = expiredByUsage ? `hết lượt (${used}/3)` : `quá hạn ${diffDays.toFixed(1)} ngày`;
+      console.log(`[Render Middleware BLOCK] ${emailForTrial} ${reason} - chặn load module render`);
+      return res.status(403).json({ 
+        success:false, 
+        blocked:true, 
+        code:'TRIAL_EXPIRED', 
+        reason: reason,
+        trial_used: used,
+        trial_limit: 3,
+        is_vip: false,
+        message:'Bạn đã hết lượt dùng thử (3/3). Vui lòng nâng cấp lên VIP để tiếp tục sử dụng tính năng render.',
+        upgrade_required: true,
+        action_required: 'upgrade_vip'
+      });
     }
+    
+    console.log(`[Render Middleware ALLOW] ${emailForTrial} còn ${3-used} lượt trial`);
     return next();
   }catch(e){
-    console.log('[Render Middleware] error', e.message);
+    console.log('[Render Middleware] error', e.message, e.stack);
     return next();
   }
 }
+
 
 app.use('/api', upgradeRoutes);
 app.use('/api/render', blockRenderIfTrialExpired, fastVideobgRouter);
