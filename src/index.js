@@ -1514,37 +1514,52 @@ app.all('/exec', async (req, res) => {
       case 'kara-render-engine':
       case 'getRenderEngine': {
         try{
-          // ===== CHẶN KHI HẾT LƯỢT DÙNG THỬ =====
+          // ===== CHẶN KHI HẾT LƯỢT DÙNG THỬ - V4 FIX INCONSISTENT FLAGS =====
           try{
             const emailForTrial = (params.email || req.headers['x-user-email'] || req.query?.email || '').toString().toLowerCase().trim();
             if(emailForTrial){
-              const { supabaseAdmin: adminTrial } = require('./services/supabase');
-              if(adminTrial){
-                const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,trial_used,created_at').eq('email', emailForTrial).maybeSingle();
-                if(trialUser){
-                  // Auto expire nếu quá 15 ngày (gọi helper nếu có)
-                  let finalUser = trialUser;
-                  try{
-                    if(typeof checkAndExpireTrialSingleUser === 'function'){
-                      const checked = await checkAndExpireTrialSingleUser(trialUser);
-                      if(checked) finalUser = checked;
-                    } else {
-                      // fallback tính tay
-                      const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+              const ADMIN_WHITELIST_EXEC = ['chithanh2404@gmail.com','admin@kararender.com'];
+              if(!ADMIN_WHITELIST_EXEC.includes(emailForTrial)){
+                const { supabaseAdmin: adminTrial } = require('./services/supabase');
+                if(adminTrial){
+                  const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,role,trial_used,created_at,vip_status,expired_date').eq('email', emailForTrial).maybeSingle();
+                  if(trialUser){
+                    let finalUser = trialUser;
+                    try{
+                      const created = trialUser.created_at ? new Date(trialUser.created_at) : null;
                       const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
-                      if(diffDays > 15 && !finalUser.is_vip){
-                        finalUser.trial_used = 3;
+                      const isVipEarly = trialUser.is_vip === true;
+                      if(created && diffDays > 15 && !isVipEarly){
+                        const used = parseInt(trialUser.trial_used) || 0;
+                        if(used < 3){
+                          finalUser = { ...trialUser, trial_used: 3 };
+                        }
+                      }
+                    }catch(e){}
+                    
+                    const nowExec = new Date();
+                    const expiredDateExec = finalUser.expired_date ? new Date(finalUser.expired_date) : null;
+                    const isExpiredValidExec = expiredDateExec && expiredDateExec > nowExec;
+                    const vipStatusUpperExec = String(finalUser.vip_status || '').toUpperCase();
+                    const isRejectedExec = ['REJECTED','EXPIRED','BANNED','CANCELLED','DENIED'].includes(vipStatusUpperExec);
+                    
+                    let isVipExec = false;
+                    if(finalUser.is_vip === true){
+                      if(!isRejectedExec && (!finalUser.expired_date || isExpiredValidExec)){
+                        isVipExec = true;
+                      }
+                    } else {
+                      if(finalUser.role && String(finalUser.role).toUpperCase() === 'VIP' && ['ACTIVE','APPROVED','APPROVED_VIP','VIP','PAID','SUCCESS'].includes(vipStatusUpperExec) && (isExpiredValidExec || !finalUser.expired_date)){
+                        isVipExec = true;
                       }
                     }
-                  }catch(e){}
-                  
-                  const isVip = !!(finalUser.is_vip || finalUser.is_vip_bool);
-                  if(!isVip){
-                    const used = parseInt(finalUser.trial_used) || 0;
-                    const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
-                    const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
-                    const expiredByTime = created && diffDays > 15;
-                    if(used >= 3 || expiredByTime){
+                    
+                    if(!isVipExec){
+                      const used = parseInt(finalUser.trial_used) || 0;
+                      const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+                      const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+                      const expiredByTime = created && diffDays > 15;
+                      if(used >= 3 || expiredByTime){
                       console.log(`[Secure Render BLOCK] ${emailForTrial} hết trial used=${used} diff=${diffDays.toFixed(1)}d`);
                       const blockMsg = 'Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full';
                       if(params.plain === '1' || params.plain === 'true'){
@@ -2482,30 +2497,55 @@ app.get('/api/secure-render', async (req, res) => {
   if (guard.blocked && !req.query.tk) {
     return res.type('text/plain').status(403).send('ERROR_DOMAIN_BLOCKED');
   }
-  // ===== CHẶN KHI HẾT LƯỢT DÙNG THỬ =====
+  // ===== CHẶN KHI HẾT LƯỢT DÙNG THỬ - V4 FIX INCONSISTENT FLAGS =====
   try{
     const emailForTrial = (req.query.email || req.headers['x-user-email'] || '').toString().toLowerCase().trim();
     if(emailForTrial){
-      const { supabaseAdmin: adminTrial } = require('./services/supabase');
-      if(adminTrial){
-        const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,trial_used,created_at').eq('email', emailForTrial).maybeSingle();
-        if(trialUser){
-          let finalUser = trialUser;
-          try{
-            if(typeof checkAndExpireTrialSingleUser === 'function'){
-              const checked = await checkAndExpireTrialSingleUser(trialUser);
-              if(checked) finalUser = checked;
+      const ADMIN_WHITELIST_SECURE = ['chithanh2404@gmail.com','admin@kararender.com'];
+      if(!ADMIN_WHITELIST_SECURE.includes(emailForTrial)){
+        const { supabaseAdmin: adminTrial } = require('./services/supabase');
+        if(adminTrial){
+          const { data: trialUser } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,role,trial_used,created_at,vip_status,expired_date').eq('email', emailForTrial).maybeSingle();
+          if(trialUser){
+            let finalUser = trialUser;
+            try{
+              const created = trialUser.created_at ? new Date(trialUser.created_at) : null;
+              const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+              const isVipEarly = trialUser.is_vip === true;
+              if(created && diffDays > 15 && !isVipEarly){
+                const used = parseInt(trialUser.trial_used) || 0;
+                if(used < 3){
+                  finalUser = { ...trialUser, trial_used: 3 };
+                }
+              }
+            }catch(e){}
+            
+            const nowSecure = new Date();
+            const expiredDateSecure = finalUser.expired_date ? new Date(finalUser.expired_date) : null;
+            const isExpiredValidSecure = expiredDateSecure && expiredDateSecure > nowSecure;
+            const vipStatusUpperSecure = String(finalUser.vip_status || '').toUpperCase();
+            const isRejectedSecure = ['REJECTED','EXPIRED','BANNED','CANCELLED','DENIED'].includes(vipStatusUpperSecure);
+            
+            let isVipSecure = false;
+            if(finalUser.is_vip === true){
+              if(!isRejectedSecure && (!finalUser.expired_date || isExpiredValidSecure)){
+                isVipSecure = true;
+              }
+            } else {
+              if(finalUser.role && String(finalUser.role).toUpperCase() === 'VIP' && ['ACTIVE','APPROVED','APPROVED_VIP','VIP','PAID','SUCCESS'].includes(vipStatusUpperSecure) && (isExpiredValidSecure || !finalUser.expired_date)){
+                isVipSecure = true;
+              }
             }
-          }catch(e){}
-          const isVip = !!(finalUser.is_vip || finalUser.is_vip_bool);
-          if(!isVip){
-            const used = parseInt(finalUser.trial_used) || 0;
-            const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
-            const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
-            const expiredByTime = created && diffDays > 15;
-            if(used >= 3 || expiredByTime){
-              console.log(`[Secure API BLOCK] ${emailForTrial} hết trial used=${used}`);
-              return res.type('text/plain').status(403).send('ERROR_TRIAL_EXPIRED: Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full');
+            
+            if(!isVipSecure){
+              const used = parseInt(finalUser.trial_used) || 0;
+              const created = finalUser.created_at ? new Date(finalUser.created_at) : null;
+              const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
+              const expiredByTime = created && diffDays > 15;
+              if(used >= 3 || expiredByTime){
+                console.log(`[Secure API BLOCK] ${emailForTrial} is_vip:${finalUser.is_vip} is_vip_bool:${finalUser.is_vip_bool} vip_status:${finalUser.vip_status} used=${used} - CHẶN`);
+                return res.type('text/plain').status(403).send('ERROR_TRIAL_EXPIRED: Bạn đã hết lượt dùng thử, hãy nâng cấp để sử dụng full');
+              }
             }
           }
         }
