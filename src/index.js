@@ -3122,6 +3122,103 @@ app.get('/api/payment/lemonsqueezy/config', async (req,res)=>{
   }
 });
 
+
+// ===== ADMIN LEMON SQUEEZY CONFIG - BẬT/TẮT TRONG ADMIN DASHBOARD =====
+app.get('/api/admin/lemon-config', async (req,res)=>{
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    let enabled = false;
+    let storeActive = false;
+    try{
+      if(supabaseAdmin){
+        const {data} = await supabaseAdmin.from('app_settings').select('value').eq('id','lemon_enabled').single();
+        if(data?.value){
+          enabled = !!data.value.enabled;
+          storeActive = !!data.value.storeActive;
+        }
+      }
+    }catch(e){ console.warn('[Lemon Admin] get config error', e.message); }
+    const hasKey = !!(process.env.LEMONSQUEEZY_API_KEY && (process.env.LEMONSQUEEZY_STORE_ID || '495257'));
+    return res.json({
+      success:true,
+      enabled,
+      storeActive,
+      configured: hasKey,
+      hasApiKey: !!process.env.LEMONSQUEEZY_API_KEY,
+      storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257',
+      variants: {
+        '1m': process.env.LEMON_VARIANT_1M || '2234458',
+        '3m': process.env.LEMON_VARIANT_3M || '2234498',
+        '6m': process.env.LEMON_VARIANT_6M || '2234508',
+        '12m': process.env.LEMON_VARIANT_12M || '2234510',
+        '24m': process.env.LEMON_VARIANT_24M || '2234517'
+      },
+      demoMode: !storeActive,
+      message: !hasKey ? 'Chưa cấu hình API key' : !enabled ? 'Đã cấu hình nhưng đang TẮT trong admin' : !storeActive ? 'Đang ở chế độ DEMO - chờ store active' : 'Đang hoạt động LIVE'
+    });
+  }catch(e){
+    return res.status(500).json({success:false, message:e.message});
+  }
+});
+
+app.post('/api/admin/lemon-config', express.json(), async (req,res)=>{
+  try{
+    const { enabled, storeActive } = req.body || {};
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'Supabase not configured'});
+    const value = {
+      enabled: !!enabled,
+      storeActive: !!storeActive,
+      updated_at: new Date().toISOString(),
+      updated_by: (req.headers['x-user-email'] || '').toLowerCase()
+    };
+    const { error } = await supabaseAdmin.from('app_settings').upsert({id:'lemon_enabled', value}, {onConflict:'id'});
+    if(error) throw error;
+    console.log(`[Lemon Admin] Saved config enabled:${!!enabled} storeActive:${!!storeActive}`);
+    return res.json({success:true, value, message: `Đã ${enabled ? 'BẬT' : 'TẮT'} Lemon Squeezy - Store ${storeActive ? 'ACTIVE' : 'DEMO'}`});
+  }catch(e){
+    console.error('[Lemon Admin] save error', e.message);
+    return res.status(500).json({success:false, message:e.message});
+  }
+});
+
+// Cập nhật /api/payment/lemonsqueezy/config để trả thêm enabled từ DB
+const originalLemonConfigHandler = async (req,res)=>{
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    let dbEnabled = false;
+    let dbStoreActive = false;
+    try{
+      if(supabaseAdmin){
+        const {data} = await supabaseAdmin.from('app_settings').select('value').eq('id','lemon_enabled').single();
+        if(data?.value){
+          dbEnabled = !!data.value.enabled;
+          dbStoreActive = !!data.value.storeActive;
+        }
+      }
+    }catch(e){}
+    const hasKey = !!(process.env.LEMONSQUEEZY_API_KEY && (process.env.LEMONSQUEEZY_STORE_ID || '495257'));
+    return res.json({
+      success:true,
+      configured: hasKey,
+      enabled: dbEnabled,
+      storeActive: dbStoreActive,
+      demoMode: !dbStoreActive,
+      storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257',
+      variants: {
+        '1m': process.env.LEMON_VARIANT_1M || '2234458',
+        '3m': process.env.LEMON_VARIANT_3M || '2234498',
+        '6m': process.env.LEMON_VARIANT_6M || '2234508',
+        '12m': process.env.LEMON_VARIANT_12M || '2234510',
+        '24m': process.env.LEMON_VARIANT_24M || '2234517'
+      },
+      prices: { '1m': 99000, '3m': 199000, '6m': 399000, '12m': 599000, '24m': 999000 }
+    });
+  }catch(e){ return res.json({success:false, message:e.message}); }
+};
+app.get('/api/payment/lemonsqueezy/config-v2', originalLemonConfigHandler);
+
+
 app.post('/api/webhook/lemonsqueezy', express.raw({type: 'application/json'}), async (req, res) => {
   try{
     const rawBody = req.body;
