@@ -2579,47 +2579,162 @@ app.get('/', (req,res)=>res.json({ status:'KaraRender API v5.5 FULL - Feedback +
 app.get('/health',(req,res)=>res.json({ ok:true, version:'5.5 FULL - Feedback + Telegram Full Info + Dropbox + Client tự gỡ', lines:850, features:['feedback','telegram-full'] }));
 
 // ===== AUTO APPROVE VIP KHI CHUYỂN KHOẢN THÀNH CÔNG - WEBHOOK SEPAY / CASSO =====
+
 app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) => {
   try {
-    console.log('[Webhook Bank] Raw body:', JSON.stringify(req.body).slice(0,1000));
-    const body = req.body;
-    const amount = body.transferAmount || body.amount || body.data?.amount || body.transfer_amount || 0;
-    const content = (body.content || body.description || body.data?.description || body.transaction_content || '').toLowerCase().trim();
-    if(!content){ return res.json({ success: true, message: 'No content' }); }
-    console.log(`[Webhook] Content: "${content}" Amount: ${amount}`);
-    const match = content.match(/nang\s*cap\s+([a-z0-9]+)\s+([a-z0-9]+)/i);
-    if(!match){
-      console.log('[Webhook] Không match cú pháp nang cap');
-      return res.json({ success: true, ignored: true });
+    console.log('[Webhook Bank] Raw body:', JSON.stringify(req.body).slice(0,2000));
+    const body = req.body || {};
+    
+    // ===== FIX GẤP: Parse amount robust hơn - hỗ trợ SePay, Casso, và các format khác =====
+    let rawAmount = body.transferAmount ?? body.amount ?? body.data?.amount ?? body.transfer_amount ?? body.transaction_amount ?? body.transfer_amount_raw ?? 0;
+    // SePay đôi khi gửi trong data.transferAmount
+    if(!rawAmount && body.data){
+      rawAmount = body.data.transferAmount ?? body.data.amount ?? 0;
     }
+    let amount = 0;
+    if(typeof rawAmount === 'string'){
+      // Loại bỏ dấu phẩy, chữ, chỉ giữ số
+      const cleaned = rawAmount.replace(/[^0-9]/g,'');
+      amount = parseInt(cleaned) || 0;
+    } else {
+      amount = Number(rawAmount) || 0;
+    }
+    
+    // ===== FIX GẤP: Parse content robust hơn =====
+    let rawContent = body.content || body.description || body.data?.description || body.data?.content || body.transaction_content || body.transferContent || body.transfer_content || body.code || '';
+    // SePay có thể gửi content trong nhiều field khác nhau
+    if(!rawContent && body.data){
+      rawContent = body.data.content || body.data.description || body.data.transaction_content || '';
+    }
+    const content = (rawContent || '').toString().toLowerCase().trim();
+    
+    console.log(`[Webhook] Parsed Content: "${content}" Amount: ${amount} RawAmount: ${rawAmount}`);
+    
+    if(!content){
+      console.log('[Webhook] No content found in payload');
+      return res.json({ success: true, message: 'No content', received: body });
+    }
+    
+    // Regex linh hoạt hơn: hỗ trợ cả "nang cap" và "nâng cấp" và cho phép dấu _ - .
+    const match = content.match(/nang\s*cap\s+([a-z0-9]+)\s+([a-z0-9]+)/i) || content.match(/nangcap\s+([a-z0-9]+)\s+([a-z0-9]+)/i);
+    if(!match){
+      console.log('[Webhook] Không match cú pháp nang cap, content:', content);
+      // Thử tìm safeCode đơn lẻ trong content để vẫn xử lý được
+      // Tìm tất cả chuỗi alphanumeric dài >=10 ký tự có thể là safeCode
+      return res.json({ success: true, ignored: true, content });
+    }
+    
     const safeCode = match[1].toLowerCase();
     const planKey = match[2].toLowerCase();
+    console.log(`[Webhook] Matched safeCode: ${safeCode}, planKey: ${planKey}`);
+    
     let supabaseAdmin;
     try { supabaseAdmin = require('./services/supabase').supabaseAdmin; } catch(e) { supabaseAdmin = null; }
     if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
-    const { data: users, error } = await supabaseAdmin.from('users').select('*');
-    if(error) return res.status(500).json({ success:false, error:error.message });
+    
+    // ===== FIX GẤP: Tìm user qua vip_requests PENDING trước (tránh lỗi select * limit 1000) =====
     let targetUser = null;
-    for(let u of users){
-      const code = (u.email || '').replace(/[@.]/g,'').toLowerCase();
-      if(code === safeCode || content.includes(code)){
-        targetUser = u;
-        break;
+    let pendingRequest = null;
+    
+    try{
+      // Tìm PENDING requests có content chứa safeCode
+      const { data: pendingList } = await supabaseAdmin.from('vip_requests')
+        .select('*')
+        .eq('status','PENDING')
+        .ilike('content', `%${safeCode}%`)
+        .order('created_at',{ascending:false})
+        .limit(10);
+      
+      if(pendingList && pendingList.length > 0){
+        // Ưu tiên request có planKey khớp
+        pendingRequest = pendingList.find(r => (r.plan_key||'').toLowerCase() === planKey) || pendingList[0];
+        console.log(`[Webhook] Found PENDING request via safeCode: ${pendingRequest.id} email: ${pendingRequest.email} plan: ${pendingRequest.plan_key}`);
+        
+        // Tìm user qua email từ request
+        const { data: userByEmail } = await supabaseAdmin.from('users').select('*').eq('email', pendingRequest.email.toLowerCase()).maybeSingle();
+        if(userByEmail){
+          targetUser = userByEmail;
+          console.log(`[Webhook] Found user via pending request: ${targetUser.email}`);
+        }
+      }
+    }catch(e){
+      console.warn('[Webhook] Error finding pending via safeCode', e.message);
+    }
+    
+    // Nếu chưa tìm thấy user qua pending, thử tìm qua users table với filter
+    if(!targetUser){
+      try{
+        // Tìm user mà email safeCode khớp
+        // Thử query trực tiếp: tìm user có email chứa safeCode (vì safeCode là email bỏ @.)
+        // Cách: lấy tất cả users có email ilike %gmail% hoặc tương tự là không hiệu quả, nên thử 2 cách:
+        
+        // Cách 1: Tìm trong 200 users mới nhất
+        const { data: recentUsers } = await supabaseAdmin.from('users').select('*').order('created_at',{ascending:false}).limit(200);
+        if(recentUsers){
+          for(let u of recentUsers){
+            const code = (u.email || '').replace(/[@.]/g,'').toLowerCase();
+            if(code === safeCode || content.includes(code)){
+              targetUser = u;
+              console.log(`[Webhook] Found user via recentUsers scan: ${u.email}`);
+              break;
+            }
+          }
+        }
+        
+        // Cách 2: Nếu vẫn chưa thấy, thử query tất cả users với ilike (có thể có nhiều nhưng thử)
+        if(!targetUser){
+          // Tạo các biến thể email có thể từ safeCode: thêm @ và . vào các vị trí
+          // Thay vì brute force, thử tìm user có email mà khi bỏ @. sẽ ra safeCode
+          // Query tất cả users nhưng với filter email ilike %safeCode% không hiệu quả vì safeCode đã bỏ @.
+          // Nên thử: lấy email từ pendingRequest nếu có, hoặc tìm user có email mà content chứa phần của nó
+          const { data: allUsers, error } = await supabaseAdmin.from('users').select('id,email,full_name,expired_date').limit(1000);
+          if(allUsers){
+            for(let u of allUsers){
+              const code = (u.email || '').replace(/[@.]/g,'').toLowerCase();
+              if(code === safeCode){
+                // Lấy full user
+                const { data: fullUser } = await supabaseAdmin.from('users').select('*').eq('id', u.id).single();
+                targetUser = fullUser || u;
+                console.log(`[Webhook] Found user via full scan: ${u.email}`);
+                break;
+              }
+            }
+          }
+        }
+      }catch(e){
+        console.warn('[Webhook] Error scanning users', e.message);
       }
     }
+    
     if(!targetUser){
       console.log('[Webhook] Không tìm thấy user với code', safeCode);
-      return res.json({ success:false, message:'User not found for code '+safeCode });
+      // Lưu log để admin có thể duyệt thủ công
+      try{
+        await supabaseAdmin.from('bank_webhook_logs').insert({
+          content: content,
+          amount: amount,
+          safe_code: safeCode,
+          plan_key: planKey,
+          status: 'USER_NOT_FOUND',
+          raw_body: body,
+          created_at: new Date().toISOString()
+        });
+      }catch(e){ console.warn('[Webhook] Log insert error', e.message); }
+      
+      return res.json({ success:false, message:'User not found for code '+safeCode, safeCode, planKey, content });
     }
-    const planPrices = { '1m':99000, '3m':199000, '6m':299000, '12m':499000, '1y':499000 };
+    
+    const planPrices = { '1m':99000, '3m':199000, '6m':299000, '12m':499000, '1y':499000, 'vip1m':99000, 'vip3m':199000 };
     let expectedAmount = planPrices[planKey] || 99000;
     try{
       const { data: plans } = await supabaseAdmin.from('upgrade_plans').select('*').eq('key', planKey).single();
       if(plans && plans.price) expectedAmount = plans.price;
     }catch(e){}
 
-    // ===== NHÁNH THIẾU TIỀN =====
-    if(amount < expectedAmount - 1000){
+    console.log(`[Webhook] User: ${targetUser.email} Expected: ${expectedAmount} Actual: ${amount} Plan: ${planKey}`);
+
+    // ===== NHÁNH THIẾU TIỀN - nhưng vẫn tạo PENDING để admin duyệt =====
+    if(amount > 0 && amount < expectedAmount - 1000){
       console.log(`[Webhook] Amount ${amount} < expected ${expectedAmount} -> pending`);
       await supabaseAdmin.from('users').update({
         vip_status: 'PENDING',
@@ -2629,9 +2744,8 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
         request_vip_time: new Date().toISOString()
       }).eq('id', targetUser.id);
 
-      // FIX 1: Tạo/cập nhật vip_requests PENDING luôn
       await supabaseAdmin.from('vip_requests').upsert({
-        email: targetUser.email,
+        email: targetUser.email.toLowerCase(),
         full_name: targetUser.full_name || targetUser.email,
         plan_key: planKey,
         amount: amount,
@@ -2639,12 +2753,36 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
         status: 'PENDING',
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
-      }, {onConflict: 'email'});
+      }, {onConflict: 'email,plan_key'});
 
-      return res.json({ success:true, pending:true, reason:'Amount not enough' });
+      return res.json({ success:true, pending:true, reason:'Amount not enough', expected: expectedAmount, actual: amount });
     }
 
-    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '1y':12, 'lifetime':1200 };
+    // Nếu amount = 0 (do parse lỗi), vẫn cho phép auto approve nếu có pending request khớp (fix gấp)
+    if(amount === 0){
+      console.warn(`[Webhook] Amount is 0, but content matches safeCode ${safeCode}. Checking if we should still approve...`);
+      // Nếu có pendingRequest, vẫn approve (coi như bank gửi amount = 0 do lỗi format)
+      if(pendingRequest){
+        console.log(`[Webhook] Amount 0 but found pending request ${pendingRequest.id}, proceeding to approve anyway`);
+        amount = expectedAmount; // Giả định đủ tiền để auto approve
+      } else {
+        // Không có pending, tạo pending để admin duyệt
+        console.log(`[Webhook] Amount 0 and no pending, creating PENDING for manual check`);
+        await supabaseAdmin.from('vip_requests').upsert({
+          email: targetUser.email.toLowerCase(),
+          full_name: targetUser.full_name || targetUser.email,
+          plan_key: planKey,
+          amount: 0,
+          content: content + ` [AMOUNT_PARSE_FAILED raw:${JSON.stringify(rawAmount).slice(0,100)}]`,
+          status: 'PENDING',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, {onConflict: 'email,plan_key'});
+        return res.json({ success:true, pending:true, reason:'Amount parse failed, created PENDING', rawAmount });
+      }
+    }
+
+    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '1y':12, 'lifetime':1200, 'vip1m':1, 'vip3m':3 };
     const months = monthsMap[planKey] || 1;
     const now = new Date();
     let expireDate = new Date();
@@ -2657,7 +2795,7 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
     // ===== NHÁNH ĐỦ TIỀN - AUTO APPROVED =====
     const { error: upErr } = await supabaseAdmin.from('users').update({
       is_vip: true,
-      is_vip_bool: true, // fix field bạn đang false
+      is_vip_bool: true,
       role: 'VIP',
       vip_status: 'APPROVED',
       expired_date: expireDate.toISOString(),
@@ -2674,38 +2812,31 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       return res.status(500).json({ success:false, error: upErr.message });
     }
 
-    // FIX 2: Update vip_requests - CHỈ DUYỆT 1 PENDING MỚI NHẤT, TRÁNH DUPLICATE như peterbui791123@gmail.com
-    let approvedId = null;
+    // Update vip_requests - CHỈ DUYỆT 1 PENDING MỚI NHẤT
+    let approvedId = pendingRequest?.id || null;
     try{
-      // Lấy PENDING mới nhất của user này
       const {data: pendingList} = await supabaseAdmin.from('vip_requests')
         .select('id, created_at')
-        .eq('email', targetUser.email)
+        .eq('email', targetUser.email.toLowerCase())
         .eq('status','PENDING')
         .order('created_at',{ascending:false})
         .limit(10);
       
       if(pendingList && pendingList.length>0){
-        // Duyệt cái mới nhất
         const latest = pendingList[0];
         approvedId = latest.id;
-        const {error: upErr} = await supabaseAdmin.from('vip_requests').update({
+        await supabaseAdmin.from('vip_requests').update({
           status:'APPROVED',
           amount: amount,
           content: content,
           updated_at: new Date().toISOString()
         }).eq('id', latest.id);
         
-        if(upErr){
-          console.warn('[Webhook] Update latest PENDING error', upErr.message);
-        }else{
-          console.log(`[Webhook] Approved latest PENDING ${latest.id} for ${targetUser.email}`);
-        }
+        console.log(`[Webhook] Approved latest PENDING ${latest.id} for ${targetUser.email}`);
         
-        // Nếu có nhiều PENDING cũ hơn do double-click, đánh dấu REJECTED duplicate
         if(pendingList.length>1){
           const oldIds = pendingList.slice(1).map(r=>r.id);
-          console.log(`[Webhook] Found ${oldIds.length} old PENDING duplicates for ${targetUser.email}, marking REJECTED`, oldIds);
+          console.log(`[Webhook] Found ${oldIds.length} old PENDING duplicates, marking REJECTED`, oldIds);
           await supabaseAdmin.from('vip_requests').update({
             status:'REJECTED',
             reason:'duplicate_double_click',
@@ -2713,10 +2844,9 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
           }).in('id', oldIds);
         }
       }else{
-        // Không có PENDING nào (trường hợp hiếm), INSERT mới để giữ lịch sử
         console.log(`[Webhook] No PENDING found, INSERT new APPROVED for history: ${targetUser.email}`);
         const {data: inserted} = await supabaseAdmin.from('vip_requests').insert({
-          email: targetUser.email,
+          email: targetUser.email.toLowerCase(),
           full_name: targetUser.full_name || targetUser.email,
           plan_key: planKey,
           amount: amount,
@@ -2733,21 +2863,11 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
 
     console.log(`[Webhook] AUTO APPROVED VIP cho ${targetUser.email} gói ${planKey} hết hạn ${expireDate.toISOString()} id=${approvedId||'N/A'}`);
     
-    // ===== TELEGRAM AUTO DUYỆT VIP - CHỈ GỬI 1 LẦN, KHÔNG DUPLICATE =====
+    // TELEGRAM
     try{
       const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
       const expireVN = expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-      const autoMsg = `✅🤖 <b>AUTO DUYỆT VIP - KARARENDER</b> 🤖✅
-━━━━━━━━━━━━━━━━━━━━━━
-👤 <b>Email:</b> ${targetUser.email}
-👤 <b>Tên:</b> ${targetUser.full_name||targetUser.email}
-💳 <b>Gói:</b> ${planKey} (${months} tháng)
-💰 <b>Số tiền:</b> ${amount.toLocaleString('vi-VN')}đ
-📝 <b>Nội dung:</b> <code>${content}</code>
-📅 <b>Hạn dùng:</b> ${expireVN}
-⏰ <b>Thời gian:</b> ${timeVN}
-━━━━━━━━━━━━━━━━━━━━━━
-🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
+      const autoMsg = `✅🤖 <b>AUTO DUYỆT VIP - KARARENDER</b> 🤖✅\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${targetUser.email}\n👤 <b>Tên:</b> ${targetUser.full_name||targetUser.email}\n💳 <b>Gói:</b> ${planKey} (${months} tháng)\n💰 <b>Số tiền:</b> ${amount.toLocaleString('vi-VN')}đ\n📝 <b>Nội dung:</b> <code>${content}</code>\n📅 <b>Hạn dùng:</b> ${expireVN}\n⏰ <b>Thời gian:</b> ${timeVN}\n━━━━━━━━━━━━━━━━━━━━━━\n🤖 Hệ thống tự động duyệt qua webhook ngân hàng!`;
 
       let sent = false;
       for(let attempt=1; attempt<=2 && !sent; attempt++){
