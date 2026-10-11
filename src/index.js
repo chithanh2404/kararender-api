@@ -26,6 +26,36 @@ if (!config.ALLOWED_HOSTS || config.ALLOWED_HOSTS.length === 0) {
 }
 
 const app = express();
+
+// ===== LEMON DEBUG ROUTE - ĐẶT SỚM NHẤT ĐỂ TRÁNH BỊ CHE =====
+app.get('/api/payment/lemonsqueezy/config', (req, res) => {
+  console.log('[Lemon Config] HIT - env check');
+  try {
+    const hasKey = !!(process.env.LEMONSQUEEZY_API_KEY);
+    const variants = {
+      '1m': process.env.LEMON_VARIANT_1M || '2234458',
+      '3m': process.env.LEMON_VARIANT_3M || '2234498',
+      '6m': process.env.LEMON_VARIANT_6M || '2234508',
+      '12m': process.env.LEMON_VARIANT_12M || '2234510',
+      '24m': process.env.LEMON_VARIANT_24M || '2234517'
+    };
+    res.json({
+      success: true,
+      configured: hasKey,
+      storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257',
+      hasApiKey: hasKey,
+      apiKeyPrefix: process.env.LEMONSQUEEZY_API_KEY ? process.env.LEMONSQUEEZY_API_KEY.slice(0,15)+'...' : 'NOT SET',
+      webhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET ? 'SET '+process.env.LEMONSQUEEZY_WEBHOOK_SECRET.slice(0,10)+'...' : 'NOT SET',
+      variants,
+      prices: { '1m': 99000, '3m': 199000, '6m': 399000, '12m': 599000, '24m': 999000 },
+      timestamp: new Date().toISOString()
+    });
+  } catch(e) {
+    res.status(500).json({success:false, error:e.message});
+  }
+});
+console.log('[Lemon] Early config route registered');
+
 const PORT = config.PORT;
 app.set('trust proxy', true);
 
@@ -2906,7 +2936,7 @@ app.post('/api/webhook/casso', (req,res,next)=>{ req.url='/api/webhook/bank'; re
 
 
 // ===== LEMON SQUEEZY - CỔNG THANH TOÁN QUỐC TẾ - AUTO DUYỆT VIP =====
-const crypto = require('crypto');
+// crypto already declared at top
 
 function getLemonVariantId(planKey){
   const key = planKey ? planKey.toLowerCase() : '1m';
