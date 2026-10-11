@@ -3070,26 +3070,62 @@ app.post('/api/payment/lemonsqueezy/create', express.json(), async (req, res) =>
     }
     const checkoutUrl = lemonData.data?.attributes?.url;
     const checkoutId = lemonData.data?.id;
+    let insertedRequestId = null;
+    let fullNameForTelegram = email.toLowerCase();
     if(supabaseAdmin){
       try{
+        // Lấy full_name từ users nếu có
+        try{
+          const {data: userData} = await supabaseAdmin.from('users').select('full_name').eq('email', email.toLowerCase()).maybeSingle();
+          if(userData?.full_name) fullNameForTelegram = userData.full_name;
+        }catch(e){}
         const {data: existing} = await supabaseAdmin.from('vip_requests')
           .select('id').eq('email', email.toLowerCase()).eq('status','PENDING').eq('plan_key', planKey.toLowerCase())
           .gte('created_at', new Date(Date.now() - 10*60*1000).toISOString())
           .limit(1).maybeSingle();
         if(!existing){
-          await supabaseAdmin.from('vip_requests').insert({
+          const {data: insData} = await supabaseAdmin.from('vip_requests').insert({
             email: email.toLowerCase(),
-            full_name: email.toLowerCase(),
+            full_name: fullNameForTelegram,
             plan_key: planKey.toLowerCase(),
             amount: planPriceVnd,
             content: `lemon ${email.replace(/[@.]/g,'')} ${planKey} $${displayPrice} checkout:${checkoutId}`,
             status: 'PENDING',
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
-          });
+          }).select().single();
+          insertedRequestId = insData?.id || null;
+        } else {
+          insertedRequestId = existing?.id || null;
         }
       }catch(e){ console.warn('[Lemon Create] save pending error', e.message); }
     }
+
+    // ===== TELEGRAM: YÊU CẦU NÂNG CẤP VIP - LEMON SQUEEZY (giống bank) =====
+    try{
+      const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.headers['x-real-ip'] || 'unknown';
+      const domain = req.headers.origin || req.headers.referer || req.body?.domain || 'https://kararender.com';
+      const origin = req.headers.origin || 'unknown';
+      const referer = req.headers.referer || 'unknown';
+      const ua = req.headers['user-agent'] || 'unknown';
+      const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+      const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+      
+      const planLabelMap = { '1m':'Gói 1 tháng', '3m':'Gói 3 tháng', '6m':'Gói 6 tháng', '12m':'Gói 1 năm', '24m':'Gói 2 năm' };
+      const label = planLabelMap[planKey.toLowerCase()] || planLabel;
+      
+      const detailedMsg = `💥💎🚀 <b>YÊU CẦU NÂNG CẤP VIP - LEMON SQUEEZY</b> 🚀💎💥\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Khách hàng:</b> ${fullNameForTelegram}\n📧 <b>Email:</b> ${email}\n🆔 <b>User:</b> <code>${email}</code>\n\n💳 <b>GÓI NÂNG CẤP:</b>\n├─ <b>Mã gói:</b> ${planKey}\n├─ <b>Tên gói:</b> ${label}\n├─ <b>Thời hạn:</b> ${months} tháng\n└─ <b>Giá:</b> ${planPriceVnd.toLocaleString('vi-VN')}đ ($${displayPrice})\n\n📝 <b>Nội dung CK:</b> <code>lemon ${email.replace(/[@.]/g,'')} ${planKey}</code>\n💰 <b>Số tiền:</b> ${planPriceVnd.toLocaleString('vi-VN')}đ\n🆔 <b>Checkout:</b> ${checkoutId||'N/A'}\n\n🌐 <b>THÔNG TIN TRUY CẬP:</b>\n├─ <b>Domain:</b> ${domain}\n├─ <b>Origin:</b> ${origin}\n├─ <b>Referer:</b> ${referer}\n├─ <b>IP:</b> ${ip}\n└─ <b>Browser:</b> ${ua.slice(0,220)}\n\n⏰ <b>Thời gian:</b> ${timeVN}\n🆔 <b>Request ID:</b> <code>${insertedRequestId||'N/A'}</code>\n━━━━━━━━━━━━━━━━━━━━━━\n⚡ <b>HÀNH ĐỘNG:</b> Chờ thanh toán Lemon Squeezy - sẽ auto duyệt khi thanh toán xong!`;
+      
+      if(token && chatId){
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ chat_id: chatId, text: detailedMsg, parse_mode:'HTML' })
+        }).then(r=>r.json()).then(d=>console.log('[Lemon Create] Telegram request sent:', d.ok)).catch(e=>console.warn('[Lemon Create] Telegram error', e.message));
+      }
+    }catch(e){ console.warn('[Lemon Create] Telegram exception', e.message); }
+
     return res.json({
       success:true,
       checkoutUrl,
@@ -3318,18 +3354,24 @@ app.post('/api/webhook/lemonsqueezy', express.raw({type: 'application/json'}), a
       }
     }catch(e){ console.warn('[Lemon Webhook] vip_requests update error', e.message); }
     console.log(`[Lemon Webhook] AUTO APPROVED ${email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
+    // ===== TELEGRAM AUTO DUYỆT - GIỐNG BANK/USDT =====
     try{
       const timeVN = new Date().toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
       const expireVN = expireDate.toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
-      const msg = `✅💳 <b>AUTO DUYỆT VIP - LEMON SQUEEZY</b> 💳✅\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${email}\n💳 <b>Gói:</b> ${planKey} (${monthsToAdd} tháng)\n💰 <b>Số tiền:</b> $${attrs.total || 'N/A'}\n🆔 <b>Order:</b> ${order.id}\n📅 <b>Hạn dùng:</b> ${expireVN}\n⏰ <b>Thời gian:</b> ${timeVN}\n━━━━━━━━━━━━━━━━━━━━━━\n🤖 Auto duyệt qua Lemon Squeezy webhook!`;
+      const fullNameLemon = targetUser.full_name || email;
+      // Format giống hệt bank webhook
+      const autoMsg = `✅🤖 <b>AUTO DUYỆT VIP - KARARENDER</b> 🤖✅\n━━━━━━━━━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${email}\n👤 <b>Tên:</b> ${fullNameLemon}\n💳 <b>Gói:</b> ${planKey} (${monthsToAdd} tháng)\n💰 <b>Số tiền:</b> $${attrs.total || 'N/A'} (${(attrs.total || 0)*1} USD)\n📝 <b>Nội dung:</b> <code>lemon ${email.replace(/[@.]/g,'')} ${planKey} order:${order.id}</code>\n📅 <b>Hạn dùng:</b> ${expireVN}\n⏰ <b>Thời gian:</b> ${timeVN}\n🆔 <b>Order ID:</b> ${order.id}\n━━━━━━━━━━━━━━━━━━━━━━\n🤖 <b>Hệ thống tự động duyệt qua webhook Lemon Squeezy!</b>`;
+      
       const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
       const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
       if(token && chatId){
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method:'POST',
           headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({chat_id: chatId, text: msg, parse_mode:'HTML'})
+          body: JSON.stringify({chat_id: chatId, text: autoMsg, parse_mode:'HTML'})
         });
+        const data = await resp.json().catch(()=>({}));
+        console.log('[Lemon Webhook] Telegram auto duyệt sent:', data.ok, 'for', email);
       }
     }catch(e){ console.warn('[Lemon Webhook] Telegram error', e.message); }
     return res.json({success:true, autoApproved:true, email, plan: planKey, expire: expireDate.toISOString()});
