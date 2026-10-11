@@ -815,6 +815,76 @@ router.get('/admin/usdt-wallets', async (req,res)=>{
   }
 });
 
+// ====== ADMIN: Giải phóng ví bận (force release) ======
+router.post('/admin/usdt-wallets/:id/release', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const walletId = req.params.id;
+    // Tìm ví
+    const { data: wallet } = await supabaseAdmin.from('usdt_wallets').select('*').eq('id', walletId).maybeSingle();
+    if(!wallet) return res.status(404).json({success:false, message:'Không tìm thấy ví'});
+
+    // Tìm các pending đang giữ ví này trong 30p
+    const cutoff = new Date(Date.now() - WALLET_BUSY_MINUTES*60*1000).toISOString();
+    const { data: pendings } = await supabaseAdmin.from('vip_requests')
+      .select('id, email, content, created_at')
+      .eq('status','PENDING')
+      .gte('created_at', cutoff)
+      .ilike('content','%usdt%');
+
+    let releasedCount = 0;
+    if(pendings && pendings.length>0){
+      const addrLower = wallet.address.toLowerCase();
+      const addrShort = addrLower.slice(0,10);
+      const toReject = pendings.filter(p=>{
+        const c = (p.content||'').toLowerCase();
+        return c.includes(addrLower) || c.includes(addrShort) || c.includes(`walletid:${String(walletId).toLowerCase()}`);
+      });
+      for(const p of toReject){
+        await supabaseAdmin.from('vip_requests').update({
+          status:'REJECTED',
+          reason:'admin_force_release_wallet',
+          updated_at: new Date().toISOString(),
+          content: (p.content||'') + ` | force_released_by_admin_at:${new Date().toISOString()} | wallet:${wallet.address}`
+        }).eq('id', p.id);
+        releasedCount++;
+      }
+    }
+    // Xóa lock nếu có
+    unlockWallet(walletId);
+    console.log(`[USDT Release] Wallet ${walletId} released ${releasedCount} pendings`);
+    res.json({success:true, released: releasedCount, walletId});
+  }catch(e){
+    console.error('[usdt release] error', e.message);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+router.post('/admin/cancel-vip-request', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { requestId, reason } = req.body||{};
+    if(!requestId) return res.status(400).json({success:false, message:'Thiếu requestId'});
+    await supabaseAdmin.from('vip_requests').update({
+      status:'REJECTED',
+      reason: reason||'admin_cancel',
+      updated_at: new Date().toISOString()
+    }).eq('id', requestId);
+    // Cố gắng unlock ví liên quan
+    try{
+      const { data: reqData } = await supabaseAdmin.from('vip_requests').select('content').eq('id', requestId).maybeSingle();
+      if(reqData?.content){
+        const m = reqData.content.match(/walletId:([a-f0-9\-]+)/i);
+        if(m) unlockWallet(m[1]);
+      }
+    }catch{}
+    res.json({success:true});
+  }catch(e){
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+
 // ====== API: CREATE USDT PAYMENT VỚI XOAY VÒNG ======
 router.post('/payment/usdt/create', async (req,res)=>{
   try{
