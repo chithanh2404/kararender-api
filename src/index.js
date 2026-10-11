@@ -96,9 +96,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== MIDDLEWARE CHẶN RENDER KHI HẾT TRIAL - ENHANCED V3 (FIX VIP APPROVED) =====
-// Chặn không cho load module render nếu user đã hết lượt dùng thử (trial_used >=3) mà chưa lên VIP
-// VIP với is_vip=true, is_vip_bool=true, role=VIP, vip_status=APPROVED/ACTIVE, expired_date future -> luôn cho qua
+// ===== MIDDLEWARE CHẶN RENDER KHI HẾT TRIAL - ENHANCED V4 (FIX INCONSISTENT VIP FLAGS) =====
+// Fix case: is_vip=false, is_vip_bool=true, vip_status=REJECTED, trial_used=3, expired_date future -> PHẢI CHẶN
+// VIP thật sự phải có is_vip=true + vip_status không phải REJECTED/EXPIRED + expired_date future (nếu có)
 async function blockRenderIfTrialExpired(req, res, next){
   try{
     const action = (req.query.action || req.body?.action || '').toString();
@@ -126,7 +126,7 @@ async function blockRenderIfTrialExpired(req, res, next){
       return next();
     }
     
-    const ADMIN_WHITELIST = ['chithanh2404@gmail.com','thanhprowadia6@gmail.com','admin@kararender.com'];
+    const ADMIN_WHITELIST = ['chithanh2404@gmail.com','admin@kararender.com'];
     if(ADMIN_WHITELIST.includes(emailForTrial)){
       return next();
     }
@@ -143,12 +143,11 @@ async function blockRenderIfTrialExpired(req, res, next){
     
     let finalUser = trialUser;
     
-    // Auto expire trial nếu quá 15 ngày và chưa VIP
     try{
       const created = trialUser.created_at ? new Date(trialUser.created_at) : null;
       const diffDays = created ? (Date.now() - created.getTime())/86400000 : 0;
-      const isVipEarly = !!(trialUser.is_vip || trialUser.is_vip_bool);
-      if(created && diffDays > 15 && !isVipEarly){
+      const isVipEarlyFlag = trialUser.is_vip === true;
+      if(created && diffDays > 15 && !isVipEarlyFlag){
         const used = parseInt(trialUser.trial_used) || 0;
         if(used < 3){
           console.log(`[Render Block] Auto expire trial 15d for ${emailForTrial} - ${diffDays.toFixed(1)} days`);
@@ -161,17 +160,32 @@ async function blockRenderIfTrialExpired(req, res, next){
       }
     }catch(e){}
     
-    // Check VIP - FIX cho case nhungtlagi62@gmail.com: is_vip=true, is_vip_bool=true, role=VIP, vip_status=APPROVED, expired_date=2026-11-09, trial_used=4
-    // VIP phải luôn được qua dù trial_used=4
     const now = new Date();
     const expiredDate = finalUser.expired_date ? new Date(finalUser.expired_date) : null;
-    const isVipByExpiredDate = expiredDate && expiredDate > now;
+    const isExpiredDateValid = expiredDate && expiredDate > now;
     const vipStatusUpper = String(finalUser.vip_status || '').toUpperCase();
-    const isVipByStatus = ['ACTIVE','APPROVED','APPROVED_VIP','VIP','PAID','SUCCESS'].includes(vipStatusUpper);
-    const isVipByRole = finalUser.role && String(finalUser.role).toUpperCase() === 'VIP';
-    const isVipByFlag = !!(finalUser.is_vip || finalUser.is_vip_bool);
+    const isRejectedOrExpired = ['REJECTED','EXPIRED','BANNED','CANCELLED','DENIED'].includes(vipStatusUpper);
+    const isApprovedStatus = ['ACTIVE','APPROVED','APPROVED_VIP','VIP','PAID','SUCCESS'].includes(vipStatusUpper);
     
-    const isVip = isVipByFlag || isVipByRole || isVipByStatus || isVipByExpiredDate;
+    let isVip = false;
+    if(finalUser.is_vip === true){
+      if(isRejectedOrExpired){
+        isVip = false;
+        console.log(`[Render Block] is_vip=true nhưng vip_status=${finalUser.vip_status} REJECTED/EXPIRED => coi như không VIP`);
+      } else if(finalUser.expired_date && !isExpiredDateValid){
+        isVip = false;
+        console.log(`[Render Block] is_vip=true nhưng expired_date hết hạn ${finalUser.expired_date}`);
+      } else {
+        isVip = true;
+      }
+    } else {
+      if(finalUser.role && String(finalUser.role).toUpperCase() === 'VIP' && isApprovedStatus && (isExpiredDateValid || !finalUser.expired_date)){
+        isVip = true;
+        console.log(`[Render Block] is_vip=false nhưng role=VIP + status APPROVED + expired valid => cho qua legacy`);
+      } else {
+        isVip = false;
+      }
+    }
     
     if(isVip){
       console.log(`[Render Middleware ALLOW VIP] ${emailForTrial} - is_vip:${finalUser.is_vip} is_vip_bool:${finalUser.is_vip_bool} role:${finalUser.role} vip_status:${finalUser.vip_status} expired:${finalUser.expired_date} trial_used:${finalUser.trial_used} -> ALLOW`);
@@ -186,12 +200,21 @@ async function blockRenderIfTrialExpired(req, res, next){
     
     if(expiredByUsage || expiredByTime){
       const reason = expiredByUsage ? `hết lượt (${used}/3)` : `quá hạn ${diffDays.toFixed(1)} ngày`;
-      console.log(`[Render Middleware BLOCK] ${emailForTrial} ${reason} - chặn load module render`);
+      console.log(`[Render Middleware BLOCK] ${emailForTrial} is_vip:${finalUser.is_vip} is_vip_bool:${finalUser.is_vip_bool} vip_status:${finalUser.vip_status} role:${finalUser.role} ${reason} - CHẶN load module render`);
       return res.status(403).json({ 
         success:false, 
         blocked:true, 
         code:'TRIAL_EXPIRED', 
         reason: reason,
+        debug: {
+          email: finalUser.email,
+          is_vip: finalUser.is_vip,
+          is_vip_bool: finalUser.is_vip_bool,
+          vip_status: finalUser.vip_status,
+          role: finalUser.role,
+          expired_date: finalUser.expired_date,
+          trial_used: used
+        },
         trial_used: used,
         trial_limit: 3,
         is_vip: false,
