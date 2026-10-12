@@ -114,6 +114,44 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
+// ===== IP BLOCKING + USER LOCK HELPERS =====
+function getClientIp(req){
+  try{
+    const xf = (req.headers['x-forwarded-for']||'').toString().split(',')[0].trim();
+    if(xf) return xf;
+    const xr = (req.headers['x-real-ip']||'').toString().trim();
+    if(xr) return xr;
+    return (req.ip||'').toString().replace('::ffff:','');
+  }catch{ return (req.ip||'').toString(); }
+}
+
+async function checkBlockedIpMiddleware(req,res,next){
+  try{
+    // Bỏ qua các path health, webhook để tránh loop
+    const path = (req.path||'').toLowerCase();
+    if(path.includes('/health') || path.includes('/webhook')) return next();
+    const ip = getClientIp(req);
+    if(!ip) return next();
+    // IP whitelist (admin, localhost)
+    const IP_WHITELIST = ['127.0.0.1','::1','::ffff:127.0.0.1'];
+    if(IP_WHITELIST.includes(ip)) return next();
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return next();
+    // Check blocked_ips table
+    const { data: blocked } = await supabaseAdmin.from('blocked_ips').select('id,ip,reason,expires_at,is_active').eq('ip', ip).eq('is_active', true).maybeSingle();
+    if(blocked){
+      if(blocked.expires_at && new Date(blocked.expires_at) < new Date()){
+        await supabaseAdmin.from('blocked_ips').update({is_active:false, updated_at:new Date().toISOString()}).eq('id', blocked.id);
+        return next();
+      }
+      console.log(`[IP Block] Blocked IP ${ip} -> ${req.method} ${req.path} Reason: ${blocked.reason}`);
+      return res.status(403).json({success:false, message:'IP của bạn đã bị chặn', code:'IP_BLOCKED', ip, reason: blocked.reason});
+    }
+  }catch(e){ console.warn('[IP Block] check error', e.message); }
+  next();
+}
+app.use(checkBlockedIpMiddleware);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -164,12 +202,21 @@ async function blockRenderIfTrialExpired(req, res, next){
     const { supabaseAdmin: adminTrial } = require('./services/supabase');
     if(!adminTrial) return next();
     
-    const { data: trialUser, error } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,role,trial_used,created_at,vip_status,expired_date').eq('email', emailForTrial).maybeSingle();
+    const { data: trialUser, error } = await adminTrial.from('users').select('id,email,is_vip,is_vip_bool,role,trial_used,created_at,vip_status,expired_date,is_locked,is_banned,status,locked_reason,banned_until').eq('email', emailForTrial).maybeSingle();
     if(error){
       console.warn('[Render Block] query error', error.message);
       return next();
     }
     if(!trialUser) return next();
+
+    // ===== CHECK LOCK / BAN trong render middleware =====
+    if(trialUser.is_locked===true || trialUser.is_banned===true || ['locked','banned','blocked'].includes(String(trialUser.status||'').toLowerCase())){
+      console.log(`[Render Block] User ${emailForTrial} is LOCKED/BANNED status=${trialUser.status} -> BLOCK render`);
+      return res.status(403).json({ success:false, blocked:true, code:'USER_BANNED', message:'Tài khoản đã bị khóa', reason: trialUser.locked_reason||'Tài khoản bị khóa bởi admin' });
+    }
+    if(trialUser.banned_until && new Date(trialUser.banned_until) > new Date()){
+      return res.status(403).json({ success:false, blocked:true, code:'USER_BANNED', message:`Tài khoản bị khóa đến ${trialUser.banned_until}` });
+    }
     
     let finalUser = trialUser;
     
@@ -1227,10 +1274,222 @@ app.get('/api/admin/debug', async (req, res) => {
 app.get('/api/admin/users', async (req,res)=>{
   try{
     const { supabaseAdmin } = require('./services/supabase');
-    const { data } = await supabaseAdmin.from('users').select('id,email,full_name,is_vip,created_at').order('created_at',{ascending:false}).limit(2000);
+    if(!supabaseAdmin) return res.status(500).json({error:'Supabase not configured'});
+    // Trả thêm các trường lock/ban để admin quản lý
+    const { data } = await supabaseAdmin.from('users')
+      .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status')
+      .order('created_at',{ascending:false}).limit(2000);
     res.json(data||[]);
   }catch(e){ res.status(500).json({ error:e.message }); }
 });
+
+// ===== LOCK / UNLOCK USER - ADMIN =====
+function isAdminEmailCheck(email){
+  const list = ['chithanh2404@gmail.com','admin@kararender.com','thanhprowadia6@gmail.com','loinhacsong.pro@gmail.com'];
+  return list.includes((email||'').toLowerCase().trim());
+}
+
+app.post('/api/admin/users/lock', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.body?.adminEmail||req.query?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin mới được khóa user'});
+    const { email, userId, reason, bannedUntil } = req.body||{};
+    const target = (email||'').toLowerCase().trim();
+    if(!target && !userId) return res.status(400).json({success:false, message:'Thiếu email hoặc userId'});
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'Supabase not configured'});
+    const updateData = {
+      is_locked: true,
+      status: 'locked',
+      locked_reason: reason||'Khóa bởi admin',
+      locked_at: new Date().toISOString(),
+      locked_by: adminEmail,
+      updated_at: new Date().toISOString()
+    };
+    if(bannedUntil) updateData.banned_until = new Date(bannedUntil).toISOString();
+    let query = supabaseAdmin.from('users').update(updateData);
+    if(userId) query = query.eq('id', userId);
+    else query = query.eq('email', target);
+    const { data, error } = await query.select('id,email,is_locked,status').maybeSingle();
+    if(error) throw error;
+    console.log(`[Admin Lock] ${adminEmail} locked ${target||userId} reason: ${reason}`);
+    // Ghi log ra Telegram nếu có
+    try{
+      const msg = `🔒 <b>LOCK USER - KARARENDER</b>\n👤 ${target||userId}\n📝 ${reason||'N/A'}\n👮‍♂️ By: ${adminEmail}\n⏰ ${new Date().toLocaleString('vi-VN')}`;
+      const token = process.env.TELEGRAM_BOT_TOKEN; const chatId = process.env.TELEGRAM_CHAT_ID;
+      if(token && chatId) fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:chatId,text:msg,parse_mode:'HTML'})}).catch(()=>{});
+    }catch{}
+    res.json({success:true, user: data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.post('/api/admin/users/unlock', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.body?.adminEmail||req.query?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin mới được mở khóa'});
+    const { email, userId } = req.body||{};
+    const target = (email||'').toLowerCase().trim();
+    if(!target && !userId) return res.status(400).json({success:false, message:'Thiếu email hoặc userId'});
+    const { supabaseAdmin } = require('./services/supabase');
+    const updateData = {
+      is_locked: false,
+      is_banned: false,
+      status: 'active',
+      locked_reason: null,
+      locked_at: null,
+      locked_by: null,
+      banned_until: null,
+      updated_at: new Date().toISOString()
+    };
+    let query = supabaseAdmin.from('users').update(updateData);
+    if(userId) query = query.eq('id', userId);
+    else query = query.eq('email', target);
+    const { data, error } = await query.select('id,email,is_locked,status').maybeSingle();
+    if(error) throw error;
+    console.log(`[Admin Unlock] ${adminEmail} unlocked ${target||userId}`);
+    res.json({success:true, user: data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.post('/api/admin/users/:id/lock', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.body?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { id } = req.params;
+    const { reason, bannedUntil } = req.body||{};
+    const { supabaseAdmin } = require('./services/supabase');
+    const updateData = {
+      is_locked: true,
+      status: 'locked',
+      locked_reason: reason||'Khóa bởi admin',
+      locked_at: new Date().toISOString(),
+      locked_by: adminEmail,
+      updated_at: new Date().toISOString()
+    };
+    if(bannedUntil) updateData.banned_until = new Date(bannedUntil).toISOString();
+    const { data, error } = await supabaseAdmin.from('users').update(updateData).eq('id', id).select('id,email,is_locked,status').maybeSingle();
+    if(error) throw error;
+    res.json({success:true, user:data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.post('/api/admin/users/:id/unlock', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { id } = req.params;
+    const { supabaseAdmin } = require('./services/supabase');
+    const { data, error } = await supabaseAdmin.from('users').update({
+      is_locked:false, is_banned:false, status:'active', locked_reason:null, locked_at:null, locked_by:null, banned_until:null, updated_at:new Date().toISOString()
+    }).eq('id', id).select('id,email,is_locked,status').maybeSingle();
+    if(error) throw error;
+    res.json({success:true, user:data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+// ===== IP BLOCKING MANAGEMENT =====
+app.get('/api/admin/blocked-ips', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.query?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { supabaseAdmin } = require('./services/supabase');
+    const { data, error } = await supabaseAdmin.from('blocked_ips').select('*').order('created_at',{ascending:false}).limit(500);
+    if(error){
+      // Nếu bảng chưa tồn tại
+      return res.json({success:true, ips:[], _needCreateTable:true, message:'Bảng blocked_ips chưa tồn tại, cần tạo trong Supabase'});
+    }
+    res.json({success:true, ips: data||[]});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.post('/api/admin/blocked-ips', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.body?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { ip, reason, expiresAt, expires_at } = req.body||{};
+    const targetIp = (ip||'').trim();
+    if(!targetIp) return res.status(400).json({success:false, message:'Thiếu IP'});
+    // Validate IP đơn giản
+    if(targetIp.length<7) return res.status(400).json({success:false, message:'IP không hợp lệ'});
+    const { supabaseAdmin } = require('./services/supabase');
+    const payload = {
+      ip: targetIp,
+      reason: reason||'Chặn bởi admin',
+      blocked_by: adminEmail,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      expires_at: expiresAt||expires_at ? new Date(expiresAt||expires_at).toISOString() : null,
+      updated_at: new Date().toISOString()
+    };
+    const { data, error } = await supabaseAdmin.from('blocked_ips').upsert(payload, {onConflict:'ip'}).select('*').maybeSingle();
+    if(error) throw error;
+    console.log(`[IP Block] ${adminEmail} blocked IP ${targetIp} reason: ${reason}`);
+    res.json({success:true, ip: data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.delete('/api/admin/blocked-ips/:id', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.query?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { id } = req.params;
+    const { supabaseAdmin } = require('./services/supabase');
+    // Hỗ trợ xóa theo id hoặc ip
+    let result;
+    if(id.includes('.')){
+      // Là IP
+      result = await supabaseAdmin.from('blocked_ips').update({is_active:false, updated_at:new Date().toISOString()}).eq('ip', id);
+    }else{
+      result = await supabaseAdmin.from('blocked_ips').update({is_active:false, updated_at:new Date().toISOString()}).eq('id', id);
+    }
+    if(result.error) throw result.error;
+    res.json({success:true});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.post('/api/admin/unblock-ip', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.body?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { ip, id } = req.body||{};
+    const { supabaseAdmin } = require('./services/supabase');
+    let query = supabaseAdmin.from('blocked_ips').update({is_active:false, updated_at:new Date().toISOString()});
+    if(id) query = query.eq('id', id);
+    else if(ip) query = query.eq('ip', ip);
+    else return res.status(400).json({success:false, message:'Thiếu ip hoặc id'});
+    const { error } = await query;
+    if(error) throw error;
+    res.json({success:true});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
+app.post('/api/admin/block-ip', async (req,res)=>{
+  try{
+    const adminEmail = (req.headers['x-user-email']||req.body?.adminEmail||'').toLowerCase().trim();
+    if(!isAdminEmailCheck(adminEmail)) return res.status(403).json({success:false, message:'Chỉ admin'});
+    const { ip, reason, email } = req.body||{};
+    let targetIp = (ip||'').trim();
+    const { supabaseAdmin } = require('./services/supabase');
+    // Nếu không có IP mà có email -> lấy last_ip của user
+    if(!targetIp && email){
+      const { data: user } = await supabaseAdmin.from('users').select('last_ip,email').eq('email', email.toLowerCase().trim()).maybeSingle();
+      if(user?.last_ip) targetIp = user.last_ip;
+    }
+    if(!targetIp) return res.status(400).json({success:false, message:'Thiếu IP (hoặc email không có last_ip)'});
+    const payload = {
+      ip: targetIp,
+      reason: reason||`Chặn IP của user ${email||targetIp} bởi admin`,
+      blocked_by: adminEmail,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    const { data, error } = await supabaseAdmin.from('blocked_ips').upsert(payload, {onConflict:'ip'}).select('*').maybeSingle();
+    if(error) throw error;
+    res.json({success:true, ip: data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
 app.get('/api/admin/stats/fonts', async (req,res)=>{
   try{
     const { supabaseAdmin } = require('./services/supabase');
