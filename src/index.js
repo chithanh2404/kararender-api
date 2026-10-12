@@ -1275,13 +1275,70 @@ app.get('/api/admin/users', async (req,res)=>{
   try{
     const { supabaseAdmin } = require('./services/supabase');
     if(!supabaseAdmin) return res.status(500).json({error:'Supabase not configured'});
-    // Trả thêm các trường lock/ban để admin quản lý
-    const { data } = await supabaseAdmin.from('users')
-      .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status')
-      .order('created_at',{ascending:false}).limit(2000);
+    const search = (req.query.search || req.query.q || '').toString().trim();
+    const filter = (req.query.filter || '').toString().toLowerCase().trim(); // all | locked | vip | active
+    const statusParam = (req.query.status || '').toString().toLowerCase().trim();
+    const searchLower = search.toLowerCase();
+    
+    let query = supabaseAdmin.from('users')
+      .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status');
+    
+    // Filter theo loại - để tìm user thứ 201+ vẫn ra
+    if(filter==='locked' || statusParam==='locked'){
+      query = query.or('is_locked.eq.true,is_banned.eq.true,status.eq.locked,status.eq.banned');
+    } else if(filter==='vip'){
+      query = query.eq('is_vip', true);
+    } else if(filter==='active'){
+      query = query.eq('is_locked', false).eq('is_banned', false).neq('status','locked').neq('status','banned');
+    }
+    
+    if(search){
+      // Nếu search chứa @ thì tìm chính xác email trước để đảm bảo tìm ra dù ở vị trí 5000+
+      if(search.includes('@')){
+        // Thử tìm exact email trước
+        const { data: exact } = await supabaseAdmin.from('users')
+          .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status')
+          .eq('email', searchLower)
+          .limit(5);
+        if(exact && exact.length>0){
+          return res.json(exact);
+        }
+      }
+      // Nếu không exact thì ilike
+      // Nếu đã có filter locked/vip thì phải kết hợp bằng cách thêm or filter sau
+      // Để đơn giản, nếu có filter thì thêm điều kiện search vào sau bằng cách dùng or với ilike
+      query = query.or(`email.ilike.%${search}%,full_name.ilike.%${search}%,last_ip.ilike.%${search}%,locked_reason.ilike.%${search}%`);
+    }
+    
+    // Nếu filter thì tăng limit lên 5000 để lấy hết user khóa/VIP dù ở sâu
+    const limit = (filter==='locked' || filter==='vip' || search) ? 5000 : 2000;
+    query = query.order('created_at',{ascending:false}).limit(limit);
+    const { data, error } = await query;
+    if(error) throw error;
     res.json(data||[]);
-  }catch(e){ res.status(500).json({ error:e.message }); }
+  }catch(e){ 
+    console.error('[admin/users] error', e.message);
+    res.status(500).json({ error:e.message }); 
+  }
 });
+
+// Thêm endpoint tìm user chính xác theo email - để khóa user thứ 201+ dễ dàng
+app.get('/api/admin/users/by-email', async (req,res)=>{
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({error:'Supabase not configured'});
+    const email = (req.query.email || '').toString().toLowerCase().trim();
+    if(!email) return res.status(400).json({success:false, message:'Thiếu email'});
+    const { data, error } = await supabaseAdmin.from('users')
+      .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status')
+      .eq('email', email)
+      .maybeSingle();
+    if(error) throw error;
+    if(!data) return res.status(404).json({success:false, message:'Không tìm thấy user'});
+    res.json({success:true, user:data});
+  }catch(e){ res.status(500).json({success:false, message:e.message}); }
+});
+
 
 // ===== LOCK / UNLOCK USER - ADMIN =====
 function isAdminEmailCheck(email){
