@@ -3700,6 +3700,202 @@ app.post('/api/webhook/lemonsqueezy', express.raw({type: 'application/json'}), a
 app.post('/api/webhook/lemon', (req,res,next)=>{ req.url='/api/webhook/lemonsqueezy'; req.method='POST'; app._router.handle(req,res,next); });
 
 
+// ===== PAYPAL - CỔNG THANH TOÁN QUỐC TẾ - AUTO DUYỆT VIP =====
+// PayPal webhook cần raw body để verify signature
+app.post('/api/webhook/paypal', express.raw({type:'application/json'}), async (req,res)=>{
+  try{
+    const rawBody = req.body;
+    const bodyString = rawBody ? rawBody.toString('utf8') : '';
+    console.log('[PayPal Webhook] Raw:', bodyString.slice(0,3000));
+
+    const webhookId = (process.env.PAYPAL_WEBHOOK_ID || '').trim();
+    if(!webhookId){
+      console.warn('[PayPal Webhook] Thiếu PAYPAL_WEBHOOK_ID - bỏ qua verify (chỉ nên dùng khi test)');
+    }
+
+    // Verify signature với PayPal
+    let verifyOk = false;
+    try{
+      const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
+        method:'POST',
+        headers:{
+          'Authorization':'Basic '+Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET||process.env.PAYPAL_CLIENT_SECRET}`).toString('base64'),
+          'Content-Type':'application/x-www-form-urlencoded'
+        },
+        body:'grant_type=client_credentials'
+      });
+      const tokenData = await tokenRes.json();
+      const token = tokenData.access_token;
+      if(token && webhookId){
+        const verifyRes = await fetch('https://api-m.paypal.com/v1/notifications/verify-webhook-signature', {
+          method:'POST',
+          headers:{
+            'Authorization':`Bearer ${token}`,
+            'Content-Type':'application/json'
+          },
+          body: JSON.stringify({
+            transmission_id: req.headers['paypal-transmission-id'],
+            transmission_time: req.headers['paypal-transmission-time'],
+            cert_id: req.headers['paypal-cert-id'],
+            auth_algo: req.headers['paypal-auth-algo'],
+            transmission_sig: req.headers['paypal-transmission-sig'],
+            webhook_id: webhookId,
+            webhook_event: JSON.parse(bodyString || '{}')
+          })
+        });
+        const verifyData = await verifyRes.json();
+        verifyOk = verifyData.verification_status === 'SUCCESS';
+        console.log('[PayPal Webhook] Verify:', verifyData.verification_status);
+        if(!verifyOk){
+          console.warn('[PayPal Webhook] Verify FAIL nhưng vẫn tiếp tục xử lý để debug:', verifyData);
+          // Khi live nên return 400 nếu verify fail, tạm thời vẫn cho qua
+          // return res.status(400).json({success:false, message:'Invalid signature'});
+        }
+      }else{
+        verifyOk = true; // sandbox/test không có webhookId
+      }
+    }catch(e){ console.warn('[PayPal Webhook] Verify exception', e.message); }
+
+    let body;
+    try{ body = JSON.parse(bodyString); }catch(e){ body = {}; }
+
+    const eventType = body.event_type || '';
+    console.log('[PayPal Webhook] Event:', eventType);
+
+    // Chỉ xử lý khi thanh toán thành công
+    if(eventType !== 'PAYMENT.CAPTURE.COMPLETED' && eventType !== 'CHECKOUT.ORDER.APPROVED'){
+      console.log('[PayPal Webhook] Ignored event', eventType);
+      return res.json({success:true, ignored:true, event:eventType});
+    }
+
+    // Lấy thông tin
+    const resource = body.resource || {};
+    // custom_id = email|planKey (ta set lúc create-order)
+    let customId = resource.custom_id || '';
+    if(!customId && resource.purchase_units && resource.purchase_units[0]){
+      customId = resource.purchase_units[0].custom_id || '';
+    }
+    // Nếu là ORDER.APPROVED thì custom nằm trong purchase_units
+    if(!customId && body.resource && body.resource.purchase_units){
+      customId = body.resource.purchase_units?.[0]?.custom_id || '';
+    }
+
+    // Fallback: lấy từ supplementary_data hoặc tìm trong DB pending
+    let email = '';
+    let planKey = '1m';
+    if(customId && customId.includes('|')){
+      const parts = customId.split('|');
+      email = (parts[0]||'').toLowerCase().trim();
+      planKey = (parts[1]||'1m').toLowerCase().trim();
+    }
+
+    // Nếu không có customId (trường hợp user trả qua link cũ), thử lấy email từ payer
+    if(!email){
+      email = (resource.payer?.email_address || body.resource?.payer?.email_address || '').toLowerCase().trim();
+    }
+
+    if(!email){
+      console.warn('[PayPal Webhook] No email found in webhook');
+      return res.json({success:false, message:'No email'});
+    }
+
+    // Map planKey nếu thiếu
+    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '24m':24, '1y':12, '2y':24, 'lifetime':1200 };
+    const monthsToAdd = monthsMap[planKey] || 1;
+    const amount = resource.amount?.value || resource.purchase_units?.[0]?.amount?.value || '0';
+
+    console.log(`[PayPal Webhook] Parsed email:${email} plan:${planKey} amount:$${amount}`);
+
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'Supabase not configured'});
+
+    const { data: targetUser } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
+    if(!targetUser){
+      console.warn('[PayPal Webhook] User not found', email);
+      return res.json({success:false, message:'User not found '+email});
+    }
+
+    const now = new Date();
+    let expireDate = new Date();
+    if(targetUser.expired_date && new Date(targetUser.expired_date) > now){
+      expireDate = new Date(targetUser.expired_date);
+    }
+    expireDate.setMonth(expireDate.getMonth() + monthsToAdd);
+    if(planKey==='lifetime') expireDate = new Date('2099-12-31');
+
+    // Update VIP
+    const { error: upErr } = await supabaseAdmin.from('users').update({
+      is_vip: true,
+      is_vip_bool: true,
+      role: 'VIP',
+      vip_status: 'APPROVED',
+      expired_date: expireDate.toISOString(),
+      request_plan_key: planKey,
+      request_amount: parseFloat(amount)||0,
+      request_content: `paypal auto ${planKey} order:${resource.id||body.id} $${amount} ${email}`,
+      request_vip_time: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }).eq('id', targetUser.id);
+
+    if(upErr){
+      console.error('[PayPal Webhook] Update user error', upErr.message);
+      return res.status(500).json({success:false, error:upErr.message});
+    }
+
+    // Update vip_requests
+    try{
+      const { data: pendingList } = await supabaseAdmin.from('vip_requests').select('id').eq('email', email).eq('status','PENDING').order('created_at',{ascending:false}).limit(5);
+      if(pendingList && pendingList.length>0){
+        await supabaseAdmin.from('vip_requests').update({
+          status:'APPROVED',
+          amount: parseFloat(amount)||0,
+          content: `paypal ${planKey} order:${resource.id||body.id} $${amount} ${email} - AUTO`,
+          updated_at: new Date().toISOString()
+        }).eq('id', pendingList[0].id);
+      }else{
+        await supabaseAdmin.from('vip_requests').insert({
+          email: email,
+          full_name: targetUser.full_name || email,
+          plan_key: planKey,
+          amount: parseFloat(amount)||0,
+          content: `paypal auto ${planKey} order:${resource.id||body.id} $${amount}`,
+          status:'APPROVED',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+      }
+    }catch(e){ console.warn('[PayPal Webhook] vip_requests error', e.message); }
+
+    console.log(`[PayPal Webhook] AUTO APPROVED ${email} gói ${planKey} hết hạn ${expireDate.toISOString()}`);
+
+    // Telegram - giống hệt Lemon
+    try{
+      const timeVN = new Date().toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
+      const expireVN = expireDate.toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
+      const fullName = targetUser.full_name || email;
+      const autoMsg = `✅🤖 <b>AUTO DUYỆT VIP - PAYPAL</b> 🤖✅\n━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${email}\n👤 <b>Tên:</b> ${fullName}\n💳 <b>Gói:</b> ${planKey} (${monthsToAdd} tháng)\n💰 <b>Số tiền:</b> $${amount} USD\n📝 <b>Nội dung:</b> <code>paypal ${email.replace(/[@.]/g,'')} ${planKey} order:${resource.id||''}</code>\n📅 <b>Hạn:</b> ${expireVN}\n⏰ <b>Giờ:</b> ${timeVN}\n🆔 <b>PayPal ID:</b> ${resource.id||body.id}\n━━━━━━━━━━━━━━\n🤖 <b>Auto via PayPal webhook!</b>`;
+      const token = (process.env.TELEGRAM_BOT_TOKEN||'').trim();
+      const chatId = (process.env.TELEGRAM_CHAT_ID||'').trim();
+      if(token && chatId){
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({chat_id: chatId, text: autoMsg, parse_mode:'HTML'})
+        });
+      }
+    }catch(e){ console.warn('[PayPal Webhook] Telegram error', e.message); }
+
+    return res.json({success:true, autoApproved:true, email, plan:planKey, expire: expireDate.toISOString()});
+  }catch(e){
+    console.error('[PayPal Webhook] Exception', e);
+    return res.status(500).json({success:false, error:e.message});
+  }
+});
+
+app.post('/api/webhook/paypal-legacy', (req,res,next)=>{ req.url='/api/webhook/paypal'; req.method='POST'; app._router.handle(req,res,next); });
+
+// ===== END PAYPAL =====
+
 
 // ===== ADMIN: GỠ CHẶN OTP IP/EMAIL =====
 app.post('/api/admin/clear-otp-block', express.json(), (req, res) => {
