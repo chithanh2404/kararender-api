@@ -15,6 +15,7 @@ const config = require('./config');
 const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
 const upgradeRoutes = require('./routes/upgrade');
+const paypalRouter = require('./routes/paypal');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
 
@@ -157,6 +158,7 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Sau khi cors mới mount vocalRouter
 app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
+app.use('/api/payment/paypal', paypalRouter);
 
 // FIX: Thêm middleware log + đảm bảo /api/health luôn trả về
 app.use((req, res, next) => {
