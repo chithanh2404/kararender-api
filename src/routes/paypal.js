@@ -1,4 +1,4 @@
-// src/routes/paypal.js - FULL FIXED - Giống logic Bank 100% + Telegram
+// src/routes/paypal.js - SUPABASE COMPATIBLE - đúng cấu trúc vip_requests hiện tại của bạn
 const express = require('express');
 const router = express.Router();
 
@@ -32,8 +32,6 @@ function getPayPalPrice(planKey){
     '6M': process.env.PAYPAL_PRICE_6M || '17.99',
     '12M': process.env.PAYPAL_PRICE_12M || '27.99',
     '24M': process.env.PAYPAL_PRICE_24M || '44.99',
-    '1Y': process.env.PAYPAL_PRICE_12M || '27.99',
-    '2Y': process.env.PAYPAL_PRICE_24M || '44.99',
   };
   return map[key] || map['1M'];
 }
@@ -47,36 +45,23 @@ async function sendTelegram(htmlMessage){
   try{
     const token = (process.env.TELEGRAM_BOT_TOKEN||'').trim();
     const chatId = (process.env.TELEGRAM_CHAT_ID||'').trim();
-    if(!token || !chatId) {
-      console.warn('[Telegram] Thiếu TELEGRAM_BOT_TOKEN / CHAT_ID');
-      return false;
-    }
+    if(!token || !chatId) return false;
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({chat_id: chatId, text: htmlMessage, parse_mode:'HTML', disable_web_page_preview: true})
+      body: JSON.stringify({chat_id: chatId, text: htmlMessage, parse_mode:'HTML'})
     });
-    const data = await res.json();
-    console.log('[Telegram] Sent:', data.ok ? 'OK' : JSON.stringify(data));
-    return data.ok;
-  }catch(e){
-    console.warn('[Telegram] Error', e.message);
-    return false;
-  }
+    return (await res.json()).ok;
+  }catch(e){ console.warn('[Telegram]', e.message); return false; }
 }
 
-// GET /api/payment/paypal/config
 router.get('/config', async (req,res)=>{
   try{
     const hasKey = !!(process.env.PAYPAL_CLIENT_ID && (process.env.PAYPAL_SECRET || process.env.PAYPAL_CLIENT_SECRET));
-    const webhookId = process.env.PAYPAL_WEBHOOK_ID || '';
     return res.json({
       success:true,
       configured: hasKey,
       mode: process.env.PAYPAL_MODE || 'live',
-      clientId: process.env.PAYPAL_CLIENT_ID ? process.env.PAYPAL_CLIENT_ID.slice(0,12)+'...' : 'NOT SET',
-      webhookId: webhookId ? webhookId.slice(0,8)+'...' : 'NOT SET',
-      fullWebhookId: webhookId,
       prices: {
         '1m': getPayPalPrice('1M'),
         '3m': getPayPalPrice('3M'),
@@ -88,7 +73,7 @@ router.get('/config', async (req,res)=>{
   }catch(e){ return res.json({success:false, message:e.message}); }
 });
 
-// POST /api/payment/paypal/create-order - GIỐNG HỆT BANK: tạo request-vip PENDING + Telegram
+// POST /api/payment/paypal/create-order - TẠO HÀNG MỚI TRONG vip_requests GIỐNG BANK
 router.post('/create-order', async (req,res)=>{
   try{
     const { email, planKey } = req.body || {};
@@ -96,11 +81,13 @@ router.post('/create-order', async (req,res)=>{
 
     const normalizedEmail = email.toLowerCase().trim();
     const normalizedPlan = planKey.toLowerCase().trim();
-    const token = await getPayPalToken();
     const priceUsd = getPayPalPrice(planKey);
     const priceVnd = getVndPrice(normalizedPlan);
-    const customId = `${normalizedEmail}|${normalizedPlan}|${Date.now()}`;
+    const emailClean = normalizedEmail.replace(/[@.]/g,''); // giống bank: alvinhoang592gmailcom
+    const customId = `${normalizedEmail}|${normalizedPlan}`;
 
+    // Tạo PayPal order
+    const token = await getPayPalToken();
     const payload = {
       intent:'CAPTURE',
       purchase_units:[{
@@ -121,10 +108,7 @@ router.post('/create-order', async (req,res)=>{
 
     const orderRes = await fetch(`${PAYPAL_API}/v2/checkout/orders`, {
       method:'POST',
-      headers:{
-        'Authorization':`Bearer ${token}`,
-        'Content-Type':'application/json'
-      },
+      headers:{ 'Authorization':`Bearer ${token}`, 'Content-Type':'application/json' },
       body: JSON.stringify(payload)
     });
     const order = await orderRes.json();
@@ -132,52 +116,56 @@ router.post('/create-order', async (req,res)=>{
       console.error('[PayPal Create] failed', order);
       return res.status(500).json({success:false, message:'Tạo PayPal order thất bại', detail:order});
     }
-
     const approveLink = (order.links||[]).find(l=>l.rel==='approve')?.href || `https://www.paypal.com/checkoutnow?token=${order.id}`;
 
-    // ===== LÀM GIỐNG BANK: TẠO VIP REQUEST PENDING + UPDATE USERS =====
+    // ===== CHÈN VÀO vip_requests ĐÚNG CẤU TRÚC BẠN ĐANG DÙNG =====
+    // Cấu trúc bạn gửi: {email, full_name, plan_key, amount, content, status, usdt_wallet_id, usdt_wallet_address}
     try{
       const { supabaseAdmin } = require('../services/supabase');
       if(supabaseAdmin){
-        // 1. Update users table giống bank
         const { data: user } = await supabaseAdmin.from('users').select('id,email,full_name').eq('email', normalizedEmail).maybeSingle();
-        
+        const fullName = user?.full_name || normalizedEmail.split('@')[0] || 'user';
+
+        // Content giống bank: "nang cap alvinhoang592gmailcom 1m" + thêm paypal để phân biệt
+        const contentText = `nang cap ${emailClean} ${normalizedPlan} paypal ${order.id} $${priceUsd}`;
+
+        // 1. Insert vip_requests - CHỈ DÙNG CÁC CỘT ĐÃ CÓ, không thêm cột lạ
+        const { data: inserted, error: insErr } = await supabaseAdmin.from('vip_requests').insert({
+          email: normalizedEmail,
+          full_name: fullName,
+          plan_key: normalizedPlan,
+          amount: priceVnd, // VND như bank: 99000
+          content: contentText,
+          status: 'PENDING'
+          // idx, id, created_at, updated_at tự động, usdt_wallet_id/address để null
+        }).select().single();
+
+        if(insErr){
+          console.error('[PayPal] vip_requests insert error', insErr.message);
+        } else {
+          console.log(`[PayPal] ✅ Đã thêm vip_requests id=${inserted?.id} email=${normalizedEmail} plan=${normalizedPlan} PENDING`);
+        }
+
+        // 2. Update users giống bank để hiện trạng thái pending
         if(user){
           await supabaseAdmin.from('users').update({
             request_plan_key: normalizedPlan,
             request_amount: priceVnd,
-            request_content: `paypal pending ${normalizedPlan} order:${order.id} $${priceUsd} ${normalizedEmail}`,
+            request_content: contentText,
             request_vip_time: new Date().toISOString(),
             vip_status: 'PENDING',
             updated_at: new Date().toISOString()
           }).eq('id', user.id);
         }
-
-        // 2. Insert vip_requests giống bank
-        await supabaseAdmin.from('vip_requests').insert({
-          email: normalizedEmail,
-          full_name: user?.full_name || normalizedEmail,
-          plan_key: normalizedPlan,
-          amount: priceVnd,
-          usd_amount: parseFloat(priceUsd),
-          content: `paypal pending ${normalizedPlan} order:${order.id} $${priceUsd} ${normalizedEmail} | approve:${approveLink}`,
-          status:'PENDING',
-          payment_method:'PAYPAL',
-          paypal_order_id: order.id,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        });
-
-        console.log(`[PayPal] Created PENDING request for ${normalizedEmail} plan ${normalizedPlan} order ${order.id}`);
       }
-    }catch(e){ console.warn('[PayPal Create] supabase insert warn', e.message, e.stack); }
+    }catch(e){ console.warn('[PayPal] supabase error', e.message); }
 
-    // 3. Gửi Telegram giống Bank - YÊU CẦU MỚI
+    // 3. Telegram báo YÊU CẦU MỚI giống bank
     try{
       const timeVN = new Date().toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
-      const msg = `🔔 <b>YÊU CẦU VIP MỚI - PAYPAL</b> 🔔\n━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${normalizedEmail}\n💳 <b>Gói:</b> ${normalizedPlan.toUpperCase()}\n💰 <b>Tiền:</b> $${priceUsd} USD (~${new Intl.NumberFormat('vi-VN').format(priceVnd)}đ)\n📝 <b>Nội dung:</b> <code>paypal ${normalizedEmail.replace(/[@.]/g,'')} ${normalizedPlan} order:${order.id}</code>\n🆔 <b>Order ID:</b> <code>${order.id}</code>\n🔗 <b>Approve:</b> ${approveLink}\n⏰ <b>Giờ:</b> ${timeVN}\n━━━━━━━━━━━━━━\n💡 <b>Chờ user thanh toán PayPal - sẽ auto duyệt khi capture</b>`;
+      const msg = `🔔 <b>YÊU CẦU VIP MỚI - PAYPAL</b> 🔔\n━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${normalizedEmail}\n💳 <b>Gói:</b> ${normalizedPlan.toUpperCase()}\n💰 <b>Tiền:</b> $${priceUsd} (~${new Intl.NumberFormat('vi-VN').format(priceVnd)}đ)\n📝 <b>Nội dung:</b> <code>${`nang cap ${emailClean} ${normalizedPlan}`}</code>\n🆔 <b>Order:</b> <code>${order.id}</code>\n🔗 <b>Link:</b> ${approveLink}\n⏰ <b>Giờ:</b> ${timeVN}\n━━━━━━━━━━━━━━\n💡 <b>Chờ user thanh toán - sẽ auto duyệt</b>`;
       await sendTelegram(msg);
-    }catch(e){ console.warn('[PayPal] Telegram pending error', e.message); }
+    }catch(e){}
 
     return res.json({
       success:true,
@@ -185,8 +173,7 @@ router.post('/create-order', async (req,res)=>{
       price: priceUsd,
       priceVnd: priceVnd,
       currency:'USD',
-      approveLink: approveLink,
-      paypalOrder: order
+      approveLink: approveLink
     });
   }catch(e){
     console.error('[PayPal Create] Exception', e);
