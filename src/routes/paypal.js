@@ -130,8 +130,8 @@ router.post('/create-order', async (req,res)=>{
         landing_page:'BILLING',
         user_action:'PAY_NOW',
         shipping_preference:'NO_SHIPPING',
-        return_url: 'https://kararender.com/vip-success',
-        cancel_url: 'https://kararender.com/vip-cancel'
+        return_url: 'https://www.kararender.com/vip-success',
+        cancel_url: 'https://www.kararender.com/vip-cancel'
       }
     };
 
