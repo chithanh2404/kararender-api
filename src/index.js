@@ -3362,9 +3362,9 @@ app.post('/api/payment/lemonsqueezy/create', express.json(), async (req, res) =>
             }
           },
           product_options: {
-            redirect_url: `${process.env.FRONTEND_URL || 'https://kararender.com'}/vip-success?email=${encodeURIComponent(email)}&plan=${planKey}`,
+            redirect_url: `${process.env.FRONTEND_URL || 'https://www.kararender.com'}/vip-success?email=${encodeURIComponent(email)}&plan=${planKey}`,
             receipt_button_text: "Quay lại KaraRender",
-            receipt_link_url: `${process.env.FRONTEND_URL || 'https://kararender.com'}/`,
+            receipt_link_url: `${process.env.FRONTEND_URL || 'https://www.kararender.com'}/`,
             receipt_thank_you_note: `Cảm ơn bạn đã mua ${planLabel} - KaraRender sẽ tự động kích hoạt VIP trong 30s!`
           }
         },
