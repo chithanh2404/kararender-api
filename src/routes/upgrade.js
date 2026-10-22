@@ -1331,17 +1331,17 @@ async function scanViaRpcLogs(walletAddress, expectedUsdt, contract){
     'https://bsc-dataseed2.binance.org/',
     'https://bsc-dataseed3.binance.org/',
     'https://bsc-dataseed4.binance.org/',
-    'https://bsc.publicnode.com',
     'https://binance.llamarpc.com',
     'https://rpc.ankr.com/bsc',
-    'https://bsc.meowrpc.com'
+    'https://1rpc.io/bnb',
+    'https://bsc-rpc.publicnode.com'
   ];
   const walletLower = walletAddress.toLowerCase();
   const contractLower = contract.toLowerCase();
   const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
   const paddedTo = '0x000000000000000000000000' + walletLower.slice(2);
-  const BLOCKS_TOTAL = 30000; // TEST: 30000 block ~25h để bắt Tx cũ hôm qua
-  const CHUNK = 5000; // node chỉ cho 5000 block/lần
+  const BLOCKS_TOTAL = 10000; // ~8h, đủ cho khách, giảm limit exceeded
+  const CHUNK = 500; // 500 block/lần để tránh limit exceeded (USDT nhiều log)
   
   for(const rpcUrl of rpcUrls){
     try{
@@ -1362,80 +1362,75 @@ async function scanViaRpcLogs(walletAddress, expectedUsdt, contract){
         continue;
       }
       
-      // chia nhỏ thành nhiều chunk
       for(let offset=0; offset<BLOCKS_TOTAL; offset+=CHUNK){
         const from = Math.max(0, latestBlock - BLOCKS_TOTAL + offset);
         const to = Math.min(latestBlock, from + CHUNK - 1);
         const fromHex = '0x' + from.toString(16);
         const toHex = '0x' + to.toString(16);
-        console.log(`[RPC Logs] Scanning ${rpcUrl} chunk ${from}-${to} wallet ${walletLower.slice(0,10)}...`);
         
-        const queries = [
-          {
-            label: 'USDT contract + to',
-            params: { fromBlock: fromHex, toBlock: toHex, address: contract, topics: [transferTopic, null, paddedTo] }
-          }
-        ];
-        
-        for(const q of queries){
-          try{
-            const res = await fetch(rpcUrl, {
-              method:'POST',
-              headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getLogs', params:[q.params] }),
-              signal: AbortSignal.timeout(15000)
-            });
-            const json = await res.json();
-            if(!json.result || !Array.isArray(json.result)){
-              console.warn(`[RPC Logs ${rpcUrl} ${q.label} chunk ${from}-${to}] no result`, JSON.stringify(json).slice(0,300));
+        const params = { fromBlock: fromHex, toBlock: toHex, address: contract, topics: [transferTopic, null, paddedTo] };
+        try{
+          const res = await fetch(rpcUrl, {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getLogs', params:[params] }),
+            signal: AbortSignal.timeout(15000)
+          });
+          const json = await res.json();
+          if(json.error){
+            if(String(json.error.message||'').includes('limit exceeded')){
+              console.warn(`[RPC Logs ${rpcUrl} chunk ${from}-${to}] limit exceeded, try smaller chunk - skip`);
               continue;
             }
-            const logs = json.result;
-            if(logs.length>0) console.log(`[RPC Logs ${rpcUrl} ${q.label} chunk ${from}-${to}] Found ${logs.length} logs`);
-            if(logs.length === 0) continue;
-            
-            const candidates = [];
-            for(const log of logs){
-              try{
-                const value = parseInt(log.data, 16) / 1e18;
-                if(value >= expectedUsdt * 0.80){
-                  candidates.push({ log, value });
-                }
-              }catch(e){}
-            }
-            
-            if(candidates.length > 0){
-              candidates.sort((a,b)=> parseInt(b.log.blockNumber,16) - parseInt(a.log.blockNumber,16));
-              const best = candidates[0];
-              const log = best.log;
-              const value = best.value;
-              const fromAddr = log.topics[1] ? '0x' + log.topics[1].slice(26) : 'unknown';
-              const txHash = log.transactionHash;
-              console.log(`[RPC Logs] ✅ Found tx ${txHash} value ${value} from ${fromAddr} in chunk ${from}-${to}`);
-              return {
-                found:true,
-                value,
-                from: fromAddr,
-                to: walletAddress,
-                tx: { hash: txHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
-                autoDetected:true,
-                _source:'BSC RPC eth_getLogs chunked ('+q.label+')',
-                _rpcUrl: rpcUrl
-              };
-            }
-          }catch(e){
-            console.warn(`[RPC Logs ${rpcUrl} ${q.label} chunk ${from}-${to}] error`, e.message);
+            console.warn(`[RPC Logs ${rpcUrl} chunk ${from}-${to}] error`, JSON.stringify(json.error).slice(0,200));
             continue;
           }
+          if(!json.result || !Array.isArray(json.result)) continue;
+          const logs = json.result;
+          if(logs.length>0) console.log(`[RPC Logs ${rpcUrl} chunk ${from}-${to}] Found ${logs.length} logs for ${walletLower.slice(0,10)}...`);
+          if(logs.length === 0) continue;
+          
+          const candidates = [];
+          for(const log of logs){
+            try{
+              const value = parseInt(log.data, 16) / 1e18;
+              if(value >= expectedUsdt * 0.80){
+                candidates.push({ log, value });
+              }
+            }catch(e){}
+          }
+          
+          if(candidates.length > 0){
+            candidates.sort((a,b)=> parseInt(b.log.blockNumber,16) - parseInt(a.log.blockNumber,16));
+            const best = candidates[0];
+            const log = best.log;
+            const value = best.value;
+            const fromAddr = log.topics[1] ? '0x' + log.topics[1].slice(26) : 'unknown';
+            const txHash = log.transactionHash;
+            console.log(`[RPC Logs] ✅ Found tx ${txHash} value ${value} from ${fromAddr} in chunk ${from}-${to}`);
+            return {
+              found:true,
+              value,
+              from: fromAddr,
+              to: walletAddress,
+              tx: { hash: txHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+              autoDetected:true,
+              _source:'BSC RPC eth_getLogs chunked 500',
+              _rpcUrl: rpcUrl
+            };
+          }
+        }catch(e){
+          console.warn(`[RPC Logs ${rpcUrl} chunk ${from}-${to}] error`, e.message);
+          continue;
         }
-        await new Promise(r=>setTimeout(r, 200)); // nghỉ nhẹ giữa chunk
+        await new Promise(r=>setTimeout(r, 100));
       }
     }catch(e){
       console.warn(`[RPC Logs ${rpcUrl}] outer error`, e.message);
       continue;
     }
   }
-  return { found:false, reason:'CHUNKED TEST - Không tìm thấy trong 30000 block (~25h) sau khi chia 6 chunk', _source:'BSC RPC chunked' };
+  return { found:false, reason:'Không tìm thấy trong 10000 block qua RPC chunked 500', _source:'BSC RPC chunked 500' };
 }
 
 
@@ -1552,7 +1547,7 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
       if(!data || data.status !== '1' || !Array.isArray(data.result)){
         if((data?.message||'').toLowerCase().includes('no transactions found')){
           if(txHashFilter) continue;
-          return { found:false, reason:'CHUNKED TEST - Chưa tìm thấy trong 30h gần nhất', recentCount: 0, _empty:true, _source: ep.label, _chunked:true };
+          return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 3 giờ gần nhất', recentCount: 0, _empty:true, _source: ep.label };
         }
         if(txHashFilter) continue;
         if(data?.status !== '1') continue;
@@ -1575,7 +1570,7 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
         }
       }
       
-      const threeHoursAgo = Math.floor(Date.now()/1000) - 30*60*60; // TEST: 30h để bắt Tx hôm qua
+      const threeHoursAgo = Math.floor(Date.now()/1000) - 8*60*60; // 8h cho auto scan
       const candidates = txs.filter(t=>{
         const toMatch = t.to?.toLowerCase() === walletLower;
         const timeMatch = parseInt(t.timeStamp) >= threeHoursAgo;
@@ -1603,7 +1598,7 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
     return { found:false, reason:'BSCScan bị chặn Cloudflare, RPC Logs cũng không tìm thấy. Hãy đợi 1-2 phút cho block confirm hoặc nhập TxHash để duyệt ngay.', _html:true, _allBlocked:true };
   }
   
-  return { found:false, reason:'CHUNKED TEST - Chưa tìm thấy trong 30h gần nhất (đã quét 30000 block chia 6 chunk qua RPC + 3 explorer).', recentCount: lastResult?.recentCount||0, _empty:true, _chunked:true };
+  return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 8 giờ gần nhất. Đã quét trực tiếp node BSC (chunk 500) và 3 explorer. Nếu vừa chuyển, đợi 1-2 phút cho node đồng bộ.', recentCount: lastResult?.recentCount||0, _empty:true };
 }
 
 
@@ -1877,23 +1872,34 @@ setInterval(async () => {
         }
         if(!expectedUsdt || expectedUsdt < 0.1) continue;
         
-        // Lấy ví: ưu tiên wallet_address trong content, nếu không thì lấy ví đầu tiên active
-        let wallet = null;
+        // Lấy danh sách ví: ưu tiên ví trong content, nếu không thì thử TẤT CẢ ví BEP20 active
+        let walletsToTry = [];
         try{
           const addrMatch = targetReq.content?.match(/0x[a-fA-F0-9]{40}/);
           if(addrMatch){
             const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('address', addrMatch[0]).maybeSingle();
-            if(data) wallet = data;
+            if(data) walletsToTry = [data];
           }
         }catch{}
-        if(!wallet){
-          const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).order('created_at').limit(1).maybeSingle();
-          wallet = data;
+        if(walletsToTry.length===0){
+          const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).order('created_at');
+          walletsToTry = data||[];
         }
-        if(!wallet) continue;
+        if(walletsToTry.length===0) continue;
         
-        // QUÉT BẰNG RPC LOGS - KHÔNG CẦN TXHASH
-        const scanResult = await scanBscForUsdtPayment(wallet.address, expectedUsdt, null);
+        // QUÉT TỪNG VÍ - thử hết tất cả ví để bắt Tx dù khách chuyển vào ví nào
+        let scanResult = null;
+        for(const w of walletsToTry){
+          const r = await scanBscForUsdtPayment(w.address, expectedUsdt, null);
+          if(r.found){
+            scanResult = r;
+            // lưu lại wallet đã tìm thấy để dùng bên dưới
+            targetReq._foundWallet = w;
+            break;
+          }
+        }
+        // fallback nếu không có wallet cụ thể
+        let wallet = targetReq._foundWallet || walletsToTry[0];
         
         if(!scanResult.found){
           console.log(`[AUTO SCAN] ${targetReq.email} chưa có tiền. Expected ${expectedUsdt} wallet ${wallet.address.slice(0,10)}...`);
@@ -1906,6 +1912,7 @@ setInterval(async () => {
         const fromAddr = scanResult.from;
         const finalTxHash = tx.hash;
         
+        let wallet = targetReq._foundWallet || walletsToTry[0];
         // Check trùng Tx
         const {data: dupCheck} = await supabaseAdmin.from('vip_requests').select('id').ilike('content', `%${finalTxHash}%`).eq('status','APPROVED').limit(1);
         if(dupCheck && dupCheck.length>0){
