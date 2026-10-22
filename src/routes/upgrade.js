@@ -1340,11 +1340,11 @@ async function scanViaRpcLogs(walletAddress, expectedUsdt, contract){
   const contractLower = contract.toLowerCase();
   const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
   const paddedTo = '0x000000000000000000000000' + walletLower.slice(2);
-  const BLOCKS_3H = 30000; // TEST: 30000 block ~25h để bắt Tx cũ hôm qua 22-10
+  const BLOCKS_TOTAL = 30000; // TEST: 30000 block ~25h để bắt Tx cũ hôm qua
+  const CHUNK = 5000; // node chỉ cho 5000 block/lần
   
   for(const rpcUrl of rpcUrls){
     try{
-      // lấy latest block
       let latestBlock = null;
       try{
         const resBlock = await fetch(rpcUrl, {
@@ -1357,94 +1357,87 @@ async function scanViaRpcLogs(walletAddress, expectedUsdt, contract){
         if(jBlock.result) latestBlock = parseInt(jBlock.result, 16);
       }catch(e){}
       
-      if(!latestBlock){
-        console.warn(`[RPC Logs ${rpcUrl}] cannot get latest block, try with latest tag`);
-        // fallback vẫn thử với fromBlock = latest - BLOCKS_3H bằng tag latest
+      if(!latestBlock) {
+        console.warn(`[RPC Logs ${rpcUrl}] cannot get latest block`);
+        continue;
       }
-      const fromBlockHex = latestBlock ? ('0x' + Math.max(0, latestBlock - BLOCKS_3H).toString(16)) : ('0x' + (0).toString(16));
       
-      console.log(`[RPC Logs] Scanning ${rpcUrl} from ${fromBlockHex} to latest for wallet ${walletLower.slice(0,10)}...`);
-      
-      // Thử 2 kiểu: 1) filter theo contract + to, 2) chỉ filter theo to (bắt mọi token)
-      const queries = [
-        {
-          label: 'USDT contract + to',
-          params: { fromBlock: fromBlockHex, toBlock: 'latest', address: contract, topics: [transferTopic, null, paddedTo] }
-        },
-        {
-          label: 'Any token to wallet',
-          params: { fromBlock: fromBlockHex, toBlock: 'latest', topics: [transferTopic, null, paddedTo] }
-        }
-      ];
-      
-      for(const q of queries){
-        try{
-          const res = await fetch(rpcUrl, {
-            method:'POST',
-            headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getLogs', params:[q.params] }),
-            signal: AbortSignal.timeout(15000)
-          });
-          const json = await res.json();
-          if(!json.result || !Array.isArray(json.result)){
-            console.warn(`[RPC Logs ${rpcUrl} ${q.label}] no result`, JSON.stringify(json).slice(0,300));
+      // chia nhỏ thành nhiều chunk
+      for(let offset=0; offset<BLOCKS_TOTAL; offset+=CHUNK){
+        const from = Math.max(0, latestBlock - BLOCKS_TOTAL + offset);
+        const to = Math.min(latestBlock, from + CHUNK - 1);
+        const fromHex = '0x' + from.toString(16);
+        const toHex = '0x' + to.toString(16);
+        console.log(`[RPC Logs] Scanning ${rpcUrl} chunk ${from}-${to} wallet ${walletLower.slice(0,10)}...`);
+        
+        const queries = [
+          {
+            label: 'USDT contract + to',
+            params: { fromBlock: fromHex, toBlock: toHex, address: contract, topics: [transferTopic, null, paddedTo] }
+          }
+        ];
+        
+        for(const q of queries){
+          try{
+            const res = await fetch(rpcUrl, {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getLogs', params:[q.params] }),
+              signal: AbortSignal.timeout(15000)
+            });
+            const json = await res.json();
+            if(!json.result || !Array.isArray(json.result)){
+              console.warn(`[RPC Logs ${rpcUrl} ${q.label} chunk ${from}-${to}] no result`, JSON.stringify(json).slice(0,300));
+              continue;
+            }
+            const logs = json.result;
+            if(logs.length>0) console.log(`[RPC Logs ${rpcUrl} ${q.label} chunk ${from}-${to}] Found ${logs.length} logs`);
+            if(logs.length === 0) continue;
+            
+            const candidates = [];
+            for(const log of logs){
+              try{
+                const value = parseInt(log.data, 16) / 1e18;
+                if(value >= expectedUsdt * 0.80){
+                  candidates.push({ log, value });
+                }
+              }catch(e){}
+            }
+            
+            if(candidates.length > 0){
+              candidates.sort((a,b)=> parseInt(b.log.blockNumber,16) - parseInt(a.log.blockNumber,16));
+              const best = candidates[0];
+              const log = best.log;
+              const value = best.value;
+              const fromAddr = log.topics[1] ? '0x' + log.topics[1].slice(26) : 'unknown';
+              const txHash = log.transactionHash;
+              console.log(`[RPC Logs] ✅ Found tx ${txHash} value ${value} from ${fromAddr} in chunk ${from}-${to}`);
+              return {
+                found:true,
+                value,
+                from: fromAddr,
+                to: walletAddress,
+                tx: { hash: txHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
+                autoDetected:true,
+                _source:'BSC RPC eth_getLogs chunked ('+q.label+')',
+                _rpcUrl: rpcUrl
+              };
+            }
+          }catch(e){
+            console.warn(`[RPC Logs ${rpcUrl} ${q.label} chunk ${from}-${to}] error`, e.message);
             continue;
           }
-          const logs = json.result;
-          console.log(`[RPC Logs ${rpcUrl} ${q.label}] Found ${logs.length} Transfer logs to wallet in last ~5h`);
-          
-          if(logs.length === 0) continue;
-          
-          // Lọc theo contract nếu query any token
-          let filteredLogs = logs;
-          if(q.label.includes('Any token')){
-            filteredLogs = logs.filter(l=> l.address?.toLowerCase() === contractLower);
-            console.log(`[RPC Logs ${rpcUrl} ${q.label}] After USDT filter: ${filteredLogs.length} logs`);
-          }
-          
-          const candidates = [];
-          for(const log of filteredLogs){
-            try{
-              const value = parseInt(log.data, 16) / 1e18;
-              // log chi tiết để debug
-              console.log(`[RPC Logs] Log value ${value} tx ${log.transactionHash?.slice(0,10)} from ${log.topics[1]?.slice(0,10)}... to ${log.topics[2]?.slice(0,10)}...`);
-              if(value >= expectedUsdt * 0.80){ // nới lỏng 20% cho MEXC
-                candidates.push({ log, value });
-              }
-            }catch(e){}
-          }
-          
-          if(candidates.length > 0){
-            candidates.sort((a,b)=> parseInt(b.log.blockNumber,16) - parseInt(a.log.blockNumber,16));
-            const best = candidates[0];
-            const log = best.log;
-            const value = best.value;
-            const fromAddr = log.topics[1] ? '0x' + log.topics[1].slice(26) : 'unknown';
-            const txHash = log.transactionHash;
-            console.log(`[RPC Logs] ✅ Found tx ${txHash} value ${value} from ${fromAddr}`);
-            return {
-              found:true,
-              value,
-              from: fromAddr,
-              to: walletAddress,
-              tx: { hash: txHash, blockNumber: log.blockNumber, logIndex: log.logIndex },
-              autoDetected:true,
-              _source:'BSC RPC eth_getLogs ('+q.label+')',
-              _rpcUrl: rpcUrl
-            };
-          }
-        }catch(e){
-          console.warn(`[RPC Logs ${rpcUrl} ${q.label}] error`, e.message);
-          continue;
         }
+        await new Promise(r=>setTimeout(r, 200)); // nghỉ nhẹ giữa chunk
       }
     }catch(e){
       console.warn(`[RPC Logs ${rpcUrl}] outer error`, e.message);
       continue;
     }
   }
-  return { found:false, _source:'RPC Logs' };
+  return { found:false, reason:'CHUNKED TEST - Không tìm thấy trong 30000 block (~25h) sau khi chia 6 chunk', _source:'BSC RPC chunked' };
 }
+
 
 async function verifyViaBscRpc(txHash, walletAddress, expectedUsdt, contract){
   try{
@@ -1559,7 +1552,7 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
       if(!data || data.status !== '1' || !Array.isArray(data.result)){
         if((data?.message||'').toLowerCase().includes('no transactions found')){
           if(txHashFilter) continue;
-          return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 3 giờ gần nhất', recentCount: 0, _empty:true, _source: ep.label };
+          return { found:false, reason:'CHUNKED TEST - Chưa tìm thấy trong 30h gần nhất', recentCount: 0, _empty:true, _source: ep.label, _chunked:true };
         }
         if(txHashFilter) continue;
         if(data?.status !== '1') continue;
@@ -1582,7 +1575,7 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
         }
       }
       
-      const threeHoursAgo = Math.floor(Date.now()/1000) - 180*60;
+      const threeHoursAgo = Math.floor(Date.now()/1000) - 30*60*60; // TEST: 30h để bắt Tx hôm qua
       const candidates = txs.filter(t=>{
         const toMatch = t.to?.toLowerCase() === walletLower;
         const timeMatch = parseInt(t.timeStamp) >= threeHoursAgo;
@@ -1610,7 +1603,7 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
     return { found:false, reason:'BSCScan bị chặn Cloudflare, RPC Logs cũng không tìm thấy. Hãy đợi 1-2 phút cho block confirm hoặc nhập TxHash để duyệt ngay.', _html:true, _allBlocked:true };
   }
   
-  return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 3 giờ gần nhất. Đã quét trực tiếp node BSC và 3 explorer. Nếu vừa chuyển, đợi 1-2 phút cho node đồng bộ.', recentCount: lastResult?.recentCount||0, _empty:true };
+  return { found:false, reason:'CHUNKED TEST - Chưa tìm thấy trong 30h gần nhất (đã quét 30000 block chia 6 chunk qua RPC + 3 explorer).', recentCount: lastResult?.recentCount||0, _empty:true, _chunked:true };
 }
 
 
