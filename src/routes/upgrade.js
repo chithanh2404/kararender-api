@@ -1207,22 +1207,58 @@ router.post('/payment/usdt/create', async (req,res)=>{
 
 
 async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=null){
-  const apiKey = BSCSCAN_API_KEY;
+  const apiKey = process.env.BSCSCAN_API_KEY || BSCSCAN_API_KEY;
   const contract = USDT_BEP20_CONTRACT;
   try{
     const url = `https://api.bscscan.com/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc&apikey=${apiKey}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    const data = await res.json();
+    console.log(`[BSCScan] Scanning ${walletAddress} expected ${expectedUsdt} txFilter ${txHashFilter||'none'}`);
+    const res = await fetch(url, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'KaraRender/1.0' } });
     
-    if(data.status !== '1' || !data.result || !Array.isArray(data.result)){
-      console.warn('[BSCScan] API error', data.message, JSON.stringify(data).slice(0,500));
-      return { found:false, error: data.message || 'BSCScan API error', raw: data };
+    const rawText = await res.text();
+    let data;
+    try{
+      data = JSON.parse(rawText);
+    }catch(jsonErr){
+      console.warn(`[BSCScan] Non-JSON response status=${res.status} body=${rawText.slice(0,500)}`);
+      if(rawText.includes('<!DOCTYPE') || rawText.includes('<html')){
+        // Thử lại không dùng API key (BSCScan free tier đôi khi thoát được Cloudflare)
+        if(apiKey && apiKey !== '7CIT8VTPA3VFB1KYEPK3FQDTA8NBK71YGT'){
+          console.warn('[BSCScan] Got HTML, retry without key...');
+          try{
+            const urlNoKey = `https://api.bscscan.com/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc`;
+            const res2 = await fetch(urlNoKey, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'KaraRender/1.0' } });
+            const raw2 = await res2.text();
+            data = JSON.parse(raw2);
+          }catch(e2){
+            return { found:false, reason: `BSCScan đang chặn tạm thời (HTML). Thử lại sau 10s.`, error: rawText.slice(0,300), _html:true };
+          }
+        } else {
+          // Key mặc định bị chặn -> trả về lỗi mềm, không throw
+          return { found:false, reason: `BSCScan đang chặn (HTML) - key hết hạn hoặc rate-limit. Chưa tìm thấy giao dịch.`, error: rawText.slice(0,300), _html:true, _empty:true };
+        }
+      } else {
+        return { found:false, error: jsonErr.message, raw: rawText.slice(0,300) };
+      }
+    }
+    
+    if(!data || data.status !== '1' || !Array.isArray(data.result)){
+      // status 0 là không có giao dịch - BÌNH THƯỜNG khi chưa chuyển khoản
+      if(data && (data.message||'').toLowerCase().includes('no transactions found')){
+        return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true };
+      }
+      if(data && data.result && Array.isArray(data.result) && data.result.length===0){
+        return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true };
+      }
+      console.log('[BSCScan] API status !=1', JSON.stringify(data).slice(0,500));
+      // Trả về empty thay vì error để frontend không hiện lỗi đỏ khi chưa CK
+      return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true, rawData: data };
     }
     
     if(txHashFilter){
-      const tx = data.result.find(t=> t.hash?.toLowerCase() === txHashFilter.toLowerCase());
+      const cleanFilter = txHashFilter.toLowerCase().trim();
+      const tx = data.result.find(t=> t.hash && t.hash.toLowerCase() === cleanFilter);
       if(!tx){
-        return { found:false, reason:'TxHash không tìm thấy trong 20 giao dịch gần nhất của ví này' };
+        return { found:false, reason:`Không tìm thấy TxHash ${cleanFilter.slice(0,10)}... trên BSCScan cho ví này` };
       }
       if(tx.to?.toLowerCase() !== walletAddress.toLowerCase()){
         return { found:false, reason:`Tx này không gửi đến ví ${walletAddress}, mà đến ${tx.to}` };
@@ -1250,13 +1286,14 @@ async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=n
       return { found:true, tx, value, from: tx.from, to: tx.to, autoDetected:true };
     }
     
-    return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: data.result.length };
+    return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: data.result.length, _empty:true };
     
   }catch(e){
     console.error('[BSCScan] fetch error', e.message);
-    return { found:false, error: e.message };
+    return { found:false, error: e.message, reason:'Lỗi kết nối BSCScan, thử lại sau 10s', _empty:true };
   }
 }
+
 
 router.post('/payment/usdt/verify', async (req,res)=>{
   try{
