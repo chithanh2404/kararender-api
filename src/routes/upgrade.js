@@ -1842,6 +1842,136 @@ router.post('/payment/usdt/scan', async (req,res)=>{
 
 
 
+
+
+// ===== AUTO SCAN CRON CHO KHÁCH - KHÔNG CẦN NHẬP TXHASH =====
+let autoScanRunning = false;
+setInterval(async () => {
+  if(autoScanRunning) return;
+  if(!supabaseAdmin) return;
+  autoScanRunning = true;
+  try{
+    const cutoff = new Date(Date.now() - 5*60*60*1000).toISOString(); // quét lệnh trong 5h gần nhất
+    const { data: pendings } = await supabaseAdmin
+      .from('vip_requests')
+      .select('*')
+      .eq('status','PENDING')
+      .ilike('content','%usdt%')
+      .gte('created_at', cutoff)
+      .order('created_at', {ascending:false})
+      .limit(20);
+    
+    if(!pendings || pendings.length===0){
+      autoScanRunning = false;
+      return;
+    }
+    
+    console.log(`[AUTO SCAN] Found ${pendings.length} PENDING USDT requests to auto check...`);
+    
+    for(const targetReq of pendings){
+      try{
+        // Parse expected USDT từ content
+        let expectedUsdt = 0;
+        try{
+          const m = targetReq.content?.match(/([0-9.]+)USDT/);
+          if(m) expectedUsdt = parseFloat(m[1]);
+        }catch{}
+        if(!expectedUsdt){
+          const plansRes = await getPlans(true);
+          const plan = plansRes.plans.find(p=>p.key===targetReq.plan_key);
+          const vndPrice = await getUsdtVndPrice();
+          expectedUsdt = parseFloat(((plan?.price||targetReq.amount||0) / vndPrice).toFixed(4));
+        }
+        if(!expectedUsdt || expectedUsdt < 0.1) continue;
+        
+        // Lấy ví: ưu tiên wallet_address trong content, nếu không thì lấy ví đầu tiên active
+        let wallet = null;
+        try{
+          const addrMatch = targetReq.content?.match(/0x[a-fA-F0-9]{40}/);
+          if(addrMatch){
+            const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('address', addrMatch[0]).maybeSingle();
+            if(data) wallet = data;
+          }
+        }catch{}
+        if(!wallet){
+          const {data} = await supabaseAdmin.from('usdt_wallets').select('*').eq('network','BEP20').eq('is_active', true).order('created_at').limit(1).maybeSingle();
+          wallet = data;
+        }
+        if(!wallet) continue;
+        
+        // QUÉT BẰNG RPC LOGS - KHÔNG CẦN TXHASH
+        const scanResult = await scanBscForUsdtPayment(wallet.address, expectedUsdt, null);
+        
+        if(!scanResult.found){
+          console.log(`[AUTO SCAN] ${targetReq.email} chưa có tiền. Expected ${expectedUsdt} wallet ${wallet.address.slice(0,10)}...`);
+          continue;
+        }
+        
+        // TÌM THẤY - AUTO DUYỆT NGAY
+        const tx = scanResult.tx;
+        const received = scanResult.value;
+        const fromAddr = scanResult.from;
+        const finalTxHash = tx.hash;
+        
+        // Check trùng Tx
+        const {data: dupCheck} = await supabaseAdmin.from('vip_requests').select('id').ilike('content', `%${finalTxHash}%`).eq('status','APPROVED').limit(1);
+        if(dupCheck && dupCheck.length>0){
+          console.log(`[AUTO SCAN] Tx ${finalTxHash.slice(0,10)}... đã dùng rồi, bỏ qua`);
+          continue;
+        }
+        
+        const plansRes = await getPlans(true);
+        const plan = plansRes.plans.find(p=>p.key===targetReq.plan_key);
+        const months = plan?.months || 1;
+        const expireDate = new Date();
+        expireDate.setMonth(expireDate.getMonth() + months);
+        
+        await supabaseAdmin.from('users').update({
+          is_vip:true, vip_status:'APPROVED',
+          expired_date: expireDate.toISOString(),
+          updated_at: new Date().toISOString()
+        }).eq('email', targetReq.email.toLowerCase());
+        
+        await supabaseAdmin.from('vip_requests').update({
+          status:'APPROVED',
+          content: `${targetReq.content} | tx:${finalTxHash} | autoScan:${received}USDT BEP20 | from:${fromAddr} | wallet:${wallet.address} | autoCron`,
+          updated_at: new Date().toISOString()
+        }).eq('id', targetReq.id);
+        
+        try{
+          const timeVN = new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
+          const msg = `✅🤖 <b>AUTO DUYỆT VIP - KHÁCH KHÔNG CẦN NHẬP TX</b> 🤖✅
+━━━━━━━━━━━━━━
+👤 Email: ${targetReq.email}
+💳 Gói: ${targetReq.plan_key} (${months} tháng)
+💵 Nhận: ${received} USDT (yêu cầu ${expectedUsdt})
+🔗 Tx: <code>${finalTxHash}</code>
+👛 Từ: <code>${fromAddr?.slice(0,10)}...${fromAddr?.slice(-6)}</code>
+👛 Đến: <code>${wallet.address.slice(0,10)}...${wallet.address.slice(-6)}</code>
+📅 Hạn: ${expireDate.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}
+⏰ ${timeVN}
+━━━━━━━━━━━━━━
+🤖 Khách chỉ chuyển tiền và chờ 2 phút là tự duyệt!`;
+          await sendTelegramDirect(msg);
+        }catch{}
+        
+        console.log(`[AUTO SCAN] ✅ AUTO APPROVED ${targetReq.email} Tx ${finalTxHash.slice(0,15)}... ${received} USDT`);
+        
+      }catch(e){
+        console.error(`[AUTO SCAN] Error for ${targetReq.email}`, e.message);
+      }
+      await new Promise(r=>setTimeout(r, 2000)); // nghỉ 2s giữa các lệnh để tránh rate limit RPC
+    }
+    
+  }catch(e){
+    console.error('[AUTO SCAN CRON] fatal', e.message);
+  }
+  autoScanRunning = false;
+}, 2*60*1000); // chạy mỗi 2 phút
+
+console.log('[AUTO SCAN CRON] Enabled - quét PENDING USDT mỗi 2 phút, khách không cần nhập TxHash');
+
+
 // ===== TRIAL 3 LẦN - LOGIC CHUẨN V13b =====
 const TRIAL_LIMIT = 3;
 
