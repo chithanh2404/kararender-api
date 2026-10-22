@@ -880,6 +880,83 @@ router.get('/admin/usdt-wallets', async (req,res)=>{
   }
 });
 
+// ===== ADMIN: Thêm / Sửa ví USDT - FIX 404 =====
+router.post('/admin/usdt-wallets', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const { id, network, address, label, is_active } = req.body || {};
+    if(!network || !address){
+      return res.status(400).json({success:false, message:'Thiếu network hoặc address'});
+    }
+    const cleanAddr = address.trim();
+    if(cleanAddr.length < 20){
+      return res.status(400).json({success:false, message:'Địa chỉ ví quá ngắn'});
+    }
+    if(!USDT_NETWORKS[network]){
+      return res.status(400).json({success:false, message:'Network không hợp lệ: '+network});
+    }
+    if(id){
+      const { data, error } = await supabaseAdmin.from('usdt_wallets').update({
+        network: network,
+        address: cleanAddr,
+        label: label || null,
+        is_active: is_active !== false,
+        updated_at: new Date().toISOString()
+      }).eq('id', id).select().single();
+      if(error){
+        console.error('[admin/usdt-wallets POST update] error', error.message);
+        return res.status(500).json({success:false, message:error.message});
+      }
+      console.log(`[admin/usdt-wallets] Updated wallet ${id} ${network} ${cleanAddr.slice(0,10)}...`);
+      return res.json({success:true, wallet: data, message:'Đã cập nhật ví'});
+    } else {
+      const { data: existing } = await supabaseAdmin.from('usdt_wallets').select('id').eq('address', cleanAddr).eq('network', network).maybeSingle();
+      if(existing){
+        return res.status(400).json({success:false, message:'Ví này đã tồn tại trong hệ thống'});
+      }
+      const { data, error } = await supabaseAdmin.from('usdt_wallets').insert({
+        network: network,
+        address: cleanAddr,
+        label: label || `${network} Wallet`,
+        is_active: is_active !== false
+      }).select().single();
+      if(error){
+        console.error('[admin/usdt-wallets POST insert] error', error.message);
+        return res.status(500).json({success:false, message:error.message});
+      }
+      console.log(`[admin/usdt-wallets] Created wallet ${data.id} ${network} ${cleanAddr.slice(0,10)}...`);
+      return res.json({success:true, wallet: data, message:'Đã thêm ví mới'});
+    }
+  }catch(e){
+    console.error('[admin/usdt-wallets POST] fatal', e.message, e.stack);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
+// ===== ADMIN: Xóa ví USDT - FIX 404 =====
+router.delete('/admin/usdt-wallets/:id', async (req,res)=>{
+  try{
+    if(!supabaseAdmin) return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
+    const walletId = req.params.id;
+    const rotation = await getWalletRotationStatus();
+    const busy = rotation.busyDetails.find(b=>b.wallet.id===walletId);
+    if(busy){
+      return res.status(400).json({success:false, message:`Ví đang bận - có yêu cầu PENDING của ${busy.pending.email} trong 30 phút, không thể xóa. Hãy giải phóng trước.`});
+    }
+    const { error } = await supabaseAdmin.from('usdt_wallets').delete().eq('id', walletId);
+    if(error){
+      console.error('[admin/usdt-wallets DELETE] error', error.message);
+      return res.status(500).json({success:false, message:error.message});
+    }
+    unlockWallet(walletId);
+    console.log(`[admin/usdt-wallets] Deleted wallet ${walletId}`);
+    return res.json({success:true, message:'Đã xóa ví'});
+  }catch(e){
+    console.error('[admin/usdt-wallets DELETE] fatal', e.message);
+    res.status(500).json({success:false, message:e.message});
+  }
+});
+
 // ====== ADMIN: Giải phóng ví bận (force release) ======
 router.post('/admin/usdt-wallets/:id/release', async (req,res)=>{
   try{
