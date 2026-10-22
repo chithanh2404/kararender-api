@@ -618,6 +618,68 @@ const USDT_NETWORKS = {
 const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || '7CIT8VTPA3VFB1KYEPK3FQDTA8NBK71YGT';
 const USDT_BEP20_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 
+// ===== FIX MISSING: GIÁ USDT REALTIME - THÊM VÀO ĐÂY =====
+let __cachedVndPrice = { value: 26000, ts: 0 };
+let __cachedUsdPrice = { value: 1.0, ts: 0 };
+
+async function getUsdtVndPrice(){
+  const now = Date.now();
+  if(__cachedVndPrice.ts && now - __cachedVndPrice.ts < 60*1000){
+    return __cachedVndPrice.value;
+  }
+  // Thử CoinGecko VND
+  try{
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=vnd', { signal: AbortSignal.timeout(5000) });
+    if(r.ok){
+      const j = await r.json();
+      if(j.tether?.vnd && j.tether.vnd > 1000){
+        __cachedVndPrice = { value: Math.round(j.tether.vnd), ts: now };
+        console.log('[getUsdtVndPrice] CoinGecko VND', __cachedVndPrice.value);
+        return __cachedVndPrice.value;
+      }
+    }
+  }catch(e){ console.warn('[getUsdtVndPrice] coingecko fail', e.message); }
+  // Fallback Binance P2P không public, dùng USDT/VNST hoặc fixed
+  try{
+    const r2 = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=USDTUSD', { signal: AbortSignal.timeout(5000) });
+    if(r2.ok){
+      // nếu lấy được USD, nhân với tỷ giá USD/VND ~ 26100
+      const j2 = await r2.json();
+      if(j2.price){
+        const usdPrice = parseFloat(j2.price);
+        const vnd = Math.round(usdPrice * 26100);
+        if(vnd>20000){
+          __cachedVndPrice = { value: vnd, ts: now };
+          return vnd;
+        }
+      }
+    }
+  }catch(e){}
+  // Fallback cứng để không bao giờ crash 500
+  return __cachedVndPrice.value || 26000;
+}
+
+async function getUsdtPriceUsd(){
+  const now = Date.now();
+  if(__cachedUsdPrice.ts && now - __cachedUsdPrice.ts < 60*1000){
+    return __cachedUsdPrice.value;
+  }
+  try{
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd', { signal: AbortSignal.timeout(5000) });
+    if(r.ok){
+      const j = await r.json();
+      if(j.tether?.usd){
+        __cachedUsdPrice = { value: j.tether.usd, ts: now };
+        return j.tether.usd;
+      }
+    }
+  }catch(e){}
+  return 1.0;
+}
+// ===== END FIX MISSING =====
+
+
+
 // ====== CONFIG XOAY VÒNG ======
 const WALLET_BUSY_MINUTES = 30; // ví bận trong 30 phút
 const WALLET_LOCK_MS = 8000; // lock tạm 8s chống race condition khi 2 người cùng request
