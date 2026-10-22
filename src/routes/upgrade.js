@@ -1340,7 +1340,7 @@ async function scanViaRpcLogs(walletAddress, expectedUsdt, contract){
   const contractLower = contract.toLowerCase();
   const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
   const paddedTo = '0x000000000000000000000000' + walletLower.slice(2);
-  const BLOCKS_3H = 6000; // tăng lên 6000 block ~5h
+  const BLOCKS_3H = 30000; // TEST: 30000 block ~25h để bắt Tx cũ hôm qua 22-10
   
   for(const rpcUrl of rpcUrls){
     try{
