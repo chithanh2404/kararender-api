@@ -871,7 +871,10 @@ router.get('/admin/usdt-wallets', async (req,res)=>{
         is_locked: isWalletLocked(w.id)
       };
     });
-    res.json({success:true, wallets: enriched, networks: USDT_NETWORKS, _rotation: { total: rotation.all.length, free: rotation.free.length, busy: rotation.busy.length }});
+    const bscKey = process.env.BSCSCAN_API_KEY || BSCSCAN_API_KEY;
+    const masked = bscKey ? (bscKey.slice(0,4) + '...' + bscKey.slice(-4)) : 'CHƯA CẤU HÌNH';
+    const fromEnv = !!process.env.BSCSCAN_API_KEY;
+    res.json({success:true, wallets: enriched, networks: USDT_NETWORKS, _rotation: { total: rotation.all.length, free: rotation.free.length, busy: rotation.busy.length }, _bscscan: { masked, fromEnv, keyLength: bscKey?.length||0, isDefault: bscKey === '7CIT8VTPA3VFB1KYEPK3FQDTA8NBK71YGT' }});
   }catch(e){
     res.status(500).json({success:false, message:e.message});
   }
