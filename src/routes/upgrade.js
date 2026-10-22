@@ -1286,92 +1286,181 @@ router.post('/payment/usdt/create', async (req,res)=>{
 });
 
 
+
+async function fetchBscScanWithFallback(url, label){
+  try{
+    const res = await fetch(url, { 
+      signal: AbortSignal.timeout(15000), 
+      headers: { 
+        'User-Agent': 'KaraRender/1.0',
+        'Accept': 'application/json'
+      } 
+    });
+    const raw = await res.text();
+    // Nếu là HTML -> bị chặn
+    if(raw.includes('<!DOCTYPE') || raw.includes('<html') || raw.includes('Just a moment') || raw.includes('cf-challenge')){
+      console.warn(`[BSCScan ${label}] Bị chặn HTML status=${res.status} body=${raw.slice(0,200)}`);
+      return { blocked: true, raw: raw.slice(0,500) };
+    }
+    try{
+      const data = JSON.parse(raw);
+      return { blocked: false, data, raw };
+    }catch(e){
+      console.warn(`[BSCScan ${label}] JSON parse fail`, raw.slice(0,300));
+      return { blocked: true, raw: raw.slice(0,500), error: e.message };
+    }
+  }catch(e){
+    console.warn(`[BSCScan ${label}] fetch error`, e.message);
+    return { blocked: true, error: e.message };
+  }
+}
+
 async function scanBscForUsdtPayment(walletAddress, expectedUsdt, txHashFilter=null){
   const apiKey = process.env.BSCSCAN_API_KEY || BSCSCAN_API_KEY;
+  const etherscanKey = process.env.ETHERSCAN_API_KEY || apiKey; // Etherscan V2 dùng chung key
   const contract = USDT_BEP20_CONTRACT;
-  try{
-    const url = `https://api.bscscan.com/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc&apikey=${apiKey}`;
-    console.log(`[BSCScan] Scanning ${walletAddress} expected ${expectedUsdt} txFilter ${txHashFilter||'none'}`);
-    const res = await fetch(url, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'KaraRender/1.0' } });
+  const walletLower = walletAddress.toLowerCase();
+  const fifteenMinAgo = Math.floor(Date.now()/1000) - 15*60;
+  
+  // Danh sách endpoint thử lần lượt
+  const endpoints = [];
+  
+  // 1. BSCScan chính
+  endpoints.push({
+    label: 'BSCScan.com',
+    url: `https://api.bscscan.com/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc&apikey=${apiKey}`
+  });
+  
+  // 2. Etherscan V2 - chainid 56 = BSC - ít bị chặn hơn
+  endpoints.push({
+    label: 'Etherscan V2 (BSC)',
+    url: `https://api.etherscan.io/v2/api?chainid=56&module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc&apikey=${etherscanKey}`
+  });
+  
+  // 3. Blockscout BSC - public, không cần key
+  endpoints.push({
+    label: 'Blockscout',
+    url: `https://api.blockscout.com/bnb/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}`
+  });
+  
+  let lastError = null;
+  let htmlBlockedCount = 0;
+  
+  for(const ep of endpoints){
+    console.log(`[BSCScan] Trying ${ep.label} for ${walletAddress.slice(0,10)}...`);
+    const result = await fetchBscScanWithFallback(ep.url, ep.label);
     
-    const rawText = await res.text();
-    let data;
-    try{
-      data = JSON.parse(rawText);
-    }catch(jsonErr){
-      console.warn(`[BSCScan] Non-JSON response status=${res.status} body=${rawText.slice(0,500)}`);
-      if(rawText.includes('<!DOCTYPE') || rawText.includes('<html')){
-        // Thử lại không dùng API key (BSCScan free tier đôi khi thoát được Cloudflare)
-        if(apiKey && apiKey !== '7CIT8VTPA3VFB1KYEPK3FQDTA8NBK71YGT'){
-          console.warn('[BSCScan] Got HTML, retry without key...');
-          try{
-            const urlNoKey = `https://api.bscscan.com/api?module=account&action=tokentx&contractaddress=${contract}&address=${walletAddress}&startblock=0&endblock=99999999&sort=desc`;
-            const res2 = await fetch(urlNoKey, { signal: AbortSignal.timeout(15000), headers: { 'User-Agent': 'KaraRender/1.0' } });
-            const raw2 = await res2.text();
-            data = JSON.parse(raw2);
-          }catch(e2){
-            return { found:false, reason: `BSCScan đang chặn tạm thời (HTML). Thử lại sau 10s.`, error: rawText.slice(0,300), _html:true };
-          }
-        } else {
-          // Key mặc định bị chặn -> trả về lỗi mềm, không throw
-          return { found:false, reason: `BSCScan đang chặn (HTML) - key hết hạn hoặc rate-limit. Chưa tìm thấy giao dịch.`, error: rawText.slice(0,300), _html:true, _empty:true };
+    if(result.blocked){
+      htmlBlockedCount++;
+      lastError = result;
+      // Nếu bị chặn HTML thì thử endpoint tiếp theo
+      if(htmlBlockedCount < endpoints.length){
+        console.log(`[BSCScan] ${ep.label} bị chặn, thử endpoint tiếp theo...`);
+        await new Promise(r=>setTimeout(r, 800));
+        continue;
+      }
+    } else {
+      const data = result.data;
+      // Kiểm tra data hợp lệ
+      if(!data){
+        lastError = { reason: 'Empty data', raw: result.raw?.slice(0,300) };
+        continue;
+      }
+      
+      // Nếu status !=1 có thể là không có tx - đây là bình thường
+      if(data.status !== '1' || !Array.isArray(data.result)){
+        if((data.message||'').toLowerCase().includes('no transactions found') || (Array.isArray(data.result) && data.result.length===0)){
+          return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true, _source: ep.label };
         }
-      } else {
-        return { found:false, error: jsonErr.message, raw: rawText.slice(0,300) };
+        // Nếu là lỗi khác như rate limit
+        if((data.message||'').toLowerCase().includes('rate limit') || (data.message||'').toLowerCase().includes('max rate')){
+          console.warn(`[BSCScan ${ep.label}] Rate limit, thử endpoint khác...`);
+          lastError = data;
+          continue;
+        }
+        // Trả về empty để không hiện lỗi đỏ khi chưa CK
+        console.log(`[BSCScan ${ep.label}] API status !=1`, JSON.stringify(data).slice(0,400));
+        return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true, _source: ep.label, rawData: data };
       }
+      
+      // Có data.result là array giao dịch
+      console.log(`[BSCScan ${ep.label}] Got ${data.result.length} txs`);
+      
+      // Nếu có txHash filter -> tìm chính xác
+      if(txHashFilter){
+        const cleanFilter = txHashFilter.toLowerCase().trim();
+        const tx = data.result.find(t=> t.hash && t.hash.toLowerCase() === cleanFilter);
+        if(!tx){
+          return { found:false, reason:`Không tìm thấy TxHash ${cleanFilter.slice(0,12)}... trên ${ep.label} cho ví này`, _source: ep.label };
+        }
+        if(tx.to?.toLowerCase() !== walletLower){
+          return { found:false, reason:`Tx này không gửi đến ví ${walletAddress}, mà đến ${tx.to}`, _source: ep.label };
+        }
+        const value = parseFloat(tx.value) / 1e18;
+        const minRequired = expectedUsdt * 0.97;
+        if(value < minRequired){
+          return { found:false, reason:`Số tiền không đủ. Nhận ${value} USDT, yêu cầu tối thiểu ${minRequired} USDT`, tx, value, _source: ep.label };
+        }
+        return { found:true, tx, value, from: tx.from, to: tx.to, _source: ep.label };
+      }
+      
+      // Auto scan: tìm giao dịch trong 15 phút gần nhất khớp số tiền
+      const candidates = data.result.filter(t=>{
+        const toMatch = t.to?.toLowerCase() === walletLower;
+        const timeMatch = parseInt(t.timeStamp) >= fifteenMinAgo;
+        const value = parseFloat(t.value) / 1e18;
+        const amountMatch = value >= expectedUsdt * 0.97;
+        return toMatch && timeMatch && amountMatch;
+      });
+      
+      if(candidates.length>0){
+        const tx = candidates[0];
+        const value = parseFloat(tx.value) / 1e18;
+        console.log(`[BSCScan ${ep.label}] Found matching tx ${tx.hash} value ${value}`);
+        return { found:true, tx, value, from: tx.from, to: tx.to, autoDetected:true, _source: ep.label };
+      }
+      
+      return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: data.result.length, _empty:true, _source: ep.label };
     }
-    
-    if(!data || data.status !== '1' || !Array.isArray(data.result)){
-      // status 0 là không có giao dịch - BÌNH THƯỜNG khi chưa chuyển khoản
-      if(data && (data.message||'').toLowerCase().includes('no transactions found')){
-        return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true };
-      }
-      if(data && data.result && Array.isArray(data.result) && data.result.length===0){
-        return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true };
-      }
-      console.log('[BSCScan] API status !=1', JSON.stringify(data).slice(0,500));
-      // Trả về empty thay vì error để frontend không hiện lỗi đỏ khi chưa CK
-      return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: 0, _empty:true, rawData: data };
-    }
-    
-    if(txHashFilter){
-      const cleanFilter = txHashFilter.toLowerCase().trim();
-      const tx = data.result.find(t=> t.hash && t.hash.toLowerCase() === cleanFilter);
-      if(!tx){
-        return { found:false, reason:`Không tìm thấy TxHash ${cleanFilter.slice(0,10)}... trên BSCScan cho ví này` };
-      }
-      if(tx.to?.toLowerCase() !== walletAddress.toLowerCase()){
-        return { found:false, reason:`Tx này không gửi đến ví ${walletAddress}, mà đến ${tx.to}` };
-      }
-      const value = parseFloat(tx.value) / 1e18;
-      const minRequired = expectedUsdt * 0.97;
-      if(value < minRequired){
-        return { found:false, reason:`Số tiền không đủ. Nhận ${value} USDT, yêu cầu tối thiểu ${minRequired} USDT (expected ${expectedUsdt})`, tx, value };
-      }
-      return { found:true, tx, value, from: tx.from, to: tx.to };
-    }
-    
-    const fifteenMinAgo = Math.floor(Date.now()/1000) - 15*60;
-    const candidates = data.result.filter(t=>{
-      const toMatch = t.to?.toLowerCase() === walletAddress.toLowerCase();
-      const timeMatch = parseInt(t.timeStamp) >= fifteenMinAgo;
-      const value = parseFloat(t.value) / 1e18;
-      const amountMatch = value >= expectedUsdt * 0.97;
-      return toMatch && timeMatch && amountMatch;
-    });
-    
-    if(candidates.length>0){
-      const tx = candidates[0];
-      const value = parseFloat(tx.value) / 1e18;
-      return { found:true, tx, value, from: tx.from, to: tx.to, autoDetected:true };
-    }
-    
-    return { found:false, reason:'Chưa tìm thấy giao dịch USDT nào khớp trong 15 phút gần nhất', recentCount: data.result.length, _empty:true };
-    
-  }catch(e){
-    console.error('[BSCScan] fetch error', e.message);
-    return { found:false, error: e.message, reason:'Lỗi kết nối BSCScan, thử lại sau 10s', _empty:true };
   }
+  
+  // Nếu tất cả endpoint đều bị chặn HTML
+  if(htmlBlockedCount >= endpoints.length){
+    console.error('[BSCScan] Tất cả endpoint đều bị chặn HTML');
+    // Thử fallback cuối: kiểm tra trực tiếp qua BSC RPC nếu có txHash
+    if(txHashFilter){
+      try{
+        console.log('[BSCScan] Fallback to BSC RPC for txHash', txHashFilter.slice(0,15));
+        const rpcUrl = 'https://bsc-dataseed.binance.org/';
+        const receiptRes = await fetch(rpcUrl, {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getTransactionReceipt', params:[txHashFilter] }),
+          signal: AbortSignal.timeout(10000)
+        });
+        const receiptData = await receiptRes.json();
+        if(receiptData.result && receiptData.result.status === '0x1'){
+          const logs = receiptData.result.logs || [];
+          const usdtLog = logs.find(l=> l.address?.toLowerCase() === contract.toLowerCase() && l.topics?.[0] === '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef');
+          if(usdtLog){
+            const toAddr = '0x' + usdtLog.topics[2].slice(26);
+            if(toAddr.toLowerCase() === walletLower){
+              const valueHex = usdtLog.data;
+              const value = parseInt(valueHex, 16) / 1e18;
+              if(value >= expectedUsdt * 0.97){
+                return { found:true, tx:{hash:txHashFilter}, value, from: receiptData.result.from, to: toAddr, _source:'BSC RPC direct', autoDetected:false };
+              }
+            }
+          }
+        }
+      }catch(e){
+        console.warn('[BSC RPC fallback] error', e.message);
+      }
+    }
+    return { found:false, reason:'BSCScan đang bị chặn tạm thời bởi Cloudflare (HTML). Đã thử 3 nguồn nhưng đều bị chặn. Vui lòng thử lại sau 30s hoặc nhập TxHash để duyệt thủ công.', _html:true, _allBlocked:true, error: lastError?.raw?.slice(0,200) };
+  }
+  
+  return { found:false, reason: lastError?.message || 'Lỗi kết nối BSCScan, thử lại sau 10s', _empty:true };
 }
 
 
