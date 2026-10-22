@@ -1911,8 +1911,6 @@ setInterval(async () => {
         const received = scanResult.value;
         const fromAddr = scanResult.from;
         const finalTxHash = tx.hash;
-        
-        let wallet = targetReq._foundWallet || walletsToTry[0];
         // Check trùng Tx
         const {data: dupCheck} = await supabaseAdmin.from('vip_requests').select('id').ilike('content', `%${finalTxHash}%`).eq('status','APPROVED').limit(1);
         if(dupCheck && dupCheck.length>0){
