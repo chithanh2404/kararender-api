@@ -135,6 +135,9 @@ app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
 app.use('/api/payment/paypal', paypalRouter);
 app.use('/api/admin', adminPaypalRouter);
 
+const karaProjectsRouter = require('./routes/karaProjects');
+app.use('/api/projects', karaProjectsRouter);
+
 // FIX: Thêm middleware log + đảm bảo /api/health luôn trả về
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - Email: ${req.headers['x-user-email'] || 'none'}`);
