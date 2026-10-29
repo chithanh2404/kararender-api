@@ -40,7 +40,7 @@ router.post('/save', requireEmail, async (req,res)=>{
     if(!data_json) return res.status(400).json({success:false, message:'Missing data_json'});
 
     if(id){
-      // Update own project
+      // Update own project - always allowed
       const { data, error } = await admin.from('kara_projects')
         .update({ title, artist, data_json, duration, lyrics_count, thumbnail_url })
         .eq('id', id)
@@ -49,6 +49,26 @@ router.post('/save', requireEmail, async (req,res)=>{
       if(error) throw error;
       return res.json({success:true, project: data, message:'Updated'});
     } else {
+      // [v7.8] Check limit 10 projects per user before insert
+      try{
+        const { count, error: countError } = await admin.from('kara_projects')
+          .select('id', { count: 'exact', head: true })
+          .eq('user_email', req.userEmail);
+        if(countError) throw countError;
+        console.log(`[Limit] User ${req.userEmail} has ${count} projects`);
+        if(count >= 10){
+          return res.status(403).json({
+            success:false, 
+            message:'Bạn đã đạt giới hạn tối đa 10 dự án. Vui lòng xóa bớt dự án cũ trước khi lưu dự án mới.',
+            code:'LIMIT_REACHED',
+            count: count,
+            limit: 10
+          });
+        }
+      }catch(limitErr){
+        console.warn('[Limit] check failed, allowing save', limitErr.message);
+        // If limit check fails, allow save to avoid blocking - but log it
+      }
       const { data, error } = await admin.from('kara_projects')
         .insert([{ user_email: req.userEmail, title, artist, data_json, duration: duration||0, lyrics_count: lyrics_count||0, thumbnail_url }])
         .select().single();
