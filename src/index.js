@@ -70,13 +70,25 @@ setInterval(() => {
 
 
 
-// FIX: Helmet phải tắt hết cross-origin để không bị Failed to fetch từ Blogger
+// FIX: Helmet tắt resource policy để không block Blogger, nhưng BẬT COOP/COEP để fix SharedArrayBuffer
+// V27 FIX SharedArrayBuffer - cần COOP + COEP để bật crossOriginIsolated
 app.use(helmet({ 
   crossOriginResourcePolicy: false, 
   contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false,
+  crossOriginEmbedderPolicy: false, // tắt mặc định, sẽ tự set credentialless bên dưới
   crossOriginOpenerPolicy: false
 }));
+
+// ===== V27 FIX SharedArrayBuffer is not defined - BẬT COOP/COEP =====
+// Thêm header này vào server serve frontend kararender.com thì ffmpeg.wasm mới chạy được
+// Dùng credentialless thay vì require-corp để không chặn Google Scripts, unpkg, CDN
+app.use((req, res, next) => {
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "credentialless");
+  // Thêm CORP để resource cross-origin vẫn load được
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  next();
+});
 
 // FIX CORS - PHẢI ĐẶT TRƯỚC /api/vocal để không bị Failed to fetch
 // Lỗi cũ: app.use('/api/vocal') đặt trước cors() nên preflight OPTIONS bị block
