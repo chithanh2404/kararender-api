@@ -16,6 +16,7 @@ const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
 const upgradeRoutes = require('./routes/upgrade');
 const paypalRouter = require('./routes/paypal');
+const dodoRouter = require('./routes/dodo');
 const adminPaypalRouter = require('./routes/adminPaypal');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
@@ -171,6 +172,7 @@ app.use((req, res, next) => {
 // Sau khi cors mới mount vocalRouter
 app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
 app.use('/api/payment/paypal', paypalRouter);
+app.use('/api', dodoRouter);
 app.use('/api/admin', adminPaypalRouter);
 
 const karaProjectsRouter = require('./routes/karaProjects');
