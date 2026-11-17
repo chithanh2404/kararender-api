@@ -139,8 +139,34 @@ async function checkBlockedIpMiddleware(req,res,next){
 }
 app.use(checkBlockedIpMiddleware);
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// ===== FIX WEBHOOK RAW BODY - PHẢI ĐẶT Ở ĐÂY, TRƯỚC MỌI WEBHOOK =====
+// Vấn đề cũ: app.use(express.json()) chạy trước mọi route, nó parse body của
+// webhook thành object và đánh dấu req._body = true. Sau đó express.raw() ở
+// /api/webhook/lemonsqueezy (dòng ~3594) và /api/webhook/paypal (dòng ~3726)
+// bị body-parser bỏ qua, req.body vẫn là object -> req.body.toString() ra
+// "[object Object]" -> verify signature luôn fail, Lemon/PayPal bị ignored.
+// Fix: global parser BỎ QUA mọi request /api/webhook/*, để parser riêng của
+// từng webhook tự xử lý:
+//   - Lemon / PayPal: express.raw({type:'application/json'}) -> req.body là Buffer (giữ nguyên raw bytes để verify signature)
+//   - Bank: express.json({limit:'2mb'}) ở chính route đó -> req.body là object như cũ
+//   - Alias (sepay/casso/lemon/paypal-legacy): viết lại req.url rồi app._router.handle() lại,
+//     lần chạy thứ 2 vẫn đi qua middleware này, vẫn được bỏ qua, rồi route đích tự parse.
+// Mọi route khác (/api/*, /api/payment/*, ...) vẫn parse JSON như cũ, không đổi hành vi.
+const __jsonParser = express.json({ limit: '10mb' });
+const __urlencodedParser = express.urlencoded({ extended: true, limit: '10mb' });
+function __isWebhookRequest(req) {
+  const u = String(req.originalUrl || req.url || req.path || '').split('?')[0];
+  const p = String(req.path || '').split('?')[0];
+  return u.startsWith('/api/webhook/') || p.startsWith('/api/webhook/') || u === '/api/webhook' || p === '/api/webhook';
+}
+app.use((req, res, next) => {
+  if (__isWebhookRequest(req)) return next();
+  return __jsonParser(req, res, next);
+});
+app.use((req, res, next) => {
+  if (__isWebhookRequest(req)) return next();
+  return __urlencodedParser(req, res, next);
+});
 
 // Sau khi cors mới mount vocalRouter
 app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
