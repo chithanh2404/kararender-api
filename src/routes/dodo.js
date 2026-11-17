@@ -125,6 +125,47 @@ async function sendTelegramAutoVip({ email, fullName, planKey, monthsToAdd, amou
   } catch (e) { console.warn('[Dodo Webhook] Telegram error', e.message); }
 }
 
+// ===== GET /api/admin/dodo-config =====
+router.get('/admin/dodo-config', async (req, res) => {
+  const cfg = getDodoConfig();
+  let enabled = false;
+  try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (supabaseAdmin) {
+      const { data } = await supabaseAdmin.from('app_settings')
+        .select('value').eq('id', 'dodo_enabled').single();
+      if (data?.value) enabled = !!data.value.enabled;
+    }
+  } catch (e) { console.warn('[Dodo Admin] get config error', e.message); }
+  res.json({
+    success: true,
+    enabled,
+    configured: !!cfg.apiKey,
+    hasApiKey: !!cfg.apiKey,
+    hasWebhookSecret: !!cfg.webhookSecret,
+    mode: cfg.isTest ? 'test' : 'live',
+  });
+});
+
+// ===== POST /api/admin/dodo-config =====
+router.post('/admin/dodo-config', express.json(), async (req, res) => {
+  try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (!supabaseAdmin) return res.status(500).json({ success: false, message: 'Supabase not configured' });
+    const value = {
+      enabled: !!req.body?.enabled,
+      updated_at: new Date().toISOString(),
+      updated_by: (req.headers['x-user-email'] || '').toLowerCase(),
+    };
+    const { error } = await supabaseAdmin.from('app_settings')
+      .upsert({ id: 'dodo_enabled', value }, { onConflict: 'id' });
+    if (error) throw error;
+    return res.json({ success: true, value, message: `Đã ${value.enabled ? 'BẬT' : 'TẮT'} Dodo Payments` });
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 // ===== GET /api/payment/dodo/config - giống Lemon config =====
 router.get('/payment/dodo/config', (req, res) => {
   const cfg = getDodoConfig();
