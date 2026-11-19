@@ -31,6 +31,11 @@ function getDodoConfig() {
   return { apiKey, webhookSecret, products, base, isTest };
 }
 
+// DB (users.request_amount, vip_requests.amount) đang là INTEGER chứa VND.
+// Dodo trả total_amount là cents EUR (4189 = €41.89, đã gồm VAT) -> KHÔNG được ghi trực tiếp vào DB.
+// Dùng map cứng theo giá bạn đang set: 1M 99000, 3M 199000, 6M 299000, 12M 499000, 24M 899000.
+const VND_BY_PLAN = { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 };
+
 function normalizePlanKey(raw) {
   const k = String(raw || '1m').toLowerCase().trim();
   const map = {
@@ -167,7 +172,15 @@ router.post('/admin/dodo-config', express.json(), async (req, res) => {
 });
 
 // ===== GET /api/payment/dodo/config - giống Lemon config =====
-router.get('/payment/dodo/config', (req, res) => {
+router.get('/payment/dodo/config', async (req, res) => {
+  let enabled = false;
+  try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (supabaseAdmin) {
+      const { data } = await supabaseAdmin.from('app_settings').select('value').eq('id', 'dodo_enabled').single();
+      if (data?.value) enabled = !!data.value.enabled;
+    }
+  } catch {}
   const cfg = getDodoConfig();
   const products = {};
   for (const [k, v] of Object.entries(cfg.products)) {
@@ -175,6 +188,7 @@ router.get('/payment/dodo/config', (req, res) => {
   }
   res.json({
     success: true,
+    enabled,
     configured: !!cfg.apiKey,
     hasApiKey: !!cfg.apiKey,
     hasWebhookSecret: !!cfg.webhookSecret,
@@ -206,6 +220,17 @@ router.post('/payment/dodo/create', express.json(), async (req, res) => {
     if (!product?.productId) {
       return res.status(400).json({ success: false, message: `Chưa cấu hình DODO_PRODUCT_${planKey.toUpperCase()} cho gói ${planKey}` });
     }
+
+    // Admin tắt Dodo -> chặn cho tất cả, kể cả whitelist/admin
+    try {
+      const supabaseAdminGate = getSupabaseAdmin();
+      if (supabaseAdminGate) {
+        const { data: gate } = await supabaseAdminGate.from('app_settings').select('value').eq('id', 'dodo_enabled').single();
+        if (gate?.value && gate.value.enabled === false) {
+          return res.status(403).json({ success: false, message: 'Dodo đang tắt' });
+        }
+      }
+    } catch {}
 
     const supabaseAdmin = getSupabaseAdmin();
     let fullName = email;
@@ -261,16 +286,17 @@ router.post('/payment/dodo/create', express.json(), async (req, res) => {
           .gte('created_at', new Date(Date.now() - 10 * 60 * 1000).toISOString())
           .limit(1).maybeSingle();
         if (!existing) {
-          const { data: ins } = await supabaseAdmin.from('vip_requests').insert({
+          const { data: ins, error: insErr } = await supabaseAdmin.from('vip_requests').insert({
             email,
             full_name: fullName,
             plan_key: planKey,
-            amount: product.usd,
+            amount: VND_BY_PLAN[planKey] || 99000,
             content: `dodo ${email.replace(/[@.]/g, '')} ${planKey} $${product.usd} session:${sessionId || ''} payment:${paymentId || ''}`,
             status: 'PENDING',
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           }).select().single();
+          if (insErr) console.error('[Dodo Create] save pending error', insErr.message);
           insertedRequestId = ins?.id || null;
         } else {
           insertedRequestId = existing?.id || null;
@@ -358,13 +384,15 @@ async function handleDodoWebhook(req, res) {
     planKey = normalizePlanKey(planKey) || '1m';
 
     const paymentId = data.payment_id || data.id || body.payment_id || '';
-    const amountUsd = toUsd(data.total_amount) || getDodoConfig().products[planKey]?.usd || 0;
+    // amountUsd chỉ để hiển thị/log. total_amount là cents EUR (4189 = 41.89 EUR) -> không dùng cho DB.
+    const amountUsd = parseFloat(data.metadata?.amount_usd) || getDodoConfig().products[planKey]?.usd || toUsd(data.total_amount) || 0;
+    const amountVnd = VND_BY_PLAN[planKey] || 99000;
 
     if (!email) {
       console.warn('[Dodo Webhook] No email found');
       return res.json({ success: false, message: 'No email in webhook' });
     }
-    console.log(`[Dodo Webhook] Parsed email: ${email} planKey: ${planKey} paymentId: ${paymentId} amountUsd: ${amountUsd}`);
+    console.log(`[Dodo Webhook] Parsed email: ${email} planKey: ${planKey} paymentId: ${paymentId} amountUsd: ${amountUsd} amountVnd: ${amountVnd} total_amount: ${data.total_amount} currency: ${data.currency}`);
 
     const supabaseAdmin = getSupabaseAdmin();
     if (!supabaseAdmin) return res.status(500).json({ success: false, message: 'Supabase not configured' });
@@ -403,7 +431,7 @@ async function handleDodoWebhook(req, res) {
       vip_status: 'APPROVED',
       expired_date: expireDate.toISOString(),
       request_plan_key: planKey,
-      request_amount: amountUsd,
+      request_amount: amountVnd,
       request_content: `dodo ${email.replace(/[@.]/g, '')} ${planKey} payment:${paymentId} $${amountUsd}`,
       request_vip_time: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -420,7 +448,7 @@ async function handleDodoWebhook(req, res) {
       if (pendingList && pendingList.length > 0) {
         await supabaseAdmin.from('vip_requests').update({
           status: 'APPROVED',
-          amount: amountUsd,
+          amount: amountVnd,
           content: `dodo ${planKey} payment:${paymentId} $${amountUsd}`,
           updated_at: new Date().toISOString(),
         }).eq('id', pendingList[0].id);
@@ -429,7 +457,7 @@ async function handleDodoWebhook(req, res) {
           email,
           full_name: targetUser.full_name || email,
           plan_key: planKey,
-          amount: amountUsd,
+          amount: amountVnd,
           content: `dodo auto ${planKey} payment:${paymentId} $${amountUsd}`,
           status: 'APPROVED',
           created_at: new Date().toISOString(),
