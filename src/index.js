@@ -204,7 +204,7 @@ app.get('/api/payment/lemonsqueezy/config', (req, res) => {
       apiKeyPrefix: process.env.LEMONSQUEEZY_API_KEY ? process.env.LEMONSQUEEZY_API_KEY.slice(0,15)+'...' : 'NOT SET',
       webhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET ? 'SET '+process.env.LEMONSQUEEZY_WEBHOOK_SECRET.slice(0,10)+'...' : 'NOT SET',
       variants,
-      prices: { '1m': 99000, '3m': 199000, '6m': 399000, '12m': 599000, '24m': 999000 },
+      prices: { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 },
       timestamp: new Date().toISOString()
     });
   } catch(e) {
@@ -3177,7 +3177,7 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       }
     }
 
-    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '1y':12, 'lifetime':1200, 'vip1m':1, 'vip3m':3 };
+    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '24m':24, '1y':12, '2y':24, '24':24, 'lifetime':1200, 'vip1m':1, 'vip3m':3, 'vip6m':6, 'vip12m':12, 'vip24m':24 };
     const months = monthsMap[planKey] || 1;
     const now = new Date();
     let expireDate = new Date();
@@ -3345,11 +3345,11 @@ function getLemonUsdPrice(planKey, vndPrice){
   const defaultVndMap = {
     '1M': 99000,
     '3M': 199000,
-    '6M': 399000,
-    '12M': 599000,
-    '24M': 999000,
-    '1Y': 599000,
-    '2Y': 999000
+    '6M': 299000,
+    '12M': 499000,
+    '24M': 899000,
+    '1Y': 499000,
+    '2Y': 899000
   };
   let usd = envPriceMap[key];
   if(usd) return parseFloat(usd);
@@ -3516,7 +3516,7 @@ app.get('/api/payment/lemonsqueezy/config', async (req,res)=>{
       '24m': process.env.LEMON_VARIANT_24M || '2234517',
       'default': '2234458'
     };
-    return res.json({success:true, configured:hasKey, variants, storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257', prices: { '1m': 99000, '3m': 199000, '6m': 399000, '12m': 599000, '24m': 999000 }});
+    return res.json({success:true, configured:hasKey, variants, storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257', prices: { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 }});
   }catch(e){
     return res.json({success:false, message:e.message});
   }
@@ -3612,7 +3612,7 @@ const originalLemonConfigHandler = async (req,res)=>{
         '12m': process.env.LEMON_VARIANT_12M || '2234510',
         '24m': process.env.LEMON_VARIANT_24M || '2234517'
       },
-      prices: { '1m': 99000, '3m': 199000, '6m': 399000, '12m': 599000, '24m': 999000 }
+      prices: { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 }
     });
   }catch(e){ return res.json({success:false, message:e.message}); }
 };
