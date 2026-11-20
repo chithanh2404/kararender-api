@@ -1357,7 +1357,18 @@ async function checkDebug(){
 }
 async function loadAll(){
   try{
-    const users=await api('/api/admin/users');
+    // FIX 1000: loop theo trang thay vi goi 1 lan (bi cap 1000)
+    let users=[]; let page=1; let total=Infinity;
+    while(users.length < total){
+      const j=await api('/api/admin/users?page='+page+'&limit=100');
+      const chunk = Array.isArray(j) ? j : (j.data||[]);
+      total = (j && j.total!=null) ? j.total : chunk.length;
+      if(!chunk.length) break;
+      users = users.concat(chunk);
+      if(chunk.length < 100) break;
+      page++;
+      if(page>500) break;
+    }
     if(Array.isArray(users)){ document.getElementById('statUsers').textContent=users.length; document.getElementById('usersBody').innerHTML=users.slice(0,20).map(u=>\`<tr><td>\${u.email}</td><td>\${u.full_name||''}</td><td>\${u.is_vip?'👑':''}</td><td>\${u.created_at?new Date(u.created_at).toLocaleDateString():''}</td></tr>\`).join(''); }
     const fonts=await api('/api/admin/stats/fonts'); if(fonts.count!==undefined) document.getElementById('statFonts').textContent=fonts.count;
     const effects=await api('/api/admin/stats/effects'); document.getElementById('statEffects').textContent=effects.exists? 'OK':'-';
@@ -1459,7 +1470,7 @@ app.get('/api/admin/users', async (req,res)=>{
     const searchLower = search.toLowerCase();
     
     let query = supabaseAdmin.from('users')
-      .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status');
+      .select('id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status', { count: 'exact' });
     
     // Filter theo loại - để tìm user thứ 201+ vẫn ra
     if(filter==='locked' || statusParam==='locked'){
@@ -1479,6 +1490,7 @@ app.get('/api/admin/users', async (req,res)=>{
           .eq('email', searchLower)
           .limit(5);
         if(exact && exact.length>0){
+          if(req.query.page || req.query.limit) return res.json({ data: exact, total: exact.length, page: 1, pageSize: exact.length, totalPages: 1 });
           return res.json(exact);
         }
       }
@@ -1488,11 +1500,18 @@ app.get('/api/admin/users', async (req,res)=>{
       query = query.or(`email.ilike.%${search}%,full_name.ilike.%${search}%,last_ip.ilike.%${search}%,locked_reason.ilike.%${search}%`);
     }
     
-    // Nếu filter thì tăng limit lên 5000 để lấy hết user khóa/VIP dù ở sâu
-    const limit = (filter==='locked' || filter==='vip' || search) ? 5000 : 2000;
-    query = query.order('created_at',{ascending:false}).limit(limit);
-    const { data, error } = await query;
+    // FIX 1000: Supabase PostgREST cap 1000 rows/query nen limit(5000) khong co tac dung.
+    // Dung range(from,to) + count:'exact' va phan trang. Client moi gui ?page=&limit= se nhan {data,total,...}.
+    // Client cu khong gui page -> tra array nhu cu de khong vo frontend cu.
+    const hasPaging = !!(req.query.page || req.query.limit);
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(1000, Math.max(1, parseInt(req.query.limit) || 100));
+    const from = (page - 1) * pageSize;
+    const to = from + pageSize - 1;
+    query = query.order('created_at',{ascending:false}).range(from, to);
+    const { data, error, count } = await query;
     if(error) throw error;
+    if(hasPaging) return res.json({ data: data || [], total: count ?? (data||[]).length, page, pageSize, totalPages: Math.ceil((count ?? (data||[]).length) / pageSize) });
     res.json(data||[]);
   }catch(e){ 
     console.error('[admin/users] error', e.message);
@@ -1501,6 +1520,42 @@ app.get('/api/admin/users', async (req,res)=>{
 });
 
 // Thêm endpoint tìm user chính xác theo email - để khóa user thứ 201+ dễ dàng
+// FIX 1000: tong so that (khong load list) + load het vuot 1000 (server tu loop range)
+app.get('/api/admin/users/count', async (req,res)=>{
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({error:'Supabase not configured'});
+    const { count, error } = await supabaseAdmin.from('users').select('*', { count: 'exact', head: true });
+    if(error) throw error;
+    res.json({ success:true, total: count || 0 });
+  }catch(e){ res.status(500).json({ success:false, message:e.message }); }
+});
+app.get('/api/admin/users/all', async (req,res)=>{
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({error:'Supabase not configured'});
+    const search = (req.query.search || '').toString().trim();
+    const filter = (req.query.filter || '').toString().toLowerCase().trim();
+    const maxRows = Math.min(50000, parseInt(req.query.max) || 20000);
+    const cols = 'id,email,full_name,is_vip,role,created_at,last_login_at,is_locked,is_banned,status,locked_reason,locked_at,locked_by,banned_until,last_ip,trial_used,vip_status';
+    const all = []; let offset = 0;
+    while(offset < maxRows){
+      let q = supabaseAdmin.from('users').select(cols);
+      if(filter==='locked') q = q.or('is_locked.eq.true,is_banned.eq.true,status.eq.locked,status.eq.banned');
+      else if(filter==='vip') q = q.eq('is_vip', true);
+      else if(filter==='active') q = q.eq('is_locked', false).eq('is_banned', false).neq('status','locked').neq('status','banned');
+      if(search) q = q.or(`email.ilike.%${search}%,full_name.ilike.%${search}%,last_ip.ilike.%${search}%`);
+      const { data, error } = await q.order('created_at',{ascending:false}).range(offset, offset + 999);
+      if(error) throw error;
+      if(!data || !data.length) break;
+      all.push(...data);
+      if(data.length < 1000) break;
+      offset += 1000;
+    }
+    res.json({ success:true, total: all.length, data: all });
+  }catch(e){ res.status(500).json({ success:false, message:e.message }); }
+});
+
 app.get('/api/admin/users/by-email', async (req,res)=>{
   try{
     const { supabaseAdmin } = require('./services/supabase');
@@ -3211,18 +3266,24 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
           // Thay vì brute force, thử tìm user có email mà khi bỏ @. sẽ ra safeCode
           // Query tất cả users nhưng với filter email ilike %safeCode% không hiệu quả vì safeCode đã bỏ @.
           // Nên thử: lấy email từ pendingRequest nếu có, hoặc tìm user có email mà content chứa phần của nó
-          const { data: allUsers, error } = await supabaseAdmin.from('users').select('id,email,full_name,expired_date').limit(1000);
-          if(allUsers){
+          // FIX 1000: limit(1000) chi quet 1000 user dau -> user thu 1001+ khong bao gio duoc auto-duyet.
+          // Loop range() 1000/trang cho den khi tim thay hoac het users.
+          let offset = 0;
+          while(!targetUser && offset < 50000){
+            const { data: allUsers, error } = await supabaseAdmin.from('users').select('id,email,full_name,expired_date').order('created_at',{ascending:false}).range(offset, offset + 999);
+            if(error) throw error;
+            if(!allUsers || !allUsers.length) break;
             for(let u of allUsers){
               const code = (u.email || '').replace(/[@.]/g,'').toLowerCase();
               if(code === safeCode){
-                // Lấy full user
                 const { data: fullUser } = await supabaseAdmin.from('users').select('*').eq('id', u.id).single();
                 targetUser = fullUser || u;
-                console.log(`[Webhook] Found user via full scan: ${u.email}`);
+                console.log(`[Webhook] Found user via full scan (offset ${offset}): ${u.email}`);
                 break;
               }
             }
+            if(allUsers.length < 1000) break;
+            offset += 1000;
           }
         }
       }catch(e){
