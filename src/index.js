@@ -15,9 +15,7 @@ const config = require('./config');
 const vocalRouter = require('./routes/vocal');
 const downloadRoute = require('./routes/download');
 const upgradeRoutes = require('./routes/upgrade');
-const paypalRouter = require('./routes/paypal');
 const dodoRouter = require('./routes/dodo');
-const adminPaypalRouter = require('./routes/adminPaypal');
 const fastVideobgRouter = require('./routes/fastVideobg-simple');
 import themeLicenseRoutes from './routes/themeLicenseRoutes.js';
 
@@ -34,6 +32,62 @@ const app = express();
 
 const PORT = config.PORT;
 app.set('trust proxy', true);
+
+// ===== VIP PLANS - NGUỒN THẬT DUY NHẤT: Supabase upgrade_plans =====
+// Thêm gói mới chỉ cần INSERT 1 dòng vào upgrade_plans, KHÔNG sửa code.
+// Bảng upgrade_plans hiện có: key, label, months, price (VND), enabled, sort_order
+// Nếu sau này thêm cột price_usd / dodo_product_id / lemon_variant_id thì code tự dùng luôn.
+let _vipPlansCache = null;
+let _vipPlansCacheAt = 0;
+const _FALLBACK_PLANS = {
+  '1m': { plan_key: '1m', label: 'Gói 1 tháng', months: 1, price_vnd: 99000, price_usd: 3.99 },
+  '3m': { plan_key: '3m', label: 'Gói 3 tháng', months: 3, price_vnd: 199000, price_usd: 7.65 },
+  '6m': { plan_key: '6m', label: 'Gói 6 tháng', months: 6, price_vnd: 299000, price_usd: 15.35 },
+  '12m': { plan_key: '12m', label: 'Gói 1 năm', months: 12, price_vnd: 499000, price_usd: 23.04 },
+  '24m': { plan_key: '24m', label: 'Gói 2 năm', months: 24, price_vnd: 899000, price_usd: 38.42 },
+};
+async function getVipPlans() {
+  if (_vipPlansCache && Date.now() - _vipPlansCacheAt < 60 * 1000) return _vipPlansCache;
+  try {
+    const { supabaseAdmin } = require('./services/supabase');
+    if (supabaseAdmin) {
+      const { data } = await supabaseAdmin.from('upgrade_plans').select('*').eq('enabled', true).order('sort_order', { ascending: true });
+      if (data && data.length) {
+        const plans = {};
+        for (const r of data) {
+          const key = String(r.key || r.plan_key || '').toLowerCase();
+          if (!key) continue;
+          plans[key] = {
+            plan_key: key,
+            label: r.label || key,
+            months: Number(r.months) || 1,
+            price_vnd: Number(r.price ?? r.price_vnd) || 99000,
+            price_usd: r.price_usd != null ? Number(r.price_usd) : (_FALLBACK_PLANS[key]?.price_usd || 0),
+            dodo_product_id: r.dodo_product_id || null,
+            lemon_variant_id: r.lemon_variant_id || null,
+          };
+        }
+        // Alias 1y/2y để code cũ vẫn chạy
+        if (plans['12m']) plans['1y'] = { ...plans['12m'], plan_key: '1y' };
+        if (plans['24m']) plans['2y'] = { ...plans['24m'], plan_key: '2y' };
+        _vipPlansCache = plans; _vipPlansCacheAt = Date.now(); return plans;
+      }
+    }
+  } catch (e) { console.warn('[VipPlans] load error, dùng fallback', e.message); }
+  _vipPlansCache = { ..._FALLBACK_PLANS }; _vipPlansCacheAt = Date.now(); return _vipPlansCache;
+}
+function clearVipPlansCache() { _vipPlansCache = null; _vipPlansCacheAt = 0; }
+async function getVipPlan(planKey) {
+  const plans = await getVipPlans();
+  const k = String(planKey || '1m').toLowerCase();
+  return plans[k] || plans['1m'];
+}
+// Endpoint cho frontend render gói động, không hardcode 5 nút
+app.get('/api/plans', async (req, res) => {
+  try { const plans = await getVipPlans(); return res.json({ success: true, plans: Object.values(plans).filter(p => !['1y','2y'].includes(p.plan_key)) }); }
+  catch (e) { return res.status(500).json({ success: false, message: e.message }); }
+});
+
 
 // ===== FIX: Rate Limit Memory cho OTP - Thiếu nên gây lỗi __checkRateLimit is not defined =====
 const __otpBuckets = new Map();
@@ -171,9 +225,7 @@ app.use((req, res, next) => {
 
 // Sau khi cors mới mount vocalRouter
 app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
-app.use('/api/payment/paypal', paypalRouter);
 app.use('/api', dodoRouter);
-app.use('/api/admin', adminPaypalRouter);
 
 const karaProjectsRouter = require('./routes/karaProjects');
 app.use('/api/projects', karaProjectsRouter);
@@ -185,7 +237,7 @@ app.use((req, res, next) => {
 });
 
 // ===== LEMON DEBUG ROUTE - ĐẶT SỚM NHẤT ĐỂ TRÁNH BỊ CHE =====
-app.get('/api/payment/lemonsqueezy/config', (req, res) => {
+app.get('/api/payment/lemonsqueezy/config', async (req, res) => {
   console.log('[Lemon Config] HIT - env check');
   try {
     const hasKey = !!(process.env.LEMONSQUEEZY_API_KEY);
@@ -204,7 +256,7 @@ app.get('/api/payment/lemonsqueezy/config', (req, res) => {
       apiKeyPrefix: process.env.LEMONSQUEEZY_API_KEY ? process.env.LEMONSQUEEZY_API_KEY.slice(0,15)+'...' : 'NOT SET',
       webhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET ? 'SET '+process.env.LEMONSQUEEZY_WEBHOOK_SECRET.slice(0,10)+'...' : 'NOT SET',
       variants,
-      prices: { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 },
+      prices: Object.fromEntries(Object.values(await getVipPlans()).filter(p=>!['1y','2y'].includes(p.plan_key)).map(p=>[p.plan_key, p.price_vnd])),
       timestamp: new Date().toISOString()
     });
   } catch(e) {
@@ -3119,12 +3171,8 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       return res.json({ success:false, message:'User not found for code '+safeCode, safeCode, planKey, content });
     }
     
-    const planPrices = { '1m':99000, '3m':199000, '6m':299000, '12m':499000, '1y':499000, 'vip1m':99000, 'vip3m':199000 };
-    let expectedAmount = planPrices[planKey] || 99000;
-    try{
-      const { data: plans } = await supabaseAdmin.from('upgrade_plans').select('*').eq('key', planKey).single();
-      if(plans && plans.price) expectedAmount = plans.price;
-    }catch(e){}
+    const _bankPlan = await getVipPlan(planKey);
+    let expectedAmount = _bankPlan.price_vnd || 99000;
 
     console.log(`[Webhook] User: ${targetUser.email} Expected: ${expectedAmount} Actual: ${amount} Plan: ${planKey}`);
 
@@ -3177,8 +3225,7 @@ app.post('/api/webhook/bank', express.json({ limit: '2mb' }), async (req, res) =
       }
     }
 
-    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '24m':24, '1y':12, '2y':24, '24':24, 'lifetime':1200, 'vip1m':1, 'vip3m':3, 'vip6m':6, 'vip12m':12, 'vip24m':24 };
-    const months = monthsMap[planKey] || 1;
+    const months = (await getVipPlan(planKey)).months || 1;
     const now = new Date();
     let expireDate = new Date();
     if(targetUser.expired_date && new Date(targetUser.expired_date) > now){
@@ -3376,14 +3423,10 @@ app.post('/api/payment/lemonsqueezy/create', express.json(), async (req, res) =>
     let planLabel = planKey;
     let months = 1;
     try{
-      if(supabaseAdmin){
-        const {data: planData} = await supabaseAdmin.from('upgrade_plans').select('*').eq('key', planKey.toLowerCase()).single();
-        if(planData){
-          planPriceVnd = planData.price || 99000;
-          planLabel = planData.label || planKey;
-          months = planData.months || 1;
-        }
-      }
+      const _lp = await getVipPlan(planKey);
+      planPriceVnd = _lp.price_vnd || 99000;
+      planLabel = _lp.label || planKey;
+      months = _lp.months || 1;
     }catch(e){}
     const variantId = getLemonVariantId(planKey);
     if(!variantId){
@@ -3516,7 +3559,7 @@ app.get('/api/payment/lemonsqueezy/config', async (req,res)=>{
       '24m': process.env.LEMON_VARIANT_24M || '2234517',
       'default': '2234458'
     };
-    return res.json({success:true, configured:hasKey, variants, storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257', prices: { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 }});
+    return res.json({success:true, configured:hasKey, variants, storeId: process.env.LEMONSQUEEZY_STORE_ID || '495257', prices: Object.fromEntries(Object.values(await getVipPlans()).filter(p=>!['1y','2y'].includes(p.plan_key)).map(p=>[p.plan_key, p.price_vnd]))});
   }catch(e){
     return res.json({success:false, message:e.message});
   }
@@ -3612,7 +3655,7 @@ const originalLemonConfigHandler = async (req,res)=>{
         '12m': process.env.LEMON_VARIANT_12M || '2234510',
         '24m': process.env.LEMON_VARIANT_24M || '2234517'
       },
-      prices: { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 }
+      prices: Object.fromEntries(Object.values(await getVipPlans()).filter(p=>!['1y','2y'].includes(p.plan_key)).map(p=>[p.plan_key, p.price_vnd]))
     });
   }catch(e){ return res.json({success:false, message:e.message}); }
 };
@@ -3671,8 +3714,7 @@ app.post('/api/webhook/lemonsqueezy', express.raw({type: 'application/json'}), a
       console.warn('[Lemon Webhook] User not found', email);
       return res.json({success:false, message:'User not found: '+email});
     }
-    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '24m':24, '1y':12, '2y':24, 'lifetime':1200 };
-    const monthsToAdd = monthsMap[planKey] || months || 1;
+    const monthsToAdd = (await getVipPlan(planKey)).months || months || 1;
     const now = new Date();
     let expireDate = new Date();
     if(targetUser.expired_date && new Date(targetUser.expired_date) > now){
@@ -3749,168 +3791,9 @@ app.post('/api/webhook/lemonsqueezy', express.raw({type: 'application/json'}), a
 app.post('/api/webhook/lemon', (req,res,next)=>{ req.url='/api/webhook/lemonsqueezy'; req.method='POST'; app._router.handle(req,res,next); });
 
 
-// ===== PAYPAL - CỔNG THANH TOÁN QUỐC TẾ - AUTO DUYỆT VIP =====
-// Webhook PayPal - CORRECT STRUCTURE - update vip_requests đúng cột hiện có
-app.post('/api/webhook/paypal', express.raw({type:'application/json'}), async (req,res)=>{
-  try{
-    const rawBody = req.body;
-    const bodyString = rawBody ? rawBody.toString('utf8') : '';
-    console.log('[PayPal Webhook] Event raw len', bodyString.length);
-
-    let body;
-    try{ body = JSON.parse(bodyString); }catch(e){ body = {}; }
-    const eventType = body.event_type || '';
-    console.log('[PayPal Webhook] Event:', eventType);
-
-    if(!eventType.includes('CAPTURE.COMPLETED') && eventType !== 'CHECKOUT.ORDER.APPROVED'){
-      return res.json({success:true, ignored:true, event:eventType});
-    }
-
-    // Nếu ORDER.APPROVED thì auto capture
-    if(eventType === 'CHECKOUT.ORDER.APPROVED'){
-      try{
-        const orderId = body.resource?.id;
-        if(orderId){
-          const tokenRes = await fetch('https://api-m.paypal.com/v1/oauth2/token', {
-            method:'POST',
-            headers:{
-              'Authorization':'Basic '+Buffer.from(`${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_SECRET||process.env.PAYPAL_CLIENT_SECRET}`).toString('base64'),
-              'Content-Type':'application/x-www-form-urlencoded'
-            },
-            body:'grant_type=client_credentials'
-          });
-          const tokenData = await tokenRes.json();
-          const token = tokenData.access_token;
-          const capRes = await fetch(`https://api-m.paypal.com/v2/checkout/orders/${orderId}/capture`, {
-            method:'POST',
-            headers:{'Authorization':`Bearer ${token}`, 'Content-Type':'application/json'}
-          });
-          const capData = await capRes.json();
-          console.log('[PayPal] Auto capture', JSON.stringify(capData).slice(0,1000));
-          body.resource = capData.purchase_units?.[0]?.payments?.captures?.[0] || capData;
-          if(capData.purchase_units?.[0]?.custom_id) body.resource.custom_id = capData.purchase_units[0].custom_id;
-        }
-      }catch(e){ console.warn('[PayPal] auto capture error', e.message); }
-    }
-
-    const resource = body.resource || {};
-    let customId = resource.custom_id || resource.purchase_units?.[0]?.custom_id || '';
-    let email = '';
-    let planKey = '1m';
-
-    if(customId && customId.includes('|')){
-      const parts = customId.split('|');
-      email = (parts[0]||'').toLowerCase().trim();
-      planKey = (parts[1]||'1m').toLowerCase().trim();
-    }
-    if(!email){
-      email = (resource.payer?.email_address || '').toLowerCase().trim();
-    }
-
-    // Fallback tìm trong vip_requests theo paypal order id chứa trong content
-    if(!email && resource.id){
-      try{
-        const { supabaseAdmin } = require('./services/supabase');
-        const { data: pending } = await supabaseAdmin.from('vip_requests')
-          .select('email,plan_key,content')
-          .ilike('content', `%${resource.id}%`)
-          .eq('status','PENDING')
-          .order('created_at',{ascending:false}).limit(1).maybeSingle();
-        if(pending){ email = pending.email; planKey = pending.plan_key; console.log('[PayPal] Found email via content search', email); }
-      }catch(e){}
-    }
-
-    if(!email){
-      console.warn('[PayPal Webhook] No email');
-      return res.json({success:false, message:'No email'});
-    }
-
-    const monthsMap = { '1m':1, '3m':3, '6m':6, '12m':12, '24m':24 };
-    const monthsToAdd = monthsMap[planKey] || 1;
-    const amountUsd = resource.amount?.value || '0';
-    const paypalId = resource.id || body.id || '';
-
-    const { supabaseAdmin } = require('./services/supabase');
-    const { data: targetUser } = await supabaseAdmin.from('users').select('*').eq('email', email).maybeSingle();
-    if(!targetUser) return res.json({success:false, message:'User not found '+email});
-
-    const now = new Date();
-    let expireDate = new Date();
-    if(targetUser.expired_date && new Date(targetUser.expired_date) > now) expireDate = new Date(targetUser.expired_date);
-    expireDate.setMonth(expireDate.getMonth() + monthsToAdd);
-
-    // Update users - giống bank
-    await supabaseAdmin.from('users').update({
-      is_vip: true,
-      is_vip_bool: true,
-      role: 'VIP',
-      vip_status: 'APPROVED',
-      expired_date: expireDate.toISOString(),
-      request_plan_key: planKey,
-      request_content: `nang cap ${email.replace(/[@.]/g,'')} ${planKey} paypal ${paypalId} $${amountUsd} - APPROVED`,
-      request_vip_time: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    }).eq('id', targetUser.id);
-
-    // ===== UPDATE vip_requests - ĐÚNG CẤU TRÚC CŨ CỦA BẠN =====
-    // Chỉ update các cột: status, content, updated_at, amount (không thêm cột lạ)
-    try{
-      const { data: pendingList } = await supabaseAdmin.from('vip_requests')
-        .select('id,content')
-        .eq('email', email)
-        .eq('status','PENDING')
-        .order('created_at',{ascending:false}).limit(5);
-
-      if(pendingList && pendingList.length>0){
-        for(const p of pendingList){
-          const newContent = `${p.content} - APPROVED $${amountUsd} ${paypalId}`;
-          await supabaseAdmin.from('vip_requests').update({
-            status:'APPROVED',
-            content: newContent,
-            updated_at: new Date().toISOString()
-          }).eq('id', p.id);
-          console.log(`[PayPal] Updated vip_requests ${p.id} -> APPROVED`);
-        }
-      } else {
-        // Nếu không có PENDING (trường hợp tạo trực tiếp), tạo mới APPROVED luôn giống bank
-        const emailClean = email.replace(/[@.]/g,'');
-        await supabaseAdmin.from('vip_requests').insert({
-          email: email,
-          full_name: targetUser.full_name || email,
-          plan_key: planKey,
-          amount: targetUser.request_amount || 99000,
-          content: `nang cap ${emailClean} ${planKey} paypal ${paypalId} $${amountUsd} - AUTO`,
-          status:'APPROVED'
-        });
-      }
-    }catch(e){ console.warn('[PayPal] vip_requests update error', e.message); }
-
-    // Telegram AUTO DUYỆT giống bank/lemon
-    try{
-      const timeVN = new Date().toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
-      const expireVN = expireDate.toLocaleString('vi-VN', {timeZone:'Asia/Ho_Chi_Minh'});
-      const msg = `✅🤖 <b>AUTO DUYỆT VIP - PAYPAL</b> 🤖✅\n━━━━━━━━━━━━━━\n👤 <b>Email:</b> ${email}\n👤 <b>Tên:</b> ${targetUser.full_name || email}\n💳 <b>Gói:</b> ${planKey} (${monthsToAdd} tháng)\n💰 <b>Số tiền:</b> $${amountUsd}\n📝 <b>Nội dung:</b> <code>nang cap ${email.replace(/[@.]/g,'')} ${planKey}</code>\n📅 <b>Hạn:</b> ${expireVN}\n⏰ <b>Giờ:</b> ${timeVN}\n🆔 <b>PayPal ID:</b> ${paypalId}\n━━━━━━━━━━━━━━\n🤖 <b>Auto via PayPal webhook!</b>`;
-      const token = (process.env.TELEGRAM_BOT_TOKEN||'').trim();
-      const chatId = (process.env.TELEGRAM_CHAT_ID||'').trim();
-      if(token && chatId){
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({chat_id: chatId, text: msg, parse_mode:'HTML'})
-        });
-      }
-    }catch(e){ console.warn('[PayPal] Telegram error', e.message); }
-
-    return res.json({success:true, autoApproved:true, email, plan:planKey});
-  }catch(e){
-    console.error('[PayPal Webhook] Exception', e);
-    return res.status(500).json({success:false, error:e.message});
-  }
-});
-
-app.post('/api/webhook/paypal-legacy', (req,res,next)=>{ req.url='/api/webhook/paypal'; req.method='POST'; app._router.handle(req,res,next); });
-
-// ===== END PAYPAL =====
+// ===== PAYPAL ĐÃ XÓA - Giờ chỉ dùng Dodo + Lemon + Bank =====
+// Mọi request /api/payment/paypal/* và /api/webhook/paypal sẽ trả 404.
+// Muốn bật lại PayPal thì khôi phục file routes/paypal.js và mount lại.
 
 
 // ===== ADMIN: GỠ CHẶN OTP IP/EMAIL =====
