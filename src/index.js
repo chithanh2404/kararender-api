@@ -488,6 +488,87 @@ async function blockRenderIfTrialExpired(req, res, next){
 }
 
 
+
+// ===== FIX DOANH THU 1000: override /api/admin/vip-stats TRUOC upgradeRoutes =====
+// Ban cu nam trong routes/upgrade.js (file rieng, khong co trong 2 file nay): select vip_requests 1 lan
+// -> Supabase cap 1000/query nen khi vip_requests > 1000, thong ke Toan thoi gian / Thang / Chart / Top user deu thieu.
+// Express match theo thu tu dang ky, nen route nay dang ky TRUOC app.use('/api', upgradeRoutes) se thang,
+// route cu trong upgrade.js khong bao gio chay. Frontend giu nguyen URL cu, khong can doi.
+// Tra dung shape frontend loadVipStats() dang dung: {success, today, month, total, avg, chart, byPlan, topUsers}
+async function handleVipStats(req, res){
+  try{
+    const { supabaseAdmin } = require('./services/supabase');
+    if(!supabaseAdmin) return res.status(500).json({ success:false, message:'Supabase not configured' });
+    const adminEmail = (req.headers['x-user-email'] || '').toString().toLowerCase().trim();
+    if(typeof isAdminEmailCheck === 'function' && !isAdminEmailCheck(adminEmail)) return res.status(403).json({ success:false, message:'Chi admin' });
+    // Chi tinh APPROVED - PENDING / REJECTED khong phai doanh thu
+    const rows = []; let offset = 0;
+    while(offset < 50000){
+      const { data, error } = await supabaseAdmin.from('vip_requests')
+        .select('id,email,full_name,plan_key,amount,content,created_at,updated_at')
+        .eq('status','APPROVED')
+        .order('created_at',{ascending:true})
+        .range(offset, offset + 999);
+      if(error) throw error;
+      if(!data || !data.length) break;
+      rows.push(...data);
+      if(data.length < 1000) break;
+      offset += 1000;
+    }
+    // Chuan hoa amount: Lemon/Dodo luu amount theo USD (vd 3.99) trong khi Bank luu VND.
+    // Neu content la lemon/dodo va amount < 5000 (dang USD) -> lay gia VND cua goi de tong doanh thu khong bi lech.
+    const norm = [];
+    for(const r of rows){
+      let amt = Number(r.amount) || 0;
+      const c = String(r.content || '').toLowerCase();
+      if((c.includes('lemon') || c.includes('dodo')) && amt > 0 && amt < 5000){
+        try{ const p = await getVipPlan(r.plan_key); if(p && p.price_vnd) amt = Number(p.price_vnd) || amt; }catch(e){}
+      }
+      // Ngay doanh thu = ngay duyet (updated_at), fallback created_at
+      const d = new Date(r.updated_at || r.created_at);
+      const vnDate = d.toLocaleDateString('en-CA', { timeZone:'Asia/Ho_Chi_Minh' }); // YYYY-MM-DD
+      norm.push({ ...r, _amt: amt, _date: vnDate, _month: vnDate.slice(0,7) });
+    }
+    const nowVN = new Date().toLocaleDateString('en-CA', { timeZone:'Asia/Ho_Chi_Minh' });
+    const thisMonth = nowVN.slice(0,7);
+    const sum = (arr)=> arr.reduce((s,x)=> s + x._amt, 0);
+    const todayRows = norm.filter(x=> x._date === nowVN);
+    const monthRows = norm.filter(x=> x._month === thisMonth);
+    const total = sum(norm);
+    const count = norm.length;
+    // Chart 30 ngay gan nhat (ke ca ngay 0d)
+    const chart = [];
+    for(let i=29;i>=0;i--){
+      const dd = new Date(new Date(nowVN).getTime() - i*86400000).toLocaleDateString('en-CA', { timeZone:'Asia/Ho_Chi_Minh' });
+      const dayRows = norm.filter(x=> x._date === dd);
+      chart.push({ date: dd, total: sum(dayRows), count: dayRows.length });
+    }
+    const byPlanMap = {};
+    for(const x of norm){ const k = String(x.plan_key || 'unknown').toLowerCase(); byPlanMap[k] = byPlanMap[k] || { plan_key: k, total: 0, count: 0 }; byPlanMap[k].total += x._amt; byPlanMap[k].count++; }
+    const byPlan = Object.values(byPlanMap).sort((a,b)=> b.total - a.total);
+    const byUserMap = {};
+    for(const x of norm){
+      const em = String(x.email || '').toLowerCase();
+      byUserMap[em] = byUserMap[em] || { email: em, full_name: x.full_name || '', total: 0, count: 0, last_date: x._date };
+      byUserMap[em].total += x._amt; byUserMap[em].count++;
+      if(x._date > byUserMap[em].last_date) byUserMap[em].last_date = x._date;
+      if(x.full_name) byUserMap[em].full_name = x.full_name;
+    }
+    const topUsers = Object.values(byUserMap).sort((a,b)=> b.total - a.total).slice(0,50);
+    const firstDate = norm.length ? norm[0]._date : nowVN;
+    const daysSinceFirst = Math.max(1, Math.ceil((new Date(nowVN) - new Date(firstDate)) / 86400000) + 1);
+    const activeDays = new Set(norm.map(x=> x._date)).size || 1;
+    return res.json({ success:true, totalRows: count, scanned: rows.length,
+      today:{ total: sum(todayRows), count: todayRows.length, date: nowVN },
+      month:{ total: sum(monthRows), count: monthRows.length, month: thisMonth },
+      total:{ total, count },
+      avg:{ perTransaction: count ? total/count : 0, perDay: total/daysSinceFirst, perActiveDay: total/activeDays },
+      chart, byPlan, topUsers });
+  }catch(e){ console.error('[vip-stats] error', e.message); return res.status(500).json({ success:false, message:e.message }); }
+}
+app.get('/api/admin/vip-stats', handleVipStats);
+app.get('/api/admin/vip-stats-v2', handleVipStats);
+
 app.use('/api', upgradeRoutes);
 app.use('/api/render', blockRenderIfTrialExpired, fastVideobgRouter);
 app.use('/api/download', downloadRoute);
@@ -4206,18 +4287,8 @@ async function autoRejectOrphanVipRequests(){
 
     console.log(`[VIP Orphan] Starting scan - cutoff BANK: ${cutoffBankIso}, LONG: ${cutoffLongIso}`);
 
-    // Lấy tất cả PENDING quá 10 phút (limit 200) - không dùng ilike phức tạp, lọc bằng JS cho chắc
-    const { data: allPending, error } = await admin.from('vip_requests')
-      .select('id,email,content,created_at')
-      .eq('status','PENDING')
-      .lt('created_at', cutoffBankIso)
-      .order('created_at', {ascending:true})
-      .limit(200);
-
-    if(error){
-      console.log('[VIP Orphan] query error', error.message);
-      return;
-    }
+    // FIX 1000: loop range thay vi limit(200) - PENDING treo > 200 thi truoc day khong bao gio duoc don het
+    const allPending = []; { let _o = 0; let _err = null; while(_o < 20000){ const { data: _d, error: _e } = await admin.from('vip_requests').select('id,email,content,created_at').eq('status','PENDING').lt('created_at', cutoffBankIso).order('created_at', {ascending:true}).range(_o, _o + 999); if(_e){ _err = _e; break; } if(!_d || !_d.length) break; allPending.push(..._d); if(_d.length < 1000) break; _o += 1000; } if(_err){ console.log('[VIP Orphan] query error', _err.message); return; } }
     if(!allPending || allPending.length===0){
       console.log('[VIP Orphan] No PENDING >10m found');
       return;
@@ -4275,7 +4346,7 @@ async function autoRejectOrphanVipRequests(){
     if(allToSync.length>0){
       const emails = [...new Set(allToSync.map(r=>(r.email||'').toLowerCase()).filter(Boolean))];
       console.log(`[VIP Orphan] Syncing ${emails.length} emails to REJECTED if no PENDING left`);
-      for(const email of emails.slice(0,30)){
+      for(const email of emails.slice(0,500)){
         try{
           const { data: remaining } = await admin.from('vip_requests')
             .select('id')
@@ -4427,11 +4498,12 @@ app.get('/api/admin/cleanup-pending', async (req,res)=>{
     
     // Trả về số còn lại
     const { supabaseAdmin } = require('./services/supabase');
+    // FIX 1000: message dung count that (head:true), list chi hien 100 dong dau
+    const { count: remainingCount } = await supabaseAdmin.from('vip_requests').select('*', { count:'exact', head:true }).eq('status','PENDING');
     const { data: remaining } = await supabaseAdmin.from('vip_requests').select('id,email,content,created_at').eq('status','PENDING').order('created_at',{ascending:true}).limit(100);
-    
     return res.json({
-      success:true, 
-      message:`Đã chạy dọn dẹp - còn ${remaining?.length||0} PENDING`,
+      success:true,
+      message:`Đã chạy dọn dẹp - còn ${remainingCount||0} PENDING`,
       remaining: remaining || [],
       timestamp: new Date().toISOString()
     });
@@ -4447,7 +4519,8 @@ app.get('/api/admin/pending-status', async (req,res)=>{
     if(!supabaseAdmin) return res.json({success:false, message:'No admin'});
     const cutoff10 = new Date(Date.now() - 10*60*1000).toISOString();
     const cutoff30 = new Date(Date.now() - 30*60*1000).toISOString();
-    const { data: all } = await supabaseAdmin.from('vip_requests').select('id,email,content,created_at,status').eq('status','PENDING').order('created_at',{ascending:true}).limit(200);
+    // FIX 1000: loop range thay vi limit(200) - PENDING > 200 thi total truoc day sai
+    let all = []; { let _o = 0; while(_o < 50000){ const { data: _d, error: _e } = await supabaseAdmin.from('vip_requests').select('id,email,content,created_at,status').eq('status','PENDING').order('created_at',{ascending:true}).range(_o, _o + 999); if(_e) throw _e; if(!_d || !_d.length) break; all = all.concat(_d); if(_d.length < 1000) break; _o += 1000; } }
     const bankStuck = (all||[]).filter(r=> new Date(r.created_at) < new Date(cutoff10) && !(r.content||'').toLowerCase().includes('usdt') && !(r.content||'').toLowerCase().includes('lemon'));
     const longStuck = (all||[]).filter(r=> new Date(r.created_at) < new Date(cutoff30) && ((r.content||'').toLowerCase().includes('usdt') || (r.content||'').toLowerCase().includes('lemon')));
     return res.json({success:true, total: all?.length||0, bankStuck: bankStuck.length, longStuck: longStuck.length, bankStuckList: bankStuck, longStuckList: longStuck, all});
