@@ -227,6 +227,83 @@ app.use((req, res, next) => {
 app.use('/api/vocal', blockRenderIfTrialExpired, vocalRouter);
 app.use('/api', dodoRouter);
 
+// ===== USDT - BẬT/TẮT TRONG ADMIN DASHBOARD (giống Dodo / Lemon) =====
+// Vấn đề cũ: USDT không có nút gạt riêng, chỉ tự ẩn khi hết ví active hoặc IP VN.
+// Muốn ẩn phải tắt từng ví một. Giờ thêm app_settings id 'usdt_enabled' giống
+// 'dodo_enabled' / 'lemon_enabled'.
+// - Mặc định BẬT (true) nếu chưa có dòng usdt_enabled -> giữ đúng hành vi cũ.
+// - Admin TẮT -> ẩn nút USDT cho TẤT CẢ, kể cả admin / whitelist (giống Dodo).
+// - Admin vẫn xem được /api/admin/usdt-wallets để bật lại (không bị gate chặn).
+// - Đặt ở đây, TRƯỚC app.use('/api', upgradeRoutes) ở dưới, để gate chặn được
+//   request tới route USDT cũ trong routes/upgrade.js. Nếu BẬT thì next() cho
+//   route cũ chạy tiếp.
+async function getUsdtEnabled() {
+  try {
+    const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return true;
+    const { data } = await supabaseAdmin.from('app_settings').select('value').eq('id', 'usdt_enabled').single();
+    if (!data?.value) return true;
+    if (typeof data.value === 'boolean') return data.value;
+    if (typeof data.value.enabled === 'boolean') return data.value.enabled;
+    return true;
+  } catch { return true; }
+}
+
+app.get('/api/admin/usdt-config', async (req, res) => {
+  const enabled = await getUsdtEnabled();
+  return res.json({ success: true, enabled, configured: true });
+});
+
+app.post('/api/admin/usdt-config', express.json(), async (req, res) => {
+  try {
+    const { supabaseAdmin } = require('./services/supabase');
+    if (!supabaseAdmin) return res.status(500).json({ success: false, message: 'Supabase not configured' });
+    const value = {
+      enabled: !!req.body?.enabled,
+      updated_at: new Date().toISOString(),
+      updated_by: (req.headers['x-user-email'] || '').toLowerCase(),
+    };
+    const { error } = await supabaseAdmin.from('app_settings').upsert({ id: 'usdt_enabled', value }, { onConflict: 'id' });
+    if (error) throw error;
+    console.log(`[USDT Admin] Saved config enabled:${value.enabled}`);
+    return res.json({ success: true, value, enabled: value.enabled, message: `Đã ${value.enabled ? 'BẬT' : 'TẮT'} USDT` });
+  } catch (e) {
+    console.error('[USDT Admin] save error', e.message);
+    return res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+app.get('/api/payment/usdt/config', async (req, res) => {
+  const enabled = await getUsdtEnabled();
+  return res.json({ success: true, enabled, configured: true, timestamp: new Date().toISOString() });
+});
+
+// GATE: TẮT thì trả wallets: [] để frontend tự ẩn nút USDT (frontend đang check wallets.length > 0).
+// BẬT thì next() để route USDT cũ trong upgradeRoutes chạy tiếp.
+app.get('/api/payment/usdt-wallets', async (req, res, next) => {
+  const enabled = await getUsdtEnabled();
+  if (!enabled) return res.json({ success: true, enabled: false, wallets: [], message: 'USDT đang tắt trong admin' });
+  return next();
+});
+
+// GATE: chặn tạo / quét / verify khi admin TẮT. BẬT thì next() cho route cũ chạy.
+app.post('/api/payment/usdt/create', async (req, res, next) => {
+  const enabled = await getUsdtEnabled();
+  if (!enabled) return res.status(403).json({ success: false, enabled: false, message: 'USDT đang tắt' });
+  return next();
+});
+app.post('/api/payment/usdt/scan', async (req, res, next) => {
+  const enabled = await getUsdtEnabled();
+  if (!enabled) return res.status(403).json({ success: false, enabled: false, message: 'USDT đang tắt' });
+  return next();
+});
+app.post('/api/payment/usdt/verify', async (req, res, next) => {
+  const enabled = await getUsdtEnabled();
+  if (!enabled) return res.status(403).json({ success: false, enabled: false, message: 'USDT đang tắt' });
+  return next();
+});
+
+
 const karaProjectsRouter = require('./routes/karaProjects');
 app.use('/api/projects', karaProjectsRouter);
 
