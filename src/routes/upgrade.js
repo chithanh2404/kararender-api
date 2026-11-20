@@ -181,16 +181,14 @@ router.get('/admin/pending-vip', async (req,res)=>{
       console.error('[pending-vip] supabaseAdmin NULL');
       return res.status(500).json({success:false, message:'supabaseAdmin NULL', users:[], count:0});
     }
-    const {data, error}=await supabaseAdmin.from('vip_requests').select('*').eq('status','PENDING').order('created_at',{ascending:false}).limit(50);
-    if(error){
-      console.error('[pending-vip] error', error.message);
-      return res.json({success:true, users:[], count:0, message:error.message, _error:true});
-    }
-    let list = data||[];
+    // FIX 1000: truoc day limit(50) -> admin chi thay 50 PENDING moi nhat, so con lai khong bao gio duoc duyet.
+    // Loop range lay HET PENDING (cap 10000, PENDING thuc te khong bao gio toi muc do).
+    let list = []; { let _o = 0; while(_o < 10000){ const {data: _d, error: _e} = await supabaseAdmin.from('vip_requests').select('*').eq('status','PENDING').order('created_at',{ascending:false}).range(_o, _o + 999); if(_e){ console.error('[pending-vip] error', _e.message); return res.json({success:true, users:[], count:0, message:_e.message, _error:true}); } if(!_d || !_d.length) break; list.push(..._d); if(_d.length < 1000) break; _o += 1000; } }
     // FIX: Đồng bộ với users - nếu users đã REJECTED thì vip_requests cũng phải REJECTED
     if(list.length>0){
       const emails = [...new Set(list.map(r=>r.email.toLowerCase()))];
-      const {data: usersData} = await supabaseAdmin.from('users').select('email,vip_status').in('email', emails);
+      // Chunk 100 email/lan: .in() voi hang tram email 1 lan de bi cat / URL qua dai
+      let usersData = []; for(let _i = 0; _i < emails.length; _i += 100){ const {data: _u} = await supabaseAdmin.from('users').select('email,vip_status').in('email', emails.slice(_i, _i + 100)); if(_u) usersData.push(..._u); }
       const rejectedEmails = new Set((usersData||[]).filter(u=>u.vip_status==='REJECTED').map(u=>u.email.toLowerCase()));
       if(rejectedEmails.size>0){
         const toFix = list.filter(r=>rejectedEmails.has(r.email.toLowerCase()));
@@ -220,13 +218,13 @@ router.get('/admin/vip-stats', async (req,res)=>{
     if(!supabaseAdmin){
       return res.status(500).json({success:false, message:'supabaseAdmin NULL'});
     }
-    // Lấy tất cả vip_requests APPROVED (đã nạp thành công)
-    const {data: allData, error} = await supabaseAdmin.from('vip_requests').select('email, full_name, amount, plan_key, created_at, updated_at, status').eq('status','APPROVED').order('created_at',{ascending:false}).limit(1000);
-    if(error){
-      console.error('[vip-stats] error', error.message);
-      return res.status(500).json({success:false, message:error.message});
-    }
-    const records = allData||[];
+    // FIX 1000: truoc day limit(1000) -> doanh thu Toan thoi gian / Chart / Top user thieu khi APPROVED > 1000.
+    // Loop range lay HET APPROVED (cap 50000). Them 'content' vao select de nhan dien Lemon/Dodo.
+    let allData = []; { let _o = 0; while(_o < 50000){ const {data: _d, error: _e} = await supabaseAdmin.from('vip_requests').select('email, full_name, amount, plan_key, content, created_at, updated_at, status').eq('status','APPROVED').order('created_at',{ascending:false}).range(_o, _o + 999); if(_e){ console.error('[vip-stats] error', _e.message); return res.status(500).json({success:false, message:_e.message}); } if(!_d || !_d.length) break; allData.push(..._d); if(_d.length < 1000) break; _o += 1000; } }
+    // Chuan hoa amount: Lemon/Dodo luu amount theo USD (vd 3.99), Bank luu VND.
+    // Neu content la lemon/dodo va amount < 5000 (dang USD) -> lay gia VND cua goi, khong thi tong doanh thu bi lech xuong.
+    let _planPrice = {}; try{ const _pr = await getPlans(true); for(const _p of (_pr.plans||[])) _planPrice[String(_p.key||'').toLowerCase()] = Number(_p.price) || 0; }catch(e){}
+    const records = (allData||[]).map(r=>{ let amt = parseFloat(r.amount) || 0; const c = String(r.content||'').toLowerCase(); if((c.includes('lemon') || c.includes('dodo')) && amt > 0 && amt < 5000){ const pv = _planPrice[String(r.plan_key||'').toLowerCase()] || 0; if(pv) amt = pv; } return { ...r, _amt: amt }; });
     
     // Helper lấy ngày VN YYYY-MM-DD
     const getVNDateStr = (d)=>{
@@ -273,7 +271,7 @@ router.get('/admin/vip-stats', async (req,res)=>{
     }
     
     for(const r of records){
-      const amt = parseInt(r.amount)||0;
+      const amt = (r._amt != null ? r._amt : parseInt(r.amount)||0);
       const dateStr = getVNDateStr(r.created_at);
       const monthStr = dateStr.slice(0,7);
       
@@ -327,7 +325,7 @@ router.get('/admin/vip-stats', async (req,res)=>{
       const k = r.plan_key||'unknown';
       if(!planMap.has(k)) planMap.set(k, {plan_key:k, total:0, count:0});
       const p = planMap.get(k);
-      p.total += parseInt(r.amount)||0;
+      p.total += (r._amt != null ? r._amt : parseInt(r.amount)||0);
       p.count++;
     }
     const byPlan = [...planMap.values()].sort((a,b)=>b.total-a.total);
@@ -724,13 +722,8 @@ async function getWalletRotationStatus(){
 
   // 2. Lấy các request PENDING trong 30 phút qua có chứa USDT
   const cutoff = new Date(Date.now() - WALLET_BUSY_MINUTES*60*1000).toISOString();
-  const { data: pendings, error: pErr } = await supabaseAdmin
-    .from('vip_requests')
-    .select('id, email, content, created_at, plan_key')
-    .eq('status','PENDING')
-    .gte('created_at', cutoff)
-    .ilike('content','%usdt%')
-    .order('created_at', { ascending: true });
+  // FIX 1000: query khong co limit -> Supabase cap mac dinh 1000. Loop range lay het PENDING USDT 30p (cap 5000).
+  let pendings = []; let pErr = null; { let _o = 0; while(_o < 5000){ const {data: _d, error: _e} = await supabaseAdmin.from('vip_requests').select('id, email, content, created_at, plan_key').eq('status','PENDING').gte('created_at', cutoff).ilike('content','%usdt%').order('created_at', { ascending: true }).range(_o, _o + 999); if(_e){ pErr = _e; break; } if(!_d || !_d.length) break; pendings.push(..._d); if(_d.length < 1000) break; _o += 1000; } }
 
   if(pErr){
     console.warn('[USDT Rotation] query pending error', pErr.message);
@@ -968,11 +961,8 @@ router.post('/admin/usdt-wallets/:id/release', async (req,res)=>{
 
     // Tìm các pending đang giữ ví này trong 30p
     const cutoff = new Date(Date.now() - WALLET_BUSY_MINUTES*60*1000).toISOString();
-    const { data: pendings } = await supabaseAdmin.from('vip_requests')
-      .select('id, email, content, created_at')
-      .eq('status','PENDING')
-      .gte('created_at', cutoff)
-      .ilike('content','%usdt%');
+    // FIX 1000: loop range thay vi query khong limit (cap mac dinh 1000)
+    let pendings = []; { let _o = 0; while(_o < 5000){ const {data: _d} = await supabaseAdmin.from('vip_requests').select('id, email, content, created_at').eq('status','PENDING').gte('created_at', cutoff).ilike('content','%usdt%').range(_o, _o + 999); if(!_d || !_d.length) break; pendings.push(..._d); if(_d.length < 1000) break; _o += 1000; } }
 
     let releasedCount = 0;
     if(pendings && pendings.length>0){
