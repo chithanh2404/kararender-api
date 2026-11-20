@@ -31,10 +31,64 @@ function getDodoConfig() {
   return { apiKey, webhookSecret, products, base, isTest };
 }
 
-// DB (users.request_amount, vip_requests.amount) đang là INTEGER chứa VND.
-// Dodo trả total_amount là cents EUR (4189 = €41.89, đã gồm VAT) -> KHÔNG được ghi trực tiếp vào DB.
-// Dùng map cứng theo giá bạn đang set: 1M 99000, 3M 199000, 6M 299000, 12M 499000, 24M 899000.
-const VND_BY_PLAN = { '1m': 99000, '3m': 199000, '6m': 299000, '12m': 499000, '24m': 899000 };
+// ===== VIP PLANS - Đọc từ Supabase upgrade_plans, KHÔNG hardcode =====
+// upgrade_plans: key, label, months, price (VND), enabled, sort_order
+// Nếu sau này thêm cột price_usd / dodo_product_id thì code tự dùng, không cần sửa file.
+let _vipPlansCache = null;
+let _vipPlansCacheAt = 0;
+const _FALLBACK_PLANS = {
+  '1m': { months: 1, price_vnd: 99000, price_usd: 3.99, label: 'KaraRender VIP - 1 Month' },
+  '3m': { months: 3, price_vnd: 199000, price_usd: 7.65, label: 'KaraRender VIP - 3 Months' },
+  '6m': { months: 6, price_vnd: 299000, price_usd: 15.35, label: 'KaraRender VIP - 6 Months' },
+  '12m': { months: 12, price_vnd: 499000, price_usd: 23.04, label: 'KaraRender VIP - 1 Year' },
+  '24m': { months: 24, price_vnd: 899000, price_usd: 38.42, label: 'KaraRender VIP - 2 Years' },
+};
+async function getVipPlans() {
+  if (_vipPlansCache && Date.now() - _vipPlansCacheAt < 60 * 1000) return _vipPlansCache;
+  try {
+    const supabaseAdmin = getSupabaseAdmin();
+    if (supabaseAdmin) {
+      const { data } = await supabaseAdmin.from('upgrade_plans').select('*').eq('enabled', true).order('sort_order', { ascending: true });
+      if (data && data.length) {
+        const plans = {};
+        for (const r of data) {
+          const key = String(r.key || r.plan_key || '').toLowerCase();
+          if (!key) continue;
+          plans[key] = {
+            months: Number(r.months) || _FALLBACK_PLANS[key]?.months || 1,
+            price_vnd: Number(r.price ?? r.price_vnd) || _FALLBACK_PLANS[key]?.price_vnd || 99000,
+            price_usd: r.price_usd != null ? Number(r.price_usd) : (_FALLBACK_PLANS[key]?.price_usd || 0),
+            label: r.label || _FALLBACK_PLANS[key]?.label || key,
+            dodo_product_id: r.dodo_product_id || null,
+          };
+        }
+        _vipPlansCache = plans; _vipPlansCacheAt = Date.now(); return plans;
+      }
+    }
+  } catch (e) { console.warn('[Dodo VipPlans] load error, dùng fallback', e.message); }
+  _vipPlansCache = { ..._FALLBACK_PLANS }; _vipPlansCacheAt = Date.now(); return _vipPlansCache;
+}
+async function getVipPlan(planKey) {
+  const plans = await getVipPlans();
+  return plans[String(planKey||'1m').toLowerCase()] || plans['1m'];
+}
+// Dodo products = upgrade_plans (months/price/label) + env productId (ưu tiên cột dodo_product_id nếu có)
+async function getDodoProducts() {
+  const cfg = getDodoConfig();
+  const plans = await getVipPlans();
+  const out = {};
+  const envMap = { '1m': process.env.DODO_PRODUCT_1M, '3m': process.env.DODO_PRODUCT_3M, '6m': process.env.DODO_PRODUCT_6M, '12m': process.env.DODO_PRODUCT_12M, '24m': process.env.DODO_PRODUCT_24M };
+  for (const [k, p] of Object.entries(plans)) {
+    out[k] = {
+      productId: p.dodo_product_id || envMap[k] || cfg.products[k]?.productId,
+      months: p.months,
+      usd: p.price_usd || cfg.products[k]?.usd || 0,
+      label: p.label,
+      price_vnd: p.price_vnd,
+    };
+  }
+  return out;
+}
 
 function normalizePlanKey(raw) {
   const k = String(raw || '1m').toLowerCase().trim();
@@ -55,6 +109,14 @@ function getPlanByProductId(productId) {
     if (p.productId === productId) return planKey;
   }
   return null;
+}
+async function getPlanByProductIdAsync(productId) {
+  if (!productId) return null;
+  const products = await getDodoProducts();
+  for (const [planKey, p] of Object.entries(products)) {
+    if (p.productId === productId) return planKey;
+  }
+  return getPlanByProductId(productId);
 }
 
 function getSupabaseAdmin() {
@@ -182,9 +244,10 @@ router.get('/payment/dodo/config', async (req, res) => {
     }
   } catch {}
   const cfg = getDodoConfig();
+  const _prods = await getDodoProducts();
   const products = {};
-  for (const [k, v] of Object.entries(cfg.products)) {
-    products[k] = { productId: v.productId, months: v.months, usd: v.usd, label: v.label };
+  for (const [k, v] of Object.entries(_prods)) {
+    products[k] = { productId: v.productId, months: v.months, usd: v.usd, label: v.label, price_vnd: v.price_vnd };
   }
   res.json({
     success: true,
@@ -213,10 +276,11 @@ router.post('/payment/dodo/create', express.json(), async (req, res) => {
     }
 
     const cfg = getDodoConfig();
+    const _allProds = await getDodoProducts();
     if (!cfg.apiKey) {
       return res.status(500).json({ success: false, message: 'Chưa cấu hình DODO_API_KEY trong Render ENV' });
     }
-    const product = cfg.products[planKey];
+    const product = _allProds[planKey] || cfg.products[planKey];
     if (!product?.productId) {
       return res.status(400).json({ success: false, message: `Chưa cấu hình DODO_PRODUCT_${planKey.toUpperCase()} cho gói ${planKey}` });
     }
@@ -290,7 +354,7 @@ router.post('/payment/dodo/create', express.json(), async (req, res) => {
             email,
             full_name: fullName,
             plan_key: planKey,
-            amount: VND_BY_PLAN[planKey] || 99000,
+            amount: (await getVipPlan(planKey)).price_vnd || 99000,
             content: `dodo ${email.replace(/[@.]/g, '')} ${planKey} $${product.usd} session:${sessionId || ''} payment:${paymentId || ''}`,
             status: 'PENDING',
             created_at: new Date().toISOString(),
@@ -380,13 +444,14 @@ async function handleDodoWebhook(req, res) {
 
     const email = String(data.metadata?.email || data.customer?.email || data.customer_email || data.email || '').toLowerCase().trim();
     let planKey = String(data.metadata?.plan_key || data.metadata?.planKey || '').toLowerCase().trim();
-    if (!planKey) planKey = getPlanByProductId(extractProductId(data)) || '1m';
+    if (!planKey) planKey = await getPlanByProductIdAsync(extractProductId(data)) || '1m';
     planKey = normalizePlanKey(planKey) || '1m';
 
     const paymentId = data.payment_id || data.id || body.payment_id || '';
     // amountUsd chỉ để hiển thị/log. total_amount là cents EUR (4189 = 41.89 EUR) -> không dùng cho DB.
-    const amountUsd = parseFloat(data.metadata?.amount_usd) || getDodoConfig().products[planKey]?.usd || toUsd(data.total_amount) || 0;
-    const amountVnd = VND_BY_PLAN[planKey] || 99000;
+    const _plan = await getVipPlan(planKey);
+    const amountUsd = parseFloat(data.metadata?.amount_usd) || _plan.price_usd || toUsd(data.total_amount) || 0;
+    const amountVnd = _plan.price_vnd || 99000;
 
     if (!email) {
       console.warn('[Dodo Webhook] No email found');
@@ -415,8 +480,7 @@ async function handleDodoWebhook(req, res) {
       return res.json({ success: false, message: 'User not found: ' + email });
     }
 
-    const monthsMap = { '1m': 1, '3m': 3, '6m': 6, '12m': 12, '24m': 24 };
-    const monthsToAdd = monthsMap[planKey] || Number(data.metadata?.months) || 1;
+    const monthsToAdd = (await getVipPlan(planKey)).months || Number(data.metadata?.months) || 1;
     const now = new Date();
     let expireDate = new Date();
     if (targetUser.expired_date && new Date(targetUser.expired_date) > now) {
